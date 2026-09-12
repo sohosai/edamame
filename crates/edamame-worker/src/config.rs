@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use edamame_domain::{EdamameError, validate_identifier};
+use edamame_domain::{CorsOrigins, EdamameError, validate_identifier};
 
 /// `edamame-worker` の設定
 #[derive(Debug, Clone, Parser)]
@@ -33,6 +33,10 @@ pub struct WorkerConfig {
     /// (channel_id, quality) ごとのキャッシュ上限
     #[arg(long)]
     pub cache_limit: u64,
+
+    /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
+    #[arg(long, value_delimiter = ',')]
+    pub cors_origin: Vec<String>,
 }
 
 impl WorkerConfig {
@@ -45,6 +49,11 @@ impl WorkerConfig {
             ));
         }
         Ok(())
+    }
+
+    /// CORS の設定を検証して返す
+    pub fn cors_origins(&self) -> Result<CorsOrigins, EdamameError> {
+        CorsOrigins::parse(&self.cors_origin)
     }
 }
 
@@ -88,5 +97,29 @@ mod tests {
         args[index + 1] = "0";
         let config = WorkerConfig::try_parse_from(args).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_cors_origins() {
+        let mut args = base_args();
+        args.extend([
+            "--cors-origin",
+            "http://a.test,http://b.test",
+            "--cors-origin",
+            "http://a.test",
+        ]);
+        let config = WorkerConfig::try_parse_from(args).unwrap();
+        assert_eq!(config.cors_origin.len(), 3);
+        assert_eq!(
+            config.cors_origins().unwrap(),
+            CorsOrigins::List(vec!["http://a.test".to_owned(), "http://b.test".to_owned()])
+        );
+    }
+
+    #[test]
+    fn treats_missing_cors_origin_as_disabled() {
+        let config = WorkerConfig::try_parse_from(base_args()).unwrap();
+        assert!(config.cors_origin.is_empty());
+        assert_eq!(config.cors_origins().unwrap(), CorsOrigins::Disabled);
     }
 }

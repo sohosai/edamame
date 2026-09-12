@@ -1,5 +1,6 @@
 //! Edamame の controller と worker で共有するドメイン型と純粋な処理
 
+pub mod cors;
 pub mod error;
 pub mod playlist;
 pub mod segment;
@@ -7,6 +8,7 @@ pub mod state;
 pub mod url;
 pub mod wire;
 
+pub use cors::CorsOrigins;
 pub use error::EdamameError;
 pub use playlist::{
     MasterQuality, MediaPlaylist, QualityPlaylistInput, plan_master_playlist, plan_media_playlist,

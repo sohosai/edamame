@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::header;
+use axum::http::{HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use edamame_domain::{
-    EdamameError, parse_sequence_filename, validate_identifier, validate_quality,
+    CorsOrigins, EdamameError, parse_sequence_filename, validate_identifier, validate_quality,
 };
 use tokio::sync::Mutex;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::cache::Cache;
 
@@ -54,16 +55,36 @@ impl WorkerState {
 }
 
 /// worker のルーター
-pub fn router(state: Arc<WorkerState>) -> Router {
+pub fn router(state: Arc<WorkerState>, cors: &CorsOrigins) -> Router {
     let route = format!(
         "{}/segments/{{channel_id}}/{{quality}}/{{filename}}",
         state.path_prefix
     );
     // パスの接頭辞は URL のリテラルなので、`:` や `*` を axum 7 の記法として解釈させない
-    Router::new()
+    let router = Router::new()
         .without_v07_checks()
-        .route(&route, get(get_segment))
-        .with_state(state)
+        .route(&route, get(get_segment));
+    let router = match cors_layer(cors) {
+        Some(layer) => router.layer(layer),
+        None => router,
+    };
+    router.with_state(state)
+}
+
+/// 許可する origin から読み取り用の CORS 層を作る
+fn cors_layer(cors: &CorsOrigins) -> Option<CorsLayer> {
+    let layer = match cors {
+        CorsOrigins::Disabled => return None,
+        CorsOrigins::Any => CorsLayer::new().allow_origin(Any),
+        CorsOrigins::List(origins) => CorsLayer::new().allow_origin(
+            origins
+                .iter()
+                // 起動時に URL として検証済みのため、ヘッダー値への変換は失敗しない
+                .map(|origin| HeaderValue::try_from(origin.as_str()).expect("validated origin"))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    Some(layer.allow_methods([Method::GET]))
 }
 
 /// EdamameError を plain text の HTTP レスポンスに変換する

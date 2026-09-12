@@ -6,15 +6,16 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use edamame_domain::{
-    EdamameError, RegisterRequest, RegisterResponse, SyncRequest, SyncResponse, now_ms,
-    parse_sequence_filename, validate_identifier, validate_quality,
+    CorsOrigins, EdamameError, RegisterRequest, RegisterResponse, SyncRequest, SyncResponse,
+    now_ms, parse_sequence_filename, validate_identifier, validate_quality,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::{ControllerState, IngestOutcome, SegmentIngest};
 
@@ -26,15 +27,23 @@ const REGISTER_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// controller のルーター
-pub fn router(state: Arc<ControllerState>) -> Router {
+pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins) -> Router {
+    // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
+    let read = Router::new()
+        .route(
+            "/segments/{channel_id}/{quality}/{filename}",
+            get(get_segment),
+        )
+        .route("/channels/{channel_id}/{file}", get(get_playlist));
+    let read = match cors_layer(cors) {
+        Some(layer) => read.layer(layer),
+        None => read,
+    };
     Router::new()
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
-            put(put_segment)
-                .layer(DefaultBodyLimit::max(SEGMENT_BODY_LIMIT))
-                .get(get_segment),
+            put(put_segment).layer(DefaultBodyLimit::max(SEGMENT_BODY_LIMIT)),
         )
-        .route("/channels/{channel_id}/{file}", get(get_playlist))
         .route(
             "/workers/{worker_id}",
             put(put_worker).layer(DefaultBodyLimit::max(REGISTER_BODY_LIMIT)),
@@ -43,7 +52,24 @@ pub fn router(state: Arc<ControllerState>) -> Router {
             "/workers/{worker_id}/sync",
             post(post_sync).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
         )
+        .merge(read)
         .with_state(state)
+}
+
+/// 許可する origin から読み取り用の CORS 層を作る
+fn cors_layer(cors: &CorsOrigins) -> Option<CorsLayer> {
+    let layer = match cors {
+        CorsOrigins::Disabled => return None,
+        CorsOrigins::Any => CorsLayer::new().allow_origin(Any),
+        CorsOrigins::List(origins) => CorsLayer::new().allow_origin(
+            origins
+                .iter()
+                // 起動時に URL として検証済みのため、ヘッダー値への変換は失敗しない
+                .map(|origin| HeaderValue::try_from(origin.as_str()).expect("validated origin"))
+                .collect::<Vec<_>>(),
+        ),
+    };
+    Some(layer.allow_methods([Method::GET]))
 }
 
 /// リクエストの JSON を読み取る抽出子。形式が不正な入力は 400 にする。

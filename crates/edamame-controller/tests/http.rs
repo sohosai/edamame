@@ -4,8 +4,12 @@ mod support;
 
 use std::time::Duration;
 
+use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
-use support::{TempDir, spawn_controller, spawn_worker, wait_for_playlist};
+use support::{
+    TempDir, spawn_controller, spawn_controller_with_cors, spawn_worker, spawn_worker_with_cors,
+    wait_for_playlist,
+};
 
 fn any_addr() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
@@ -910,6 +914,107 @@ async fn controller_restart_recovery() {
         .await
         .unwrap();
     assert_eq!(segment.status().as_u16(), 200);
+}
+
+/// ブラウザからは許可した origin の GET だけを CORS で許可する
+#[tokio::test]
+async fn cors_headers_follow_configured_origins() {
+    let tmp = TempDir::new("cors");
+    let allowed_origin = "http://page.test";
+    let controller = spawn_controller_with_cors(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        CorsOrigins::parse(&[allowed_origin.to_owned()]).unwrap(),
+    )
+    .await;
+    let worker = spawn_worker_with_cors(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+        CorsOrigins::Any,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/master.m3u8", controller.base_url),
+    )
+    .await;
+
+    // 許可した origin からの読み取りには、その origin をそのまま返す
+    let allowed = client
+        .get(format!("{}/channels/live/master.m3u8", controller.base_url))
+        .header(reqwest::header::ORIGIN, allowed_origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status().as_u16(), 200);
+    assert_eq!(
+        allowed
+            .headers()
+            .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        allowed_origin
+    );
+
+    // 許可していない origin には CORS ヘッダを付けない
+    let denied = client
+        .get(format!("{}/channels/live/master.m3u8", controller.base_url))
+        .header(reqwest::header::ORIGIN, "http://other.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status().as_u16(), 200);
+    assert!(
+        denied
+            .headers()
+            .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "許可していない origin に CORS ヘッダが付いている"
+    );
+
+    // worker は `*` を指定しているため、すべての origin に `*` を返す
+    let segment = client
+        .get(format!("{}/segments/live/720p/101.ts", worker.base_url))
+        .header(reqwest::header::ORIGIN, allowed_origin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(segment.status().as_u16(), 200);
+    assert_eq!(
+        segment
+            .headers()
+            .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "*"
+    );
+
+    // 書き込み系は cross-origin から実行させないため、PUT には CORS ヘッダを付けない
+    let put = client
+        .put(format!(
+            "{}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720",
+            controller.base_url
+        ))
+        .header(reqwest::header::ORIGIN, allowed_origin)
+        .body("segment-720p-101")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status().as_u16(), 200);
+    assert!(
+        put.headers()
+            .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "書き込み系に CORS ヘッダが付いている"
+    );
 }
 
 /// キャッシュがプレイリストの範囲より新しいセグメント番号で埋まっていても、worker は古い範囲を取得して READY になる

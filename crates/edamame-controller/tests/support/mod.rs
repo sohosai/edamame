@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use edamame_controller::storage::CanonicalStore;
 use edamame_controller::{ControllerState, router as controller_router};
+use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router as worker_router};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -69,12 +70,32 @@ pub async fn spawn_controller(
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
 ) -> ControllerHandle {
+    spawn_controller_with_cors(
+        addr,
+        storage_dir,
+        playlist_segments,
+        sync_interval_ms,
+        sync_timeout_ms,
+        CorsOrigins::Disabled,
+    )
+    .await
+}
+
+/// CORS の設定を指定して controller を実際の HTTP サーバーとして起動する
+pub async fn spawn_controller_with_cors(
+    addr: SocketAddr,
+    storage_dir: PathBuf,
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    cors: CorsOrigins,
+) -> ControllerHandle {
     tokio::fs::create_dir_all(&storage_dir).await.unwrap();
     let store = CanonicalStore::new(storage_dir);
     let state = ControllerState::new(store, playlist_segments, sync_interval_ms, sync_timeout_ms);
     let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = controller_router(state.clone());
+    let app = controller_router(state.clone(), &cors);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -106,6 +127,26 @@ pub async fn spawn_worker(
     cache_limit: u64,
     start_sync: bool,
 ) -> WorkerHandle {
+    spawn_worker_with_cors(
+        worker_id,
+        controller_url,
+        cache_dir,
+        cache_limit,
+        start_sync,
+        CorsOrigins::Disabled,
+    )
+    .await
+}
+
+/// CORS の設定を指定して worker を実際の HTTP サーバーとして起動する
+pub async fn spawn_worker_with_cors(
+    worker_id: &str,
+    controller_url: &str,
+    cache_dir: PathBuf,
+    cache_limit: u64,
+    start_sync: bool,
+    cors: CorsOrigins,
+) -> WorkerHandle {
     tokio::fs::create_dir_all(&cache_dir).await.unwrap();
     let cache = Cache::scan(cache_dir, cache_limit).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -118,7 +159,7 @@ pub async fn spawn_worker(
         cache,
     )
     .unwrap();
-    let app = worker_router(state.clone());
+    let app = worker_router(state.clone(), &cors);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

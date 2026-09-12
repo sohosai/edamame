@@ -25,6 +25,7 @@ client には、controller に到達できる URL を設定する。
 | `--playlist-segments` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
 | `--sync-interval-ms` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
 | `--sync-timeout-ms` | 必須 | worker を `DEAD` と見なすまでの sync の待ち時間をミリ秒で指定する（1 以上の整数） |
+| `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
 ## worker の CLI
 
@@ -36,8 +37,9 @@ client には、controller に到達できる URL を設定する。
 | `--controller-url` | 必須 | controller に接続するための、worker から到達できる URL |
 | `--cache-dir` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
 | `--cache-limit` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
+| `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
-すべての option は必須で、既定値はない。
+`--cors-origin` 以外の option は必須で、既定値はない。
 `--public-url` は `--bind` から推測しない。
 `0.0.0.0` など client から到達できないアドレスを待ち受ける場合でも、client から到達できる URL を指定する。
 `--controller-url` は query と fragment を含まない絶対 URL とし、末尾の `/` は取り除いて使う。
@@ -52,7 +54,8 @@ edamame-controller \
   --storage-dir .edamame/controller \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
-  --sync-timeout-ms 10000
+  --sync-timeout-ms 10000 \
+  --cors-origin '*'
 ```
 
 worker を起動する。
@@ -64,7 +67,8 @@ edamame-worker \
   --public-url http://127.0.0.1:9001 \
   --controller-url http://127.0.0.1:9000 \
   --cache-dir .edamame/worker-a \
-  --cache-limit 12
+  --cache-limit 12 \
+  --cors-origin '*'
 ```
 
 セグメントファイルを PUT する。
@@ -90,66 +94,6 @@ curl -i --retry 30 --retry-delay 1 --retry-connrefused \
 ```bash
 curl -i http://127.0.0.1:9001/segments/live/720p/101.ts
 ```
-
-## コンテナでの起動
-
-controller と worker のイメージは GHCR で public として公開する。
-
-| イメージ | 役割 |
-| --- | --- |
-| `ghcr.io/sohosai/edamame-controller` | controller |
-| `ghcr.io/sohosai/edamame-worker` | worker |
-
-| タグ | 内容 |
-| --- | --- |
-| `latest`、`main` | `main` ブランチの最新のビルド |
-| `sha-<短縮 SHA>` | その commit のビルド |
-| `v1.2.3` | `v*` タグのビルド |
-
-イメージは root で実行し、shell を含まない。
-保存先は volume をマウントし、`--storage-dir` と `--cache-dir` にそのパスを指定する。
-
-compose の例：
-
-```yaml
-services:
-  controller:
-    image: ghcr.io/sohosai/edamame-controller:latest
-    command:
-      - --bind=0.0.0.0:9000
-      - --storage-dir=/data
-      - --playlist-segments=6
-      - --sync-interval-ms=1000
-      - --sync-timeout-ms=10000
-    ports:
-      - "9000:9000"
-    volumes:
-      - controller-storage:/data
-
-  worker:
-    image: ghcr.io/sohosai/edamame-worker:latest
-    depends_on:
-      - controller
-    command:
-      - --worker-id=worker-a
-      - --bind=0.0.0.0:9001
-      - --public-url=http://127.0.0.1:9001
-      - --controller-url=http://controller:9000
-      - --cache-dir=/cache
-      - --cache-limit=12
-    ports:
-      - "9001:9001"
-    volumes:
-      - worker-cache:/cache
-
-volumes:
-  controller-storage:
-  worker-cache:
-```
-
-`--public-url` は client から到達できる URL を指定する。
-ホストから client を動かす場合は例のように公開ポートを指定し、同じ compose network のコンテナから動かす場合は `http://worker:9001` のようにサービス名を指定する。
-volume に bind mount を使う場合も、イメージは root で動くため所有者の調整は要らない。
 
 ## sync とタイムアウト
 
@@ -216,6 +160,7 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 - publisher が送る識別子は文字種を限定し、controller は `storage_dir` の外にファイルを作らない
 - worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
 - `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く
+- CORS は GET の読み取りだけを許可し、`PUT` と `POST` には CORS ヘッダを付けない
 
 ## ログ
 

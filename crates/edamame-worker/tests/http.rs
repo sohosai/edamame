@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router};
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -38,7 +39,7 @@ async fn serves_segments_under_public_url_path_prefix() {
         cache,
     )
     .unwrap();
-    let app = router(state);
+    let app = router(state, &CorsOrigins::Disabled);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -73,7 +74,7 @@ async fn missing_file_removes_index_entry() {
         cache,
     )
     .unwrap();
-    let app = router(state.clone());
+    let app = router(state.clone(), &CorsOrigins::Disabled);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -104,7 +105,7 @@ async fn unreadable_file_removes_index_entry() {
         cache,
     )
     .unwrap();
-    let app = router(state.clone());
+    let app = router(state.clone(), &CorsOrigins::Disabled);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -138,7 +139,7 @@ async fn serves_segments_under_path_prefix_with_route_characters() {
             cache,
         )
         .unwrap();
-        let app = router(state);
+        let app = router(state, &CorsOrigins::Disabled);
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });

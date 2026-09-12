@@ -15,6 +15,7 @@
 - エラー本文は英語の plain text とし、Content-Type は `text/plain; charset=utf-8` とする
 - プレイリストの Content-Type は `application/vnd.apple.mpegurl`、セグメントファイルの Content-Type は `application/octet-stream` とする
 - 認証はなく、private network で使う前提とする
+- ブラウザからは GET だけ cross-origin で読める。許可する origin は controller と worker の `--cors-origin` で指定し、省略すると CORS ヘッダを返さない
 - ステータスコードは 400、404、422、503 の順に判定し、入力が不正なら 400、対象が存在しなければ 404、プレイリストを生成できなければ 422、配信できる worker がなければ 503 を返す
 - 予期しない内部エラーは 500 を返す
 
