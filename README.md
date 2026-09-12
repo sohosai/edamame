@@ -42,6 +42,46 @@ cargo run -p edamame-worker -- \
 `--bind` は待ち受けるアドレスであり、接続先 URL ではない。
 `.edamame/` は例であり、`--storage-dir` と `--cache-dir` は利用者が決める。
 
+## コンテナで起動する
+
+イメージは GHCR で public として公開する。認証なしで pull できる。
+
+```bash
+docker pull ghcr.io/sohosai/edamame-controller:latest
+docker pull ghcr.io/sohosai/edamame-worker:latest
+```
+
+保存先は volume に置く。イメージは root で実行し、shell を含まない。
+
+```bash
+docker network create edamame
+docker volume create edamame-storage
+docker volume create edamame-cache
+
+docker run -d --name controller --network edamame \
+  -p 9000:9000 \
+  -v edamame-storage:/data \
+  ghcr.io/sohosai/edamame-controller:latest \
+  --bind 0.0.0.0:9000 \
+  --storage-dir /data \
+  --playlist-segments 6 \
+  --sync-interval-ms 1000 \
+  --sync-timeout-ms 10000
+
+docker run -d --name worker --network edamame \
+  -p 9001:9001 \
+  -v edamame-cache:/cache \
+  ghcr.io/sohosai/edamame-worker:latest \
+  --worker-id worker-a \
+  --bind 0.0.0.0:9001 \
+  --public-url http://127.0.0.1:9001 \
+  --controller-url http://controller:9000 \
+  --cache-dir /cache \
+  --cache-limit 12
+```
+
+compose の例は [docs/operations.md](docs/operations.md) にある。
+
 ## 動作を確認する
 
 セグメントファイルを PUT する。

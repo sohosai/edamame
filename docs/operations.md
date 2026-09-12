@@ -91,6 +91,66 @@ curl -i --retry 30 --retry-delay 1 --retry-connrefused \
 curl -i http://127.0.0.1:9001/segments/live/720p/101.ts
 ```
 
+## コンテナでの起動
+
+controller と worker のイメージは GHCR で public として公開する。
+
+| イメージ | 役割 |
+| --- | --- |
+| `ghcr.io/sohosai/edamame-controller` | controller |
+| `ghcr.io/sohosai/edamame-worker` | worker |
+
+| タグ | 内容 |
+| --- | --- |
+| `latest`、`main` | `main` ブランチの最新のビルド |
+| `sha-<短縮 SHA>` | その commit のビルド |
+| `v1.2.3` | `v*` タグのビルド |
+
+イメージは root で実行し、shell を含まない。
+保存先は volume をマウントし、`--storage-dir` と `--cache-dir` にそのパスを指定する。
+
+compose の例：
+
+```yaml
+services:
+  controller:
+    image: ghcr.io/sohosai/edamame-controller:latest
+    command:
+      - --bind=0.0.0.0:9000
+      - --storage-dir=/data
+      - --playlist-segments=6
+      - --sync-interval-ms=1000
+      - --sync-timeout-ms=10000
+    ports:
+      - "9000:9000"
+    volumes:
+      - controller-storage:/data
+
+  worker:
+    image: ghcr.io/sohosai/edamame-worker:latest
+    depends_on:
+      - controller
+    command:
+      - --worker-id=worker-a
+      - --bind=0.0.0.0:9001
+      - --public-url=http://127.0.0.1:9001
+      - --controller-url=http://controller:9000
+      - --cache-dir=/cache
+      - --cache-limit=12
+    ports:
+      - "9001:9001"
+    volumes:
+      - worker-cache:/cache
+
+volumes:
+  controller-storage:
+  worker-cache:
+```
+
+`--public-url` は client から到達できる URL を指定する。
+ホストから client を動かす場合は例のように公開ポートを指定し、同じ compose network のコンテナから動かす場合は `http://worker:9001` のようにサービス名を指定する。
+volume に bind mount を使う場合も、イメージは root で動くため所有者の調整は要らない。
+
 ## sync とタイムアウト
 
 worker は登録時に受け取った `sync_interval_ms` の間隔で controller に sync を送る。
