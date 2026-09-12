@@ -9,6 +9,7 @@
 - controller の `--bind` は待ち受けるアドレスであり、client や worker が接続する URL ではないため、`0.0.0.0` などで待ち受ける場合、client は controller に到達できる URL を base URL として使い、worker は `--controller-url` に到達できる URL を指定する
 - `channel_id`、`quality`、`worker_id` は `[A-Za-z0-9_-]` の 1 文字以上 64 文字以下とし、それ以外は 400 で拒否する
 - `quality` に `master` は使えず、使った場合は 400 で拒否する
+- セグメント識別子（`identifier`）は `[A-Za-z0-9_-]` の 1 文字以上 64 文字以下とし、それ以外は 400 で拒否する
 - `sequence` はセグメント番号を表し、10 進数の u64 として先頭に 0 を付けず、ファイル名は `{sequence}.ts` だけを許可する
 - JSON を送るリクエストの Content-Type は `application/json` とする
 - JSON を返すレスポンスの Content-Type は `application/json` とする
@@ -24,10 +25,11 @@
 ### セグメントファイルを登録する
 
 ```
-PUT /segments/{channel_id}/{quality}/{filename}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}
+PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}
 ```
 
 publisher が正規セグメントファイルを登録する。
+`identifier` はセグメントごとに publisher が付ける識別子であり、同じセグメントには quality をまたいで同じ値を使う。
 `duration_ms` と `bandwidth` は必須で、`resolution` は任意とする。
 `duration_ms` は 500 以上の整数、`bandwidth` は正の整数、`resolution` は `{width}x{height}` の形式にする。
 
@@ -35,17 +37,30 @@ publisher が正規セグメントファイルを登録する。
 
 ```bash
 curl -i -X PUT \
-  --data-binary @101.ts \
-  'http://127.0.0.1:9000/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+  --data-binary @segment-1.ts \
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
+
+レスポンス：
+
+```json
+{
+  "sequence": 0
+}
+```
+
+controller は起動するたびに channel ごとの連番を 0 から新しい識別子に割り当てる。
+同じ channel では、同じ識別子には quality が違っても同じ番号を割り当てる。
+同じ識別子の再 PUT には、割り当て済みの番号を返す。
+新しい識別子に割り当てた番号のセグメントファイルがすでにある場合（前の起動のファイルが残っている場合など）は、そのファイルを上書きする。
 
 ステータス：
 
 - `201 Created`：新しいセグメントファイルを保存した
-- `200 OK`：同じ識別子、同じバイト列、同じ属性のセグメントファイルがすでにある
-- `400 Bad Request`：識別子、ファイル名、`duration_ms`、`bandwidth`、`resolution` の形式が不正、または `duration_ms` が 500 未満
-- `409 Conflict`：同じセグメントファイルに異なるバイト列または属性がある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
-- `500 Internal Server Error`：ディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
+- `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
+- `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution` の形式が不正、または `duration_ms` が 500 未満
+- `409 Conflict`：同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
+- `500 Internal Server Error`：セグメント番号の上限に達した、またはディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
 
 同じセグメントファイルの再 PUT では、`duration_ms` が確立済みの値と違う場合も 409 とする。
 `resolution` は省略できる。確立済みの値と違う値を指定した場合は 409 とする。
@@ -56,8 +71,9 @@ curl -i -X PUT \
 基準値は `duration_ms` を秒に直し、小数点以下を切り上げた整数（最低 1）とする。
 2 つ目以降の PUT で違う `duration_ms` を指定した場合は 409 とする。
 
-controller はメタデータがない場合でも、同じ識別子のファイルが存在すればバイト列を比較する。
-バイト列が一致すれば 200、違えば 409 とする。
+controller を再起動すると識別子とセグメント番号の対応は失われ、セグメント番号は 0 から始まる。
+再起動後に同じ識別子を PUT すると、新しい番号を割り当てて保存する。
+前の起動で保存したセグメントファイルは削除せず、新しいセグメントと番号が重なった時点で上書きする。
 
 ### セグメントファイルを取得する
 
@@ -143,10 +159,11 @@ worker は `sync_interval_ms` の間隔で sync を送る。
 ステータス：
 
 - `201 Created`：新しい worker を `PREPARING` で登録し、タイムアウトの基準時刻を現在時刻にする
-- `200 OK`：登録済みの worker の `public_url` を更新し、状態もタイムアウトの基準時刻も変えず、基準時刻は sync だけで更新する
+- `200 OK`：登録済みの worker の `public_url` を更新し、報告済みのキャッシュを無効にして `PREPARING` にする。タイムアウトの基準時刻は変えず、sync だけで更新する
 - `400 Bad Request`：`worker_id` または `public_url` が不正である
 
-`DEAD` の worker が登録を更新しても状態は `DEAD` のままとし、次の sync で `PREPARING` または `READY` にする。
+worker は登録のたびにキャッシュを捨てて取り直すため、controller も登録に合わせて報告済みのキャッシュを無効にする。
+`DEAD` の worker が登録を更新すると `PREPARING` になり、次の sync で `PREPARING` または `READY` になる。
 
 ### worker を同期する
 

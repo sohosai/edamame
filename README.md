@@ -87,11 +87,14 @@ volumes:
 セグメントファイルを PUT する。
 
 ```bash
-printf 'segment-101' > /tmp/101.ts
+printf 'segment-1' > /tmp/segment-1.ts
 curl -i -X PUT \
-  --data-binary @/tmp/101.ts \
-  'http://127.0.0.1:9000/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+  --data-binary @/tmp/segment-1.ts \
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
+
+controller が割り当てたセグメント番号がレスポンスの `sequence` に入る。
+この例では 0 になる。
 
 worker が sync するまでプレイリストは 503 を返すことがある。
 503 の間は再試行する。
@@ -104,7 +107,7 @@ curl -i --retry 30 --retry-delay 1 --retry-connrefused \
 プレイリストに worker の URL が書かれていることを確認し、セグメントファイルを取得する。
 
 ```bash
-curl -i http://127.0.0.1:9001/segments/live/720p/101.ts
+curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
 ```
 
 ## 開発
@@ -117,6 +120,8 @@ cargo test --workspace
 
 ## 制約
 
-- controller のメタデータはメモリ上だけにあり、再起動すると失われる。再起動後は publisher がセグメントファイルを再 PUT する。
-- worker のキャッシュは `--cache-dir` に保存され、再起動時に走査して復元する。
+- controller のメタデータとセグメント番号はメモリ上だけにあり、再起動すると失われる。再起動後のセグメント番号は 0 から始まる。
+- publisher は再起動後もセグメントファイルを PUT し続ける。前の実行のファイルと番号が重なった場合は上書きされる。
+- 同じセグメントには quality をまたいで同じセグメント識別子を付ける。
+- worker は登録に成功した時点でキャッシュを捨てて取り直す。起動時は `--cache-dir` を走査し、登録できるまでその内容を配信する。
 - 認証と TLS はない。private network で使う。

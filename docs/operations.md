@@ -74,11 +74,14 @@ edamame-worker \
 セグメントファイルを PUT する。
 
 ```bash
-printf 'segment-101' > /tmp/101.ts
+printf 'segment-1' > /tmp/segment-1.ts
 curl -i -X PUT \
-  --data-binary @/tmp/101.ts \
-  'http://127.0.0.1:9000/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+  --data-binary @/tmp/segment-1.ts \
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
+
+レスポンスの `sequence` が controller の割り当てたセグメント番号である。
+この例では 0 になる。
 
 worker は次の sync でセグメントファイルを取得する。
 メディアプレイリストは worker が `READY` になるまで 503 を返すことがある。
@@ -92,7 +95,7 @@ curl -i --retry 30 --retry-delay 1 --retry-connrefused \
 プレイリストに worker の URL が書かれていることを確認し、セグメントファイルを取得する。
 
 ```bash
-curl -i http://127.0.0.1:9001/segments/live/720p/101.ts
+curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
 ```
 
 ## sync とタイムアウト
@@ -111,28 +114,35 @@ worker のキャッシュ上限（`--cache-limit`）は controller の `--playli
 
 ## 容量
 
-controller はセグメントファイルを削除しない。
+controller は実行中にセグメントファイルを削除しない。
 `storage_dir` の容量は運用者が監視し、必要に応じて古いセグメントファイルを削除する。
+削除してもセグメント番号には影響しない。番号は controller のメモリ上のカウンタで決まる。
+残したセグメントファイルは、次の実行で同じ番号のセグメントを PUT したときに上書きされる。
 
 worker のキャッシュ上限は `(channel_id, quality)` ごとの上限であり、`cache_dir` 全体の容量上限ではない。
 worker は形式に合わないファイルを削除しないため、`cache_dir` の総容量は運用者が監視する。
 
+controller はセグメント識別子とセグメント番号の対応もメモリに保持する。
+セグメントファイルよりはずっと小さいが、実行中に PUT したセグメント数に比例して増える。
+
 ## 再起動
 
-controller を再起動すると、channel、quality、セグメントのメタデータと worker の登録は失われる。
-`storage_dir` のファイルは残るため、`GET /segments/...` は再起動前からあるセグメントファイルを返す。
-プレイリストを生成するには publisher がセグメントファイルを再 PUT してメタデータを作り直す。
-worker は sync の 404 を契機に再登録し、キャッシュしているセグメントファイルを報告する。再 PUT が済めば `READY` に戻る。
+controller を再起動すると、channel、quality、セグメントのメタデータ、セグメント識別子とセグメント番号の対応、worker の登録は失われる。
+セグメント番号は 0 から始まり、新しい識別子に順に割り当てる。
+`storage_dir` のセグメントファイルは削除しない。前の実行で保存したファイルは残り、新しいセグメントと番号が重なった時点で上書きされる。
+`GET /segments/...` は、同じ番号のファイルがまだ上書きされていなければ前の実行のファイルを返す。
+プレイリストは再起動後に PUT されたセグメントファイルから作り直すため、publisher がセグメントファイルを PUT するまで 404 になる。
+worker は sync の 404 を契機に再登録し、登録に成功した時点でキャッシュを捨てて取り直す。新しい範囲のセグメントファイルを取得すれば `READY` に戻る。
+client はプレイリストを取り直し、メディアシーケンスが 0 から始まるプレイリストに合わせて再同期する。
 
-再起動後も `storage_dir` のファイルが正規データである。
-同じ識別子のファイルが存在する場合、PUT のバイト列がファイルと一致すれば 200、違えば 409 とする。
-ファイルが存在しない場合は 201 で保存する。
 メタデータは最初に成功した PUT の属性から作り直す。
+同じ識別子を再 PUT すると新しい番号で保存される。
 
 worker を再起動すると、`cache_dir` を走査してキャッシュしているセグメントファイルの索引を作り直す。
 走査では `{channel_id}/{quality}/{sequence}.ts` の形式に合うファイルだけを使う。
 形式に合わないファイルは索引に入れず、削除もしない。
 索引を作った後、キャッシュ上限を超えたセグメントファイルを削除し、controller に登録する。
+登録に成功すると、その時点のキャッシュの索引とファイルを捨てて controller から取り直す。controller が停止中の間だけ、走査した内容を配信する。
 
 worker はセグメントファイルを保存するたびに、`(channel_id, quality)` ごとに、キャッシュ上限までのセグメントファイルを新しい順に残し、古いセグメントファイルを削除する。
 
@@ -145,19 +155,21 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 
 | 状況 | 動作 |
 | --- | --- |
-| controller が停止した | client はプレイリストを取得できず、worker はキャッシュしているセグメントファイルを配信し続けて sync の失敗を繰り返し、controller の復帰後に再登録する |
+| controller が停止した | client はプレイリストを取得できず、worker はキャッシュしているセグメントファイルを配信し続けて sync の失敗を繰り返し、controller の復帰後に再登録してキャッシュを捨てる |
 | worker が停止した | controller は `--sync-timeout-ms` の経過後に `DEAD` にし、他の `READY` の worker があればプレイリストはその worker を使い、なければ 503 になる |
 | セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得し、`PREPARING` のままになる |
 | セグメントファイルが欠落した | controller はその quality のプレイリストを生成せず 422 を返し、キャッシュ済みセグメントファイルの配信は続く |
+| セグメントファイルを後から削除した | 番号には影響しない。次の実行で同じ番号のセグメントを PUT したときに上書きされる |
 | controller の `storage_dir` への書き込みに失敗した | controller は 500 を返し、書き込み途中のセグメントファイルを読み手に見せず、保存済みとして扱わない |
 | worker の `cache_dir` への書き込みに失敗した | worker はログを出し、そのセグメントファイルをキャッシュ済みとして扱わず、次の sync で再取得する |
-| controller がメタデータを失った | publisher が再 PUT するまでプレイリストは 404 になり、worker はキャッシュしているセグメントファイルを報告できる |
+| controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
+| controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
 | client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗し、client がプレイリストを取得し直すと controller は別の `READY` の worker を選ぶ |
 
 ## セキュリティと信頼境界
 
 - private network で使い、認証と TLS はない
-- publisher が送る識別子は文字種を限定し、controller は `storage_dir` の外にファイルを作らない
+- publisher が送るセグメント識別子は文字種を限定し、controller は識別子をファイル名に使わず `storage_dir` の外にファイルを作らない
 - worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
 - `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く
 - CORS は GET の読み取りだけを許可し、`PUT` と `POST` には CORS ヘッダを付けない
