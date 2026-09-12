@@ -1,0 +1,13 @@
+[package]
+name = "edamame-worker"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+edamame-domain = { path = "../edamame-domain" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

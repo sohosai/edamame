@@ -1,0 +1,949 @@
+//! controller と worker の HTTP 契約と統合動作を実サーバーで確認する
+
+mod support;
+
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use support::{TempDir, spawn_controller, spawn_worker, wait_for_playlist};
+
+fn any_addr() -> std::net::SocketAddr {
+    "127.0.0.1:0".parse().unwrap()
+}
+
+struct PublishInput<'a> {
+    base_url: &'a str,
+    quality: &'a str,
+    sequence: u64,
+    duration_ms: u64,
+    bandwidth: u64,
+    resolution: &'a str,
+    body: &'a [u8],
+}
+
+async fn publish(client: &reqwest::Client, input: PublishInput<'_>) -> reqwest::Response {
+    client
+        .put(format!(
+            "{}/segments/live/{}/{}.ts?duration_ms={}&bandwidth={}&resolution={}",
+            input.base_url,
+            input.quality,
+            input.sequence,
+            input.duration_ms,
+            input.bandwidth,
+            input.resolution
+        ))
+        .body(input.body.to_vec())
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn publish_default(
+    client: &reqwest::Client,
+    base_url: &str,
+    quality: &str,
+    sequence: u64,
+) -> reqwest::Response {
+    let body = format!("segment-{quality}-{sequence}");
+    publish(
+        client,
+        PublishInput {
+            base_url,
+            quality,
+            sequence,
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: body.as_bytes(),
+        },
+    )
+    .await
+}
+
+fn cached(quality: &str, sequences: impl IntoIterator<Item = u64>) -> Vec<Value> {
+    sequences
+        .into_iter()
+        .map(|sequence| {
+            json!({
+                "channel_id": "live",
+                "quality": quality,
+                "sequence": sequence
+            })
+        })
+        .collect()
+}
+
+async fn register_worker(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker_id: &str,
+    public_url: &str,
+) -> reqwest::Response {
+    client
+        .put(format!("{base_url}/workers/{worker_id}"))
+        .json(&json!({ "public_url": public_url }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn sync_worker(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker_id: &str,
+    cached_segments: Vec<Value>,
+) -> reqwest::Response {
+    client
+        .post(format!("{base_url}/workers/{worker_id}/sync"))
+        .json(&json!({ "cached_segments": cached_segments }))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn segment_put_get_contract() {
+    let tmp = TempDir::new("segment-contract");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720",
+        controller.base_url
+    );
+    let created = client.put(&url).body("segment-101").send().await.unwrap();
+    assert_eq!(created.status().as_u16(), 201);
+    let existing = client.put(&url).body("segment-101").send().await.unwrap();
+    assert_eq!(existing.status().as_u16(), 200);
+    let conflict = client.put(&url).body("different").send().await.unwrap();
+    assert_eq!(conflict.status().as_u16(), 409);
+    let missing = client
+        .put(format!("{}/segments/live/720p/102.ts", controller.base_url))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status().as_u16(), 400);
+    let short = client
+        .put(format!(
+            "{}/segments/live/720p/102.ts?duration_ms=400&bandwidth=3000000",
+            controller.base_url
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(short.status().as_u16(), 400);
+    let get = client
+        .get(format!("{}/segments/live/720p/101.ts", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status().as_u16(), 200);
+    assert_eq!(get.bytes().await.unwrap().as_ref(), b"segment-101");
+    let not_found = client
+        .get(format!("{}/segments/live/720p/999.ts", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_found.status().as_u16(), 404);
+}
+
+/// 同じセグメントファイルへの同時 PUT は、先に保存したバイト列を上書きしない
+#[tokio::test]
+async fn concurrent_put_keeps_first_bytes() {
+    let tmp = TempDir::new("concurrent-put");
+    let storage = tmp.path.join("storage");
+    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000&resolution=1280x720",
+        controller.base_url
+    );
+    let first_body = vec![1_u8; 1024 * 1024];
+    let second_body = vec![2_u8; 1024 * 1024];
+    let (first, second) = tokio::join!(
+        client.put(&url).body(first_body.clone()).send(),
+        client.put(&url).body(second_body.clone()).send()
+    );
+    let first_status = first.unwrap().status().as_u16();
+    let second_status = second.unwrap().status().as_u16();
+    let mut statuses = [first_status, second_status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [201, 409]);
+    // 保存されたバイト列が、201 を返した側のバイト列であることを確認する
+    let stored = tokio::fs::read(storage.join("live/720p/101.ts"))
+        .await
+        .unwrap();
+    let expected = if first_status == 201 {
+        &first_body
+    } else {
+        &second_body
+    };
+    assert_eq!(&stored, expected);
+}
+
+/// 属性が競合する同時 PUT は、メタデータを確立できなかった側のファイルを残さない
+#[tokio::test]
+async fn concurrent_attribute_conflict_leaves_no_file() {
+    let tmp = TempDir::new("concurrent-attributes");
+    let storage = tmp.path.join("storage");
+    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let first_url = format!("{base}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000");
+    let second_url = format!("{base}/segments/live/720p/102.ts?duration_ms=7000&bandwidth=3000000");
+    let (first, second) = tokio::join!(
+        client.put(&first_url).body("segment-101").send(),
+        client.put(&second_url).body("segment-102").send()
+    );
+    let first_status = first.unwrap().status().as_u16();
+    let second_status = second.unwrap().status().as_u16();
+    let mut statuses = [first_status, second_status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [201, 409]);
+    // 409 になった側のファイルを残すと、正しいバイト列のセグメントファイルを登録できなくなる
+    let (accepted, rejected) = if first_status == 201 {
+        ("101", "102")
+    } else {
+        ("102", "101")
+    };
+    assert!(storage.join(format!("live/720p/{accepted}.ts")).exists());
+    assert!(!storage.join(format!("live/720p/{rejected}.ts")).exists());
+}
+
+#[tokio::test]
+async fn segment_validation_and_conflicts() {
+    let tmp = TempDir::new("segment-conflicts");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    assert_eq!(
+        publish_default(&client, base, "720p", 101)
+            .await
+            .status()
+            .as_u16(),
+        201
+    );
+    let duration_conflict = client
+        .put(format!(
+            "{base}/segments/live/720p/102.ts?duration_ms=7000&bandwidth=3000000"
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duration_conflict.status().as_u16(), 409);
+    let bandwidth_conflict = client
+        .put(format!(
+            "{base}/segments/live/720p/102.ts?duration_ms=6000&bandwidth=4000000"
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bandwidth_conflict.status().as_u16(), 409);
+    let resolution_conflict = client
+        .put(format!(
+            "{base}/segments/live/720p/102.ts?duration_ms=6000&bandwidth=3000000&resolution=1920x1080"
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resolution_conflict.status().as_u16(), 409);
+    let omitted_resolution = client
+        .put(format!(
+            "{base}/segments/live/720p/102.ts?duration_ms=6000&bandwidth=3000000"
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(omitted_resolution.status().as_u16(), 201);
+    let other_quality = client
+        .put(format!(
+            "{base}/segments/live/1080p/101.ts?duration_ms=6000&bandwidth=6000000&resolution=1920x1080"
+        ))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_quality.status().as_u16(), 201);
+}
+
+#[tokio::test]
+async fn path_traversal_is_rejected() {
+    let tmp = TempDir::new("traversal");
+    let storage = tmp.path.join("storage");
+    let controller = spawn_controller(any_addr(), storage, 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let encoded_space = client
+        .put(format!(
+            "{}/segments/bad%20channel/720p/999.ts?duration_ms=6000&bandwidth=3000000",
+            controller.base_url
+        ))
+        .body("escape")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(encoded_space.status().as_u16(), 400);
+    let encoded_backslash = client
+        .put(format!(
+            "{}/segments/live%5C..%5Croot/720p/999.ts?duration_ms=6000&bandwidth=3000000",
+            controller.base_url
+        ))
+        .body("escape")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(encoded_backslash.status().as_u16(), 400);
+    assert!(!tmp.path.join("root").exists());
+}
+
+#[tokio::test]
+async fn playlist_contract_with_ready_worker() {
+    let tmp = TempDir::new("playlist");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        assert_eq!(
+            publish_default(&client, &controller.base_url, "720p", sequence)
+                .await
+                .status()
+                .as_u16(),
+            201
+        );
+    }
+    let unavailable = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status().as_u16(), 503);
+
+    let worker_public_url = "http://worker.test";
+    let registration =
+        register_worker(&client, &controller.base_url, "worker-a", worker_public_url).await;
+    assert_eq!(registration.status().as_u16(), 201);
+    let registration_body: Value = registration.json().await.unwrap();
+    assert_eq!(registration_body["sync_interval_ms"], 1000);
+
+    let sync = sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    assert_eq!(sync.status().as_u16(), 200);
+    let sync_body: Value = sync.json().await.unwrap();
+    assert_eq!(sync_body["state"], "READY");
+    assert!(sync_body["fetch_segments"].as_array().unwrap().is_empty());
+
+    let media = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    assert_eq!(
+        media.headers().get(reqwest::header::CONTENT_TYPE).unwrap(),
+        "application/vnd.apple.mpegurl"
+    );
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-TARGETDURATION:6"));
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:101"));
+    assert!(media_body.contains("#EXTINF:6.000,"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/106.ts"));
+
+    let master = client
+        .get(format!("{}/channels/live/master.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 200);
+    let master_body = master.text().await.unwrap();
+    assert!(master_body.contains("#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720"));
+    assert!(master_body.contains("720p.m3u8"));
+}
+
+#[tokio::test]
+async fn playlist_gap_and_status_precedence() {
+    let tmp = TempDir::new("gap");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    for sequence in [101, 102, 105] {
+        assert_eq!(
+            publish_default(&client, &controller.base_url, "720p", sequence)
+                .await
+                .status()
+                .as_u16(),
+            201
+        );
+    }
+    let unknown = client
+        .get(format!(
+            "{}/channels/unknown/720p.m3u8",
+            controller.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status().as_u16(), 404);
+    let gap = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gap.status().as_u16(), 422);
+
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    let sync = sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", [101, 102, 105]),
+    )
+    .await;
+    assert_eq!(sync.status().as_u16(), 200);
+    let gap_with_worker = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gap_with_worker.status().as_u16(), 422);
+    for sequence in [103, 104] {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=105),
+    )
+    .await;
+    let filled = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(filled.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn playlist_is_not_stale_after_gap() {
+    let tmp = TempDir::new("no-stale");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    let first = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status().as_u16(), 200);
+    publish_default(&client, &controller.base_url, "720p", 110).await;
+    let second = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status().as_u16(), 422);
+}
+
+#[tokio::test]
+async fn file_deleted_in_range_returns_422() {
+    let tmp = TempDir::new("deleted");
+    let storage = tmp.path.join("storage");
+    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    assert_eq!(
+        client
+            .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    std::fs::remove_file(storage.join("live/720p/104.ts")).unwrap();
+    assert_eq!(
+        client
+            .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        422
+    );
+}
+
+#[tokio::test]
+async fn worker_registration_and_sync_contract() {
+    let tmp = TempDir::new("worker-contract");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    let created = register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    assert_eq!(created.status().as_u16(), 201);
+    let updated = register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    assert_eq!(updated.status().as_u16(), 200);
+    let preparing = sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=105),
+    )
+    .await;
+    let preparing_body: Value = preparing.json().await.unwrap();
+    assert_eq!(preparing_body["state"], "PREPARING");
+    assert_eq!(
+        preparing_body["fetch_segments"],
+        json!([{ "channel_id": "live", "quality": "720p", "sequence": 106 }])
+    );
+    let ready = sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    let ready_body: Value = ready.json().await.unwrap();
+    assert_eq!(ready_body["state"], "READY");
+    assert!(ready_body["fetch_segments"].as_array().unwrap().is_empty());
+    let unknown = sync_worker(
+        &client,
+        &controller.base_url,
+        "unknown",
+        cached("720p", 101..=106),
+    )
+    .await;
+    assert_eq!(unknown.status().as_u16(), 404);
+}
+
+/// JSON の形式が不正な入力は、ハンドラに届く前に 400 にする
+#[tokio::test]
+async fn invalid_json_returns_400() {
+    let tmp = TempDir::new("invalid-json");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    // public_url の型が違う登録は 400 にする
+    let bad_type = client
+        .put(format!("{}/workers/worker-a", controller.base_url))
+        .json(&json!({ "public_url": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_type.status().as_u16(), 400);
+    assert_eq!(
+        bad_type
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    // public_url が欠けた登録は 400 にする
+    let missing_field = client
+        .put(format!("{}/workers/worker-a", controller.base_url))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_field.status().as_u16(), 400);
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    // cached_segments の型が違う sync は 400 にする
+    let bad_sync = client
+        .post(format!("{}/workers/worker-a/sync", controller.base_url))
+        .json(&json!({ "cached_segments": "none" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_sync.status().as_u16(), 400);
+    // cached_segments が null の sync は 400 にする
+    let null_sync = client
+        .post(format!("{}/workers/worker-a/sync", controller.base_url))
+        .json(&json!({ "cached_segments": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(null_sync.status().as_u16(), 400);
+    // 壊れた JSON も 400 にする
+    let broken_sync = client
+        .post(format!("{}/workers/worker-a/sync", controller.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(broken_sync.status().as_u16(), 400);
+}
+
+/// JSON ボディの上限を超える登録は 400 にする
+#[tokio::test]
+async fn oversized_json_body_returns_400() {
+    let tmp = TempDir::new("json-limit");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    // 4 MiB を超える public_url を作る
+    let body = format!(
+        r#"{{"public_url":"http://worker.test/{}"}}"#,
+        "a".repeat(5 * 1024 * 1024)
+    );
+    assert!(body.len() > 4 * 1024 * 1024);
+    let rejected = client
+        .put(format!("{}/workers/worker-a", controller.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn worker_timeout_and_recovery() {
+    let tmp = TempDir::new("worker-timeout");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 100).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        client
+            .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    assert_eq!(
+        client
+            .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+}
+
+#[tokio::test]
+async fn registration_update_does_not_extend_timeout() {
+    let tmp = TempDir::new("registration-timeout");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 100).await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    sync_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        cached("720p", 101..=106),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let updated = register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://worker.test",
+    )
+    .await;
+    assert_eq!(updated.status().as_u16(), 200);
+    assert_eq!(
+        client
+            .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+}
+
+#[tokio::test]
+async fn large_segment_body_is_accepted() {
+    let tmp = TempDir::new("large-body");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let body = vec![7_u8; 3 * 1024 * 1024];
+    let response = publish(
+        &client,
+        PublishInput {
+            base_url: &controller.base_url,
+            quality: "720p",
+            sequence: 101,
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: &body,
+        },
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+}
+
+#[tokio::test]
+async fn controller_restart_compares_existing_bytes() {
+    let tmp = TempDir::new("restart-bytes");
+    let storage = tmp.path.join("storage");
+    let first = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let first_addr = first.addr;
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000",
+        first.base_url
+    );
+    assert_eq!(
+        client
+            .put(&url)
+            .body("same")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        201
+    );
+    first.shutdown().await;
+    let second = spawn_controller(first_addr, storage, 6, 1000, 10000).await;
+    let url = format!(
+        "{}/segments/live/720p/101.ts?duration_ms=6000&bandwidth=3000000",
+        second.base_url
+    );
+    assert_eq!(
+        client
+            .put(&url)
+            .body("same")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        client
+            .put(&url)
+            .body("different")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        409
+    );
+}
+
+#[tokio::test]
+async fn end_to_end_publish_sync_playlist_serve() {
+    let tmp = TempDir::new("e2e");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    let media = wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+    )
+    .await;
+    assert!(media.contains(&format!("{}/segments/live/720p/106.ts", worker.base_url)));
+    let segment = client
+        .get(format!("{}/segments/live/720p/106.ts", worker.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(segment.status().as_u16(), 200);
+    assert_eq!(segment.bytes().await.unwrap().as_ref(), b"segment-720p-106");
+}
+
+#[tokio::test]
+async fn controller_restart_recovery() {
+    let tmp = TempDir::new("controller-restart");
+    let storage = tmp.path.join("storage");
+    let first = spawn_controller(any_addr(), storage.clone(), 6, 50, 1000).await;
+    let first_addr = first.addr;
+    let first_base_url = first.base_url.clone();
+    let worker = spawn_worker(
+        "worker-a",
+        &first_base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &first_base_url, "720p", sequence).await;
+    }
+    let first_media = wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", first_base_url),
+    )
+    .await;
+    assert!(first_media.contains(&worker.base_url));
+    first.shutdown().await;
+    let second = spawn_controller(first_addr, storage, 6, 50, 1000).await;
+    for sequence in 101..=106 {
+        let status = publish_default(&client, &second.base_url, "720p", sequence)
+            .await
+            .status()
+            .as_u16();
+        assert!(
+            status == 200 || status == 201,
+            "unexpected status: {status}"
+        );
+    }
+    let second_media = wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", second.base_url),
+    )
+    .await;
+    assert!(second_media.contains(&worker.base_url));
+    let segment = client
+        .get(format!("{}/segments/live/720p/101.ts", worker.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(segment.status().as_u16(), 200);
+}
+
+/// キャッシュがプレイリストの範囲より新しいセグメント番号で埋まっていても、worker は古い範囲を取得して READY になる
+#[tokio::test]
+async fn worker_recovers_when_cache_is_newer_than_playlist_range() {
+    let tmp = TempDir::new("newer-cache");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let cache_dir = tmp.path.join("cache");
+    tokio::fs::create_dir_all(cache_dir.join("live/720p"))
+        .await
+        .unwrap();
+    for sequence in 105..=110 {
+        tokio::fs::write(
+            cache_dir.join(format!("live/720p/{sequence}.ts")),
+            format!("segment-720p-{sequence}"),
+        )
+        .await
+        .unwrap();
+    }
+    let client = reqwest::Client::new();
+    for sequence in 101..=106 {
+        publish_default(&client, &controller.base_url, "720p", sequence).await;
+    }
+    let worker = spawn_worker("worker-a", &controller.base_url, cache_dir, 6, true).await;
+    let media = wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+    )
+    .await;
+    assert!(media.contains(&format!("{}/segments/live/720p/101.ts", worker.base_url)));
+    let segment = client
+        .get(format!("{}/segments/live/720p/106.ts", worker.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(segment.status().as_u16(), 200);
+}

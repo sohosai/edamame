@@ -1,0 +1,32 @@
+//! Edamame の controller と worker で共有するドメイン型と純粋な処理
+
+pub mod error;
+pub mod playlist;
+pub mod segment;
+pub mod state;
+pub mod url;
+pub mod wire;
+
+pub use error::EdamameError;
+pub use playlist::{
+    MasterQuality, MediaPlaylist, QualityPlaylistInput, plan_master_playlist, plan_media_playlist,
+    render_master_playlist, render_media_playlist,
+};
+pub use segment::{
+    SegmentId, SegmentKey, parse_sequence_filename, render_filename, validate_identifier,
+    validate_quality, validate_resolution,
+};
+pub use state::{WorkerStateKind, evaluate_worker_state};
+pub use url::normalize_http_url;
+pub use wire::{RegisterRequest, RegisterResponse, SyncRequest, SyncResponse};
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Unix エポックからの現在時刻をミリ秒で返す
+#[must_use]
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
