@@ -21,10 +21,14 @@ pub async fn run_sync_loop(state: Arc<WorkerState>) {
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         if !registered {
+            // 前の登録で始めた取得が残っていると、捨てたキャッシュを古い内容で埋め直すため止める
+            stop_fetch(&mut fetch_task).await;
             match register(&state).await {
                 Ok(received_interval_ms) => {
                     registered = true;
                     interval_ms = received_interval_ms;
+                    // 前の登録で集めたキャッシュは controller の前の起動のものかもしれないため捨てる
+                    discard_cache(&state).await;
                 }
                 Err(error) => {
                     eprintln!("registration failed: {error}");
@@ -56,6 +60,31 @@ pub async fn run_sync_loop(state: Arc<WorkerState>) {
             Err(error) => eprintln!("sync failed: {error}"),
         }
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+    }
+}
+
+/// 進行中のセグメント取得を止める
+async fn stop_fetch(fetch_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = fetch_task.take() {
+        handle.abort();
+        // 中断が終わるまで待ち、あとからキャッシュを書き換えないようにする
+        let _ = handle.await;
+    }
+}
+
+/// キャッシュの索引とファイルを捨てて、controller から取り直せるようにする
+async fn discard_cache(state: &WorkerState) {
+    let paths = {
+        let mut cache = state.cache.lock().await;
+        cache.clear_all()
+    };
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            eprintln!(
+                "failed to remove cached segment {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 

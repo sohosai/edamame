@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use edamame_domain::{
     EdamameError, QualityPlaylistInput, SegmentId, SegmentKey, SyncResponse, WorkerStateKind,
-    evaluate_worker_state, normalize_http_url, parse_sequence_filename, plan_master_playlist,
-    plan_media_playlist, render_master_playlist, render_media_playlist, validate_identifier,
-    validate_quality, validate_resolution,
+    evaluate_worker_state, normalize_http_url, plan_master_playlist, plan_media_playlist,
+    render_master_playlist, render_media_playlist, validate_identifier, validate_quality,
+    validate_resolution,
 };
 use tokio::sync::Mutex;
 
@@ -20,7 +20,7 @@ pub struct ControllerState {
     pub sync_interval_ms: u64,
     pub sync_timeout_ms: u64,
     pub inner: Mutex<Inner>,
-    /// セグメントの属性確認からメタデータの更新までを直列化する
+    /// セグメントの属性確認と番号の割り当てからメタデータの更新までを直列化する
     write_lock: Mutex<()>,
 }
 
@@ -35,6 +35,28 @@ pub struct Inner {
 pub struct ChannelState {
     pub segment_duration_ms: u64,
     pub qualities: BTreeMap<String, QualityState>,
+    /// セグメント識別子から割り当てたセグメント番号への対応
+    pub identifiers: BTreeMap<String, IdentifierState>,
+    /// 次に新しい識別子へ割り当てるセグメント番号
+    pub next_sequence: u64,
+}
+
+/// セグメント識別子に割り当てた番号と、セグメントファイルを保存した quality
+pub struct IdentifierState {
+    pub sequence: u64,
+    pub qualities: BTreeSet<String>,
+}
+
+impl ChannelState {
+    /// channel の状態を作る
+    fn new(segment_duration_ms: u64, next_sequence: u64) -> Self {
+        Self {
+            segment_duration_ms,
+            qualities: BTreeMap::new(),
+            identifiers: BTreeMap::new(),
+            next_sequence,
+        }
+    }
 }
 
 /// quality のメタデータ
@@ -56,15 +78,17 @@ pub struct WorkerState {
 /// セグメント登録の結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestOutcome {
-    Created,
-    AlreadyExists,
+    /// 新しいセグメントファイルを保存した
+    Created { sequence: u64 },
+    /// 同じ識別子のセグメントファイルがすでにあり、バイト列も同じである
+    AlreadyExists { sequence: u64 },
 }
 
 /// セグメント登録の入力
 pub struct SegmentIngest<'a> {
     pub channel_id: &'a str,
     pub quality: &'a str,
-    pub filename: &'a str,
+    pub identifier: &'a str,
     pub duration_ms: u64,
     pub bandwidth: u64,
     pub resolution: Option<String>,
@@ -90,7 +114,7 @@ impl ControllerState {
         })
     }
 
-    /// セグメントを検証して保存する
+    /// セグメントを検証し、識別子にセグメント番号を割り当てて保存する
     pub async fn ingest_segment(
         &self,
         input: SegmentIngest<'_>,
@@ -98,7 +122,7 @@ impl ControllerState {
         let SegmentIngest {
             channel_id,
             quality,
-            filename,
+            identifier,
             duration_ms,
             bandwidth,
             resolution,
@@ -106,7 +130,7 @@ impl ControllerState {
         } = input;
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
-        let sequence = parse_sequence_filename(filename)?;
+        validate_identifier("identifier", identifier)?;
         if duration_ms < 500 {
             return Err(EdamameError::BadRequest(
                 "duration_ms must be at least 500".to_owned(),
@@ -121,9 +145,10 @@ impl ControllerState {
             validate_resolution(value)?;
         }
 
-        // 属性の確認からメタデータの更新までを直列化する。ファイル I/O の間も inner の mutex は保持しない。
+        // 属性の確認と番号の割り当てを直列化する。ファイル I/O の間も inner の mutex は保持しない。
         let _write_guard = self.write_lock.lock().await;
-        {
+        // 保存に成功したときだけメタデータを確定するため、ここでは割り当てる番号を決めるだけにする
+        let (sequence, known_identifier, stored_in_quality, next_sequence) = {
             let inner = self.inner.lock().await;
             validate_segment_metadata(
                 &inner,
@@ -133,38 +158,76 @@ impl ControllerState {
                 bandwidth,
                 resolution.as_deref(),
             )?;
-        }
-
-        let outcome = if self
-            .store
-            .segment_exists(channel_id, quality, sequence)
-            .await?
-        {
-            let existing = self
-                .store
-                .read_segment(channel_id, quality, sequence)
-                .await?;
-            if existing != bytes {
-                return Err(EdamameError::Conflict(
-                    "segment bytes differ from the canonical file".to_owned(),
-                ));
+            match inner.channels.get(channel_id) {
+                Some(channel) => match channel.identifiers.get(identifier) {
+                    Some(state) => (
+                        state.sequence,
+                        true,
+                        // 同じ quality に保存済みの場合だけ、バイト列を比較する
+                        state.qualities.contains(quality),
+                        channel.next_sequence,
+                    ),
+                    None => (
+                        channel.next_sequence,
+                        false,
+                        false,
+                        channel.next_sequence.checked_add(1).ok_or_else(|| {
+                            EdamameError::Internal("segment sequence is exhausted".to_owned())
+                        })?,
+                    ),
+                },
+                // controller の起動ごとに 0 から採番する
+                None => (0, false, false, 1),
             }
-            IngestOutcome::AlreadyExists
+        };
+
+        let outcome = if stored_in_quality {
+            // 同じ識別子の再 PUT は、保存済みのバイト列と同じ場合だけ受け付ける
+            if self
+                .store
+                .segment_exists(channel_id, quality, sequence)
+                .await?
+            {
+                let existing = self
+                    .store
+                    .read_segment(channel_id, quality, sequence)
+                    .await?;
+                if existing != bytes {
+                    return Err(EdamameError::Conflict(
+                        "segment bytes differ from the canonical file".to_owned(),
+                    ));
+                }
+                IngestOutcome::AlreadyExists { sequence }
+            } else {
+                self.store
+                    .write_segment(channel_id, quality, sequence, bytes)
+                    .await?;
+                IngestOutcome::Created { sequence }
+            }
         } else {
+            // この quality に初めて保存する。前の実行のファイルと同じ番号になっても上書きする
             self.store
                 .write_segment(channel_id, quality, sequence, bytes)
                 .await?;
-            IngestOutcome::Created
+            IngestOutcome::Created { sequence }
         };
 
         let mut inner = self.inner.lock().await;
         let channel = inner
             .channels
             .entry(channel_id.to_owned())
-            .or_insert_with(|| ChannelState {
-                segment_duration_ms: duration_ms,
-                qualities: BTreeMap::new(),
+            .or_insert_with(|| ChannelState::new(duration_ms, next_sequence));
+        let identifier_state = channel
+            .identifiers
+            .entry(identifier.to_owned())
+            .or_insert_with(|| IdentifierState {
+                sequence,
+                qualities: BTreeSet::new(),
             });
+        identifier_state.qualities.insert(quality.to_owned());
+        if !known_identifier {
+            channel.next_sequence = next_sequence;
+        }
         let quality_state = channel
             .qualities
             .entry(quality.to_owned())
@@ -193,6 +256,9 @@ impl ControllerState {
         let mut inner = self.inner.lock().await;
         if let Some(worker) = inner.workers.get_mut(worker_id) {
             worker.public_url = public_url;
+            // worker は登録のたびにキャッシュを捨てるため、報告済みのキャッシュも無効にする
+            worker.cached = BTreeSet::new();
+            worker.state = WorkerStateKind::Preparing;
             Ok(false)
         } else {
             inner.workers.insert(

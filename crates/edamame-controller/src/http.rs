@@ -10,8 +10,8 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use edamame_domain::{
-    CorsOrigins, EdamameError, RegisterRequest, RegisterResponse, SyncRequest, SyncResponse,
-    now_ms, parse_sequence_filename, validate_identifier, validate_quality,
+    CorsOrigins, EdamameError, RegisterRequest, RegisterResponse, SegmentPutResponse, SyncRequest,
+    SyncResponse, now_ms, parse_sequence_filename, validate_identifier, validate_quality,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -29,6 +29,7 @@ const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// controller のルーター
 pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins) -> Router {
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
+    // PUT の第 3 要素はセグメント識別子、GET の第 3 要素はセグメント番号のファイル名として同じ形のパスを使う
     let read = Router::new()
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
@@ -117,25 +118,26 @@ struct SegmentQuery {
 
 async fn put_segment(
     State(state): State<Arc<ControllerState>>,
-    Path((channel_id, quality, filename)): Path<(String, String, String)>,
+    Path((channel_id, quality, identifier)): Path<(String, String, String)>,
     Query(query): Query<SegmentQuery>,
     body: Bytes,
-) -> Result<StatusCode, HttpError> {
+) -> Result<Response, HttpError> {
     let outcome = state
         .ingest_segment(SegmentIngest {
             channel_id: &channel_id,
             quality: &quality,
-            filename: &filename,
+            identifier: &identifier,
             duration_ms: query.duration_ms,
             bandwidth: query.bandwidth,
             resolution: query.resolution,
             bytes: &body,
         })
         .await?;
-    Ok(match outcome {
-        IngestOutcome::Created => StatusCode::CREATED,
-        IngestOutcome::AlreadyExists => StatusCode::OK,
-    })
+    let (status, sequence) = match outcome {
+        IngestOutcome::Created { sequence } => (StatusCode::CREATED, sequence),
+        IngestOutcome::AlreadyExists { sequence } => (StatusCode::OK, sequence),
+    };
+    Ok((status, Json(SegmentPutResponse { sequence })).into_response())
 }
 
 async fn get_segment(

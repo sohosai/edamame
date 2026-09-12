@@ -189,3 +189,21 @@ pub async fn wait_for_playlist(client: &reqwest::Client, url: &str) -> String {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// セグメントファイルが期待するバイト列で取得できるまで待つ
+pub async fn wait_for_segment(client: &reqwest::Client, url: &str, expected: &[u8]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.get(url).send().await.unwrap();
+        if response.status().is_success() {
+            let bytes = response.bytes().await.unwrap();
+            if bytes.as_ref() == expected {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("セグメントファイルが期待する内容になりません: {url}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

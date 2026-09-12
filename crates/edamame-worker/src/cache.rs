@@ -105,6 +105,18 @@ impl Cache {
             .collect()
     }
 
+    /// 索引にあるセグメントをすべて取り除き、削除するファイルのパスを返す
+    pub fn clear_all(&mut self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for ((channel_id, quality), sequences) in &self.entries {
+            for sequence in sequences {
+                paths.push(self.path(channel_id, quality, *sequence));
+            }
+        }
+        self.entries.clear();
+        paths
+    }
+
     /// sync に送るキャッシュ一覧
     #[must_use]
     pub fn keys(&self) -> Vec<SegmentKey> {

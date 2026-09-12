@@ -20,7 +20,7 @@ pub use segment::{
 };
 pub use state::{WorkerStateKind, evaluate_worker_state};
 pub use url::normalize_http_url;
-pub use wire::{RegisterRequest, RegisterResponse, SyncRequest, SyncResponse};
+pub use wire::{RegisterRequest, RegisterResponse, SegmentPutResponse, SyncRequest, SyncResponse};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

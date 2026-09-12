@@ -1,9 +1,15 @@
-//! controller と worker の間で使う JSON の型
+//! HTTP API で使う JSON の型
 
 use serde::{Deserialize, Serialize};
 
 use crate::segment::SegmentKey;
 use crate::state::WorkerStateKind;
+
+/// セグメントファイルの登録レスポンス
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SegmentPutResponse {
+    pub sequence: u64,
+}
 
 /// worker の登録リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
