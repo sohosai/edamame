@@ -67,7 +67,7 @@ pub fn plan_media_playlist(
     })
 }
 
-/// 全 quality の範囲が一致する場合だけマスタープレイリストを計算する
+/// quality ごとの範囲を持つマスタープレイリストを計算する
 pub fn plan_master_playlist(
     qualities: &BTreeMap<String, QualityPlaylistInput>,
     segment_duration_ms: u64,
@@ -79,7 +79,6 @@ pub fn plan_master_playlist(
         ));
     }
     let mut entries = Vec::new();
-    let mut common_range = None;
     for (quality, input) in qualities {
         let playlist =
             plan_media_playlist(&input.segments, segment_duration_ms, playlist_segments)?;
@@ -88,15 +87,6 @@ pub fn plan_master_playlist(
             .last()
             .ok_or_else(|| EdamameError::Unprocessable("playlist is empty".to_owned()))?;
         let range = (playlist.media_sequence, last);
-        match common_range {
-            None => common_range = Some(range),
-            Some(existing) if existing != range => {
-                return Err(EdamameError::Unprocessable(
-                    "qualities have different playlist ranges".to_owned(),
-                ));
-            }
-            _ => {}
-        }
         entries.push(MasterQuality {
             quality: quality.clone(),
             bandwidth: input.bandwidth,
@@ -201,5 +191,30 @@ mod tests {
         let rendered = render_master_playlist(&entries);
         assert!(rendered.contains("#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720"));
         assert!(rendered.contains("720p.m3u8"));
+    }
+
+    #[test]
+    fn allows_qualities_with_different_ranges() {
+        let qualities = BTreeMap::from([
+            (
+                "480p".to_owned(),
+                QualityPlaylistInput {
+                    bandwidth: 1_000_000,
+                    resolution: None,
+                    segments: segments(&[201, 202, 203]),
+                },
+            ),
+            (
+                "720p".to_owned(),
+                QualityPlaylistInput {
+                    bandwidth: 3_000_000,
+                    resolution: None,
+                    segments: segments(&[101, 102, 103]),
+                },
+            ),
+        ]);
+        let entries = plan_master_playlist(&qualities, 6000, 6).unwrap();
+        assert_eq!(entries[0].range, (201, 203));
+        assert_eq!(entries[1].range, (101, 103));
     }
 }

@@ -1,7 +1,7 @@
 //! `edamame-controller` の起動処理
 
 use clap::Parser;
-use edamame_controller::config::ControllerConfig;
+use edamame_controller::config::{ControllerConfig, DEFAULT_PUBLISH_WAIT_MS};
 use edamame_controller::http::router;
 use edamame_controller::state::ControllerState;
 use edamame_controller::storage::CanonicalStore;
@@ -12,6 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     if config.sync_timeout_ms < config.sync_interval_ms.saturating_mul(3) {
         eprintln!("warning: sync timeout is less than 3 times the sync interval");
+    }
+    if config.publish_wait_ms.is_none() {
+        eprintln!(
+            "warning: --publish-wait-ms is not specified; using {DEFAULT_PUBLISH_WAIT_MS} ms"
+        );
     }
     let cors = config.cors_origins()?;
     if config.cors_origin.is_empty() {
@@ -26,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.playlist_segments,
         config.sync_interval_ms,
         config.sync_timeout_ms,
+        config.publish_wait_ms(),
     );
     let app = router(state, &cors);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;

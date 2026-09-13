@@ -17,7 +17,7 @@
 - プレイリストの Content-Type は `application/vnd.apple.mpegurl`、セグメントファイルの Content-Type は `application/octet-stream` とする
 - 認証はなく、private network で使う前提とする
 - ブラウザからは GET だけ cross-origin で読める。許可する origin は controller と worker の `--cors-origin` で指定し、省略すると CORS ヘッダを返さない
-- ステータスコードは 400、404、422、503 の順に判定し、入力が不正なら 400、対象が存在しなければ 404、プレイリストを生成できなければ 422、配信できる worker がなければ 503 を返す
+- ステータスコードは 400、404、422、503 の順に判定し、入力が不正なら 400、対象が存在しなければ 404、公開範囲のセグメントファイルが欠落していれば 422、公開範囲または配信先 worker がなければ 503 を返す
 - 予期しない内部エラーは 500 を返す
 
 ## controller の API
@@ -104,8 +104,10 @@ GET /channels/{channel_id}/master.m3u8
 - `200 OK`：マスタープレイリストを返す
 - `400 Bad Request`：`channel_id` が不正である
 - `404 Not Found`：channel が存在しない
-- `422 Unprocessable Entity`：quality の配信範囲が一致しない、または quality のメディアプレイリストを生成できない
-- `503 Service Unavailable`：`READY` の worker がない
+- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
+- `503 Service Unavailable`：配信できる quality がない
+
+quality 間で公開範囲が違ってもよい。
 
 ### メディアプレイリストを取得する
 
@@ -120,8 +122,8 @@ GET /channels/{channel_id}/{quality}.m3u8
 - `200 OK`：メディアプレイリストを返す
 - `400 Bad Request`：`channel_id` または `quality` が不正である
 - `404 Not Found`：channel または quality が存在しない
-- `422 Unprocessable Entity`：直近のセグメントの範囲で最新のセグメント番号までの間に欠落したセグメント番号があり、controller がメディアプレイリストを生成できない
-- `503 Service Unavailable`：`READY` の worker がない
+- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
+- `503 Service Unavailable`：その quality の公開範囲または配信先 worker がない
 
 ### worker を登録する
 
@@ -158,12 +160,12 @@ worker は `sync_interval_ms` の間隔で sync を送る。
 
 ステータス：
 
-- `201 Created`：新しい worker を `PREPARING` で登録し、タイムアウトの基準時刻を現在時刻にする
-- `200 OK`：登録済みの worker の `public_url` を更新し、報告済みのキャッシュを無効にして `PREPARING` にする。タイムアウトの基準時刻は変えず、sync だけで更新する
+- `201 Created`：新しい worker を登録し、タイムアウトの基準時刻を現在時刻にする
+- `200 OK`：登録済みの worker の `public_url` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は変えず、sync だけで更新する
 - `400 Bad Request`：`worker_id` または `public_url` が不正である
 
 worker は登録のたびにキャッシュを捨てて取り直すため、controller も登録に合わせて報告済みのキャッシュを無効にする。
-`DEAD` の worker が登録を更新すると `PREPARING` になり、次の sync で `PREPARING` または `READY` になる。
+sync が `--sync-timeout-ms` を超えて届かない worker は配信先の候補から外れる。
 
 ### worker を同期する
 
@@ -185,7 +187,6 @@ POST /workers/{worker_id}/sync
 
 ```json
 {
-  "state": "PREPARING",
   "fetch_segments": [
     { "channel_id": "live", "quality": "720p", "sequence": 102 }
   ]
@@ -194,15 +195,18 @@ POST /workers/{worker_id}/sync
 
 worker は登録時に受け取った `sync_interval_ms` の間隔でこのエンドポイントを呼ぶ。
 リクエストのキャッシュ一覧（`cached_segments`）には、その時点でキャッシュしているセグメントファイルをすべて入れる。
-controller は worker の状態を評価し、`state` と `fetch_segments` を返す。
+controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
 `fetch_segments` には、キャッシュ対象のうちキャッシュ一覧に含まれないセグメント（未キャッシュのセグメント）を入れる。
 ここでキャッシュ対象とは、全 channel と全 quality の直近のセグメントの範囲に存在するセグメントの集合である。
 `fetch_segments` の各項目は `channel_id`、`quality`、`sequence` を持ち、worker は `{sequence}.ts` を取得する。
-`state` は `PREPARING` または `READY` になる。
-`DEAD` は controller がタイムアウトで付ける状態であり、sync を受けた worker は `PREPARING` に戻ってから評価される。
+controller は最初の未公開セグメントファイルを PUT した時刻から `--publish-wait-ms` だけ待つ。
+追加の PUT では待ち時間を延長しない。
+公開待ちの間は、未公開セグメントを公開範囲の候補に含めない。
+公開待ちが終わった範囲について、sync が届いている worker が連続してキャッシュしている最新範囲を、その quality の公開範囲にする。
+公開範囲は quality ごとに独立して決める。
 
-現在のキャッシュ対象に含まれないセグメントをキャッシュ一覧に入れてもよい。
-そのセグメントは `READY` の判定には使わない。
+controller は sync が `--sync-timeout-ms` 以内に届いている worker だけを配信先の候補にする。
+応答に worker の状態は含めない。
 
 ステータス：
 
@@ -238,8 +242,8 @@ worker                           controller
   |                                       |
   |-- POST /workers/{id}/sync ----------->|
   |   cached_segments                     |
-  |                                       |  状態を評価する
-  |<-- state, fetch_segments -------------|
+  |                                       |  公開範囲を評価する
+  |<-- fetch_segments --------------------|
   |                                       |
   |-- GET /segments/... ----------------->|
   |<-- bytes -----------------------------|
@@ -250,6 +254,7 @@ worker                           controller
 手順は次のとおり。
 
 1. worker は登録時に受け取った `sync_interval_ms` の間隔で sync を送る。
-2. controller は worker の状態を評価し、`fetch_segments` を返す。
+2. controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
 3. worker は `fetch_segments` の各項目を `{controller-url}/segments/{channel_id}/{quality}/{sequence}.ts` から GET する。
 4. worker は取得したセグメントファイルを保存し、次の sync でキャッシュ一覧に含めて報告する。
+5. controller は公開待ちの時間が過ぎていれば quality ごとに公開範囲を進め、次のプレイリストリクエストから新しい範囲を返す。

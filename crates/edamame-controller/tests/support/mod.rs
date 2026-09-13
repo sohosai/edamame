@@ -70,12 +70,34 @@ pub async fn spawn_controller(
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
 ) -> ControllerHandle {
-    spawn_controller_with_cors(
+    spawn_controller_with_options(
         addr,
         storage_dir,
         playlist_segments,
         sync_interval_ms,
         sync_timeout_ms,
+        0,
+        CorsOrigins::Disabled,
+    )
+    .await
+}
+
+/// 公開待ち時間を指定して controller を実際の HTTP サーバーとして起動する
+pub async fn spawn_controller_with_publish_wait(
+    addr: SocketAddr,
+    storage_dir: PathBuf,
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    publish_wait_ms: u64,
+) -> ControllerHandle {
+    spawn_controller_with_options(
+        addr,
+        storage_dir,
+        playlist_segments,
+        sync_interval_ms,
+        sync_timeout_ms,
+        publish_wait_ms,
         CorsOrigins::Disabled,
     )
     .await
@@ -90,9 +112,37 @@ pub async fn spawn_controller_with_cors(
     sync_timeout_ms: u64,
     cors: CorsOrigins,
 ) -> ControllerHandle {
+    spawn_controller_with_options(
+        addr,
+        storage_dir,
+        playlist_segments,
+        sync_interval_ms,
+        sync_timeout_ms,
+        0,
+        cors,
+    )
+    .await
+}
+
+/// controller の全設定を指定して実際の HTTP サーバーとして起動する
+async fn spawn_controller_with_options(
+    addr: SocketAddr,
+    storage_dir: PathBuf,
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    publish_wait_ms: u64,
+    cors: CorsOrigins,
+) -> ControllerHandle {
     tokio::fs::create_dir_all(&storage_dir).await.unwrap();
     let store = CanonicalStore::new(storage_dir);
-    let state = ControllerState::new(store, playlist_segments, sync_interval_ms, sync_timeout_ms);
+    let state = ControllerState::new(
+        store,
+        playlist_segments,
+        sync_interval_ms,
+        sync_timeout_ms,
+        publish_wait_ms,
+    );
     let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = controller_router(state.clone(), &cors);
@@ -185,6 +235,28 @@ pub async fn wait_for_playlist(client: &reqwest::Client, url: &str) -> String {
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("playlist did not become available: {}", response.status());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// playlist が 200 になり、指定した文字列を含むまで待つ
+pub async fn wait_for_playlist_contains(
+    client: &reqwest::Client,
+    url: &str,
+    expected: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client.get(url).send().await.unwrap();
+        if response.status().is_success() {
+            let body = response.text().await.unwrap();
+            if body.contains(expected) {
+                return body;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("playlist did not contain {expected}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

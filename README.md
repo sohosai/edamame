@@ -24,6 +24,7 @@ cargo run -p edamame-controller -- \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
+  --publish-wait-ms 2000 \
   --cors-origin '*'
 ```
 
@@ -54,6 +55,7 @@ services:
       - --playlist-segments=6
       - --sync-interval-ms=1000
       - --sync-timeout-ms=10000
+      - --publish-wait-ms=2000
       - --cors-origin=*
     ports:
       - "9000:9000"
@@ -96,8 +98,9 @@ curl -i -X PUT \
 controller が割り当てたセグメント番号がレスポンスの `sequence` に入る。
 この例では 0 になる。
 
-worker が sync するまでプレイリストは 503 を返すことがある。
-503 の間は再試行する。
+最初の公開範囲ができるまで、プレイリストは 503 を返すことがある。
+公開範囲ができた後は、新しいセグメントファイルを PUT しても `--publish-wait-ms` の間は前のプレイリストを返す。
+503 が続く場合は、その quality の公開範囲を保持している worker がいるか確認する。
 
 ```bash
 curl -i --retry 30 --retry-delay 1 --retry-connrefused \
@@ -123,5 +126,8 @@ cargo test --workspace
 - controller のメタデータとセグメント番号はメモリ上だけにあり、再起動すると失われる。再起動後のセグメント番号は 0 から始まる。
 - publisher は再起動後もセグメントファイルを PUT し続ける。前の実行のファイルと番号が重なった場合は上書きされる。
 - 同じセグメントには quality をまたいで同じセグメント識別子を付ける。
+- セグメントファイルをプレイリストに反映するまでには、`--publish-wait-ms` と worker の sync と取得の分だけ遅れる。
+- quality ごとに公開範囲は独立して決まり、メディアプレイリストは前進・後退・飛び得る。
+- worker の `--cache-limit` は controller の `--playlist-segments` より 1 以上大きくすることを推奨する。小さい場合、前の公開範囲を保持できず、controller が次の sync で保持されている最新の連続範囲へ切り替える。
 - worker は登録に成功した時点でキャッシュを捨てて取り直す。起動時は `--cache-dir` を走査し、登録できるまでその内容を配信する。
 - 認証と TLS はない。private network で使う。

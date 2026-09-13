@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use edamame_domain::{CorsOrigins, EdamameError};
 
+pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
+
 /// `edamame-controller` の設定
 #[derive(Debug, Clone, Parser)]
 #[command(name = "edamame-controller", about = "Edamame controller")]
@@ -26,9 +28,13 @@ pub struct ControllerConfig {
     #[arg(long)]
     pub sync_interval_ms: u64,
 
-    /// worker を DEAD と見なすまでの待ち時間
+    /// sync が届かない worker を配信先から外すまでの待ち時間
     #[arg(long)]
     pub sync_timeout_ms: u64,
+
+    /// 新しいセグメントを公開する前に worker の取得を待つ時間
+    #[arg(long)]
+    pub publish_wait_ms: Option<u64>,
 
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
     #[arg(long, value_delimiter = ',')]
@@ -59,6 +65,12 @@ impl ControllerConfig {
     /// CORS の設定を検証して返す
     pub fn cors_origins(&self) -> Result<CorsOrigins, EdamameError> {
         CorsOrigins::parse(&self.cors_origin)
+    }
+
+    /// 公開までの待ち時間を返す。未指定なら既定値を使う。
+    #[must_use]
+    pub fn publish_wait_ms(&self) -> u64 {
+        self.publish_wait_ms.unwrap_or(DEFAULT_PUBLISH_WAIT_MS)
     }
 }
 
@@ -124,6 +136,21 @@ mod tests {
         let config = ControllerConfig::try_parse_from(base_args()).unwrap();
         assert!(config.cors_origin.is_empty());
         assert_eq!(config.cors_origins().unwrap(), CorsOrigins::Disabled);
+    }
+
+    #[test]
+    fn uses_default_publish_wait_when_missing() {
+        let config = ControllerConfig::try_parse_from(base_args()).unwrap();
+        assert_eq!(config.publish_wait_ms, None);
+        assert_eq!(config.publish_wait_ms(), DEFAULT_PUBLISH_WAIT_MS);
+    }
+
+    #[test]
+    fn accepts_explicit_publish_wait() {
+        let mut args = base_args();
+        args.extend(["--publish-wait-ms", "0"]);
+        let config = ControllerConfig::try_parse_from(args).unwrap();
+        assert_eq!(config.publish_wait_ms(), 0);
     }
 
     #[test]

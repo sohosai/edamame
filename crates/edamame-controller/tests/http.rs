@@ -7,8 +7,9 @@ use std::time::Duration;
 use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
 use support::{
-    TempDir, spawn_controller, spawn_controller_with_cors, spawn_worker, spawn_worker_with_cors,
-    wait_for_playlist, wait_for_segment,
+    TempDir, spawn_controller, spawn_controller_with_cors, spawn_controller_with_publish_wait,
+    spawn_worker, spawn_worker_with_cors, wait_for_playlist, wait_for_playlist_contains,
+    wait_for_segment,
 };
 
 fn any_addr() -> std::net::SocketAddr {
@@ -472,7 +473,6 @@ async fn playlist_contract_with_ready_worker() {
     let sync = sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
     assert_eq!(sync.status().as_u16(), 200);
     let sync_body: Value = sync.json().await.unwrap();
-    assert_eq!(sync_body["state"], "READY");
     assert!(sync_body["fetch_segments"].as_array().unwrap().is_empty());
 
     let media = client
@@ -523,7 +523,8 @@ async fn playlist_gap_from_missing_quality_segment_is_filled() {
         .send()
         .await
         .unwrap();
-    assert_eq!(gap.status().as_u16(), 422);
+    // 欠落した範囲はまだ公開しない
+    assert_eq!(gap.status().as_u16(), 503);
 
     register_worker(&client, base, "worker-a", "http://worker.test").await;
     let sync = sync_worker(&client, base, "worker-a", cached("720p", 0..3)).await;
@@ -533,15 +534,14 @@ async fn playlist_gap_from_missing_quality_segment_is_filled() {
         .send()
         .await
         .unwrap();
-    assert_eq!(gap_with_worker.status().as_u16(), 422);
+    assert_eq!(gap_with_worker.status().as_u16(), 503);
 
     // 欠けた識別子は、別の quality が先に割り当てた番号を使う
     assert_eq!(publish_segment(&client, base, "480p", "seg-1").await, 1);
     let mut cached_segments = cached("720p", 0..3);
     cached_segments.extend(cached("480p", 0..3));
     let sync = sync_worker(&client, base, "worker-a", cached_segments).await;
-    let sync_body: Value = sync.json().await.unwrap();
-    assert_eq!(sync_body["state"], "READY");
+    assert_eq!(sync.status().as_u16(), 200);
     let filled = client
         .get(format!("{base}/channels/live/480p.m3u8"))
         .send()
@@ -615,7 +615,7 @@ async fn master_playlist_aligns_qualities_by_identifier() {
     }
 }
 
-/// プレイリストはリクエストのたびに現在のセグメントから作り、古い範囲を返さない
+/// 公開予定時刻を過ぎたら、sync で報告された新しいセグメントをすぐ反映する
 #[tokio::test]
 async fn media_playlist_reflects_new_segment() {
     let tmp = TempDir::new("no-stale");
@@ -647,6 +647,576 @@ async fn media_playlist_reflects_new_segment() {
     assert!(second_body.contains("#EXT-X-MEDIA-SEQUENCE:1"));
     assert!(second_body.contains("http://worker.test/segments/live/720p/6.ts"));
     assert!(!second_body.contains("http://worker.test/segments/live/720p/0.ts"));
+}
+
+/// 公開待ちの間は前の範囲を返し、待ち時間が過ぎたら追いついた worker に合わせて公開範囲を進める
+#[tokio::test]
+async fn publish_wait_keeps_previous_playlist_until_worker_catches_up() {
+    let tmp = TempDir::new("publish-wait");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        1000,
+        10000,
+        300,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+
+    // worker がまだない間は公開範囲がないため 503 になる
+    let unavailable = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status().as_u16(), 503);
+
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
+    let initial_body = wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+    assert!(initial_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+
+    // 未公開セグメントを PUT しても、待ち時間が過ぎるまでは前の範囲を返す
+    let mut all = sequences;
+    all.push(publish_segment(&client, base, "720p", "seg-6").await);
+    let waiting = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(waiting.status().as_u16(), 200);
+    let waiting_body = waiting.text().await.unwrap();
+    assert!(waiting_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+    assert!(!waiting_body.contains("/6.ts"));
+
+    // 待ち時間内に worker が取得しても、次の公開判定までは前の範囲を返す
+    let sync = sync_worker(&client, base, "worker-a", cached("720p", all.clone())).await;
+    assert_eq!(sync.status().as_u16(), 200);
+    let still_waiting = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_waiting.status().as_u16(), 200);
+    let still_waiting_body = still_waiting.text().await.unwrap();
+    assert!(still_waiting_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+
+    // 待ち時間が過ぎても、次の sync までは公開範囲を変えない
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let still_waiting_after_due = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still_waiting_after_due.status().as_u16(), 200);
+    let still_waiting_after_due_body = still_waiting_after_due.text().await.unwrap();
+    assert!(still_waiting_after_due_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+
+    // 待ち時間後の sync で、キャッシュ済みの範囲に合わせて公開範囲を進める
+    sync_worker(&client, base, "worker-a", cached("720p", all)).await;
+    let published = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status().as_u16(), 200);
+    let published_body = published.text().await.unwrap();
+    assert!(published_body.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+    assert!(published_body.contains("http://worker.test/segments/live/720p/6.ts"));
+    assert!(!published_body.contains("http://worker.test/segments/live/720p/0.ts"));
+}
+
+/// 期限切れの公開待ちの後に PUT されたセグメントは、新しい公開待ちになる
+#[tokio::test]
+async fn starts_new_publish_wait_after_expired_batch() {
+    let tmp = TempDir::new("expired-wait");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        1000,
+        10000,
+        300,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    // 最初の公開待ちが切れた後に次のセグメントを PUT する
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    let mut all = sequences;
+    all.push(6);
+    sync_worker(&client, base, "worker-a", cached("720p", all.clone())).await;
+
+    // 6 には新しい公開待ちがあるため、まだ公開しない
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+    assert!(!media_body.contains("http://worker.test/segments/live/720p/6.ts"));
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", all)).await;
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/6.ts"));
+}
+
+/// prune 済みのセグメントを同じバイト列で再 PUT しても、新しい公開待ちは始めない
+#[tokio::test]
+async fn reput_pruned_segment_does_not_start_wait() {
+    let tmp = TempDir::new("reput-pruned");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        1000,
+        10000,
+        2000,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
+    tokio::time::sleep(Duration::from_millis(2050)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
+    wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+
+    // seg-6 でメタデータを 1..6 に prune する
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    sync_worker(&client, base, "worker-a", cached("720p", 0..7)).await;
+
+    let repeated = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"segment-720p-seg-0",
+        },
+    )
+    .await;
+    assert_eq!(repeated.status().as_u16(), 200);
+
+    // worker が 0 だけを報告しても、再 PUT した 0 は公開待ちに入らず 503 にならない
+    sync_worker(&client, base, "worker-a", cached("720p", 0..1)).await;
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:0"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/0.ts"));
+}
+
+/// 新しい quality は worker が公開範囲を取り込むまで master playlist に追加しない
+#[tokio::test]
+async fn master_playlist_excludes_quality_until_published() {
+    let tmp = TempDir::new("master-wait");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
+
+    let master = client
+        .get(format!("{base}/channels/live/master.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 200);
+    let master_body = master.text().await.unwrap();
+    assert!(master_body.contains("720p.m3u8"));
+    assert!(!master_body.contains("480p.m3u8"));
+
+    // 480p を PUT しても worker が取り込むまで 480p は公開しない
+    publish_series(&client, base, "480p", 0..6).await;
+    let master = client
+        .get(format!("{base}/channels/live/master.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 200);
+    let master_body = master.text().await.unwrap();
+    assert!(master_body.contains("720p.m3u8"));
+    assert!(!master_body.contains("480p.m3u8"));
+    assert_eq!(
+        client
+            .get(format!("{base}/channels/live/480p.m3u8"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+
+    let mut cached_segments = cached("720p", sequences);
+    cached_segments.extend(cached("480p", 0..6));
+    sync_worker(&client, base, "worker-a", cached_segments).await;
+    let master = client
+        .get(format!("{base}/channels/live/master.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 200);
+    let master_body = master.text().await.unwrap();
+    assert!(master_body.contains("480p.m3u8"));
+    assert!(master_body.contains("720p.m3u8"));
+    assert_eq!(
+        client
+            .get(format!("{base}/channels/live/480p.m3u8"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+}
+
+/// 公開範囲を持たない worker は使わず、後から追いついた worker は配信先に復帰する
+#[tokio::test]
+async fn uses_only_worker_that_has_published_range() {
+    let tmp = TempDir::new("worker-published");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+    sync_worker(&client, base, "worker-b", cached("720p", sequences.clone())).await;
+
+    // worker-a はまだ公開範囲を持たないため、追いついた worker-b を使う
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("http://worker-b.test/segments/live/720p/5.ts"));
+
+    // worker-a が追いつけば worker_id 昇順で worker-a に戻る
+    sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("http://worker-a.test/segments/live/720p/5.ts"));
+}
+
+/// quality ごとに別の worker が公開範囲を配信できる
+#[tokio::test]
+async fn keeps_serving_when_qualities_advance_at_different_times() {
+    let tmp = TempDir::new("quality-workers");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let initial_720p = publish_series(&client, base, "720p", 0..6).await;
+    let initial_480p = publish_series(&client, base, "480p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+
+    // 最初は両方の quality を worker-a から配信する
+    let mut cached_a = cached("720p", initial_720p);
+    cached_a.extend(cached("480p", initial_480p));
+    sync_worker(&client, base, "worker-a", cached_a).await;
+
+    // worker-a は 720p だけ新しく、worker-b は 480p だけ新しい
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    assert_eq!(publish_segment(&client, base, "480p", "seg-6").await, 6);
+    let mut cached_a = cached("720p", 0..7);
+    cached_a.extend(cached("480p", 0..6));
+    sync_worker(&client, base, "worker-a", cached_a).await;
+    let mut cached_b = cached("720p", 0..6);
+    cached_b.extend(cached("480p", 0..7));
+    sync_worker(&client, base, "worker-b", cached_b).await;
+
+    // 720p は worker-a、480p は worker-b が配信する
+    let media_720p = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media_720p.status().as_u16(), 200);
+    let media_720p_body = media_720p.text().await.unwrap();
+    assert!(media_720p_body.contains("http://worker-a.test/"));
+    assert!(media_720p_body.contains("/6.ts"));
+
+    let media_480p = client
+        .get(format!("{base}/channels/live/480p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media_480p.status().as_u16(), 200);
+    let media_480p_body = media_480p.text().await.unwrap();
+    assert!(media_480p_body.contains("http://worker-b.test/"));
+    assert!(media_480p_body.contains("/6.ts"));
+}
+
+/// 古い公開範囲を追い出したら、sync で既公開範囲へフォールバックする
+#[tokio::test]
+async fn publishes_when_worker_evicted_previous_range() {
+    let tmp = TempDir::new("evicted-published");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        1000,
+        10000,
+        1000,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
+    wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+
+    // 公開待ちの間に 3 個進み、worker は古い公開範囲の先頭を追い出して最新もまだ未取得である
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-7").await, 7);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-8").await, 8);
+    sync_worker(&client, base, "worker-a", cached("720p", 1..8)).await;
+
+    // 未公開の 6..8 はまだ使わず、sync で既公開の 1..5 へフォールバックする
+    let waiting = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(waiting.status().as_u16(), 200);
+    let waiting_body = waiting.text().await.unwrap();
+    assert!(waiting_body.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+    assert!(waiting_body.contains("http://worker.test/segments/live/720p/5.ts"));
+    assert!(!waiting_body.contains("http://worker.test/segments/live/720p/6.ts"));
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", 1..8)).await;
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        media.status().as_u16(),
+        200,
+        "古い範囲の追い出しで 503 になった"
+    );
+    let media_body = media.text().await.unwrap();
+    // 待ち時間が過ぎたら、保持している最新範囲 2..7 へ進める
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:2"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/7.ts"));
+    assert!(!media_body.contains("http://worker.test/segments/live/720p/8.ts"));
+
+    // 最新まで取得できれば、次の sync で公開範囲が最新に追いつく
+    sync_worker(&client, base, "worker-a", cached("720p", 0..9)).await;
+    let media_body = wait_for_playlist_contains(
+        &client,
+        &format!("{base}/channels/live/720p.m3u8"),
+        "http://worker.test/segments/live/720p/8.ts",
+    )
+    .await;
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:3"));
+}
+
+/// 最新側に欠落があっても、待ち時間後の sync で最新の連続範囲へ進める
+#[tokio::test]
+async fn publishes_connectable_range_when_latest_has_a_gap() {
+    let tmp = TempDir::new("connectable-gap");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        1000,
+        10000,
+        1000,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
+    wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-7").await, 7);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-8").await, 8);
+    // 3..6 は保持しているが 7 は欠落し、8 だけを保持している
+    let mut cached_segments = cached("720p", 3..7);
+    cached_segments.extend(cached("720p", 8..9));
+    sync_worker(&client, base, "worker-a", cached_segments.clone()).await;
+
+    // 未公開の 6..8 はまだ使わず、sync で既公開の 3..5 へフォールバックする
+    let waiting = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(waiting.status().as_u16(), 200);
+    let waiting_body = waiting.text().await.unwrap();
+    assert!(waiting_body.contains("#EXT-X-MEDIA-SEQUENCE:3"));
+    assert!(waiting_body.contains("http://worker.test/segments/live/720p/5.ts"));
+    assert!(!waiting_body.contains("http://worker.test/segments/live/720p/6.ts"));
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    sync_worker(&client, base, "worker-a", cached_segments.clone()).await;
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        media.status().as_u16(),
+        200,
+        "接続可能な範囲があるのに 503 になった"
+    );
+    let media_body = media.text().await.unwrap();
+    // 最新の連続範囲は 8 だけなので、そこへ進める
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:8"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/8.ts"));
+    assert!(!media_body.contains("http://worker.test/segments/live/720p/6.ts"));
+}
+
+/// 公開先頭より古い範囲しか配信できない場合、media sequence は後退する
+#[tokio::test]
+async fn allows_media_sequence_to_move_backwards() {
+    let tmp = TempDir::new("media-sequence");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    // 最初はセグメント 5 だけを公開する
+    sync_worker(&client, base, "worker-a", cached("720p", 5..6)).await;
+    let media_body = wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:5"));
+
+    // メタデータを 3..8 に進め、worker は 3..8 を保持している
+    assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-7").await, 7);
+    assert_eq!(publish_segment(&client, base, "720p", "seg-8").await, 8);
+    sync_worker(&client, base, "worker-a", cached("720p", 3..9)).await;
+
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200);
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:3"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/3.ts"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/8.ts"));
+}
+
+/// 直近範囲より前を取り逃がした worker でも、保持している最新範囲へ復旧できる
+#[tokio::test]
+async fn recovers_when_worker_is_farther_behind_than_the_window() {
+    let tmp = TempDir::new("recovery");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
+    wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
+
+    // 直近範囲の 6 個を超えて進み、古い範囲はメタデータから消える
+    for index in 6..21 {
+        assert_eq!(
+            publish_segment(&client, base, "720p", &format!("seg-{index}")).await,
+            index
+        );
+    }
+    sync_worker(&client, base, "worker-a", cached("720p", 15..21)).await;
+
+    let media = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(media.status().as_u16(), 200, "復旧できず 503 になった");
+    let media_body = media.text().await.unwrap();
+    assert!(media_body.contains("#EXT-X-MEDIA-SEQUENCE:15"));
+    assert!(media_body.contains("http://worker.test/segments/live/720p/20.ts"));
+    assert!(!media_body.contains("http://worker.test/segments/live/720p/0.ts"));
+}
+
+/// quality ごとに異なる範囲を、それぞれ別の worker から配信できる
+#[tokio::test]
+async fn qualities_publish_different_ranges_with_different_workers() {
+    let tmp = TempDir::new("per-quality-ranges");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    // 720p は 0..8、480p は同じ識別子で 0..5 まで PUT する
+    publish_series(&client, base, "720p", 0..9).await;
+    publish_series(&client, base, "480p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", 0..9)).await;
+    sync_worker(&client, base, "worker-b", cached("480p", 0..6)).await;
+
+    let master = client
+        .get(format!("{base}/channels/live/master.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 200);
+    let master_body = master.text().await.unwrap();
+    assert!(master_body.contains("480p.m3u8"));
+    assert!(master_body.contains("720p.m3u8"));
+
+    for (quality, sequence, worker_url) in [
+        ("720p", 3, "http://worker-a.test/"),
+        ("480p", 0, "http://worker-b.test/"),
+    ] {
+        let media = client
+            .get(format!("{base}/channels/live/{quality}.m3u8"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(media.status().as_u16(), 200, "{quality} が 503 になった");
+        let media_body = media.text().await.unwrap();
+        assert!(media_body.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{sequence}")));
+        assert!(media_body.contains(worker_url));
+    }
 }
 
 #[tokio::test]
@@ -682,6 +1252,33 @@ async fn file_deleted_in_range_returns_422() {
     );
 }
 
+/// 配信先 worker がいなくても、公開範囲のファイル欠落は 422 を優先する
+#[tokio::test]
+async fn file_deleted_without_worker_returns_422() {
+    let tmp = TempDir::new("deleted-no-worker");
+    let storage = tmp.path.join("storage");
+    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
+
+    std::fs::remove_file(storage.join("live/720p/2.ts")).unwrap();
+    // 再登録でキャッシュを無効にし、公開範囲を保持する worker をなくす
+    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    assert_eq!(
+        client
+            .get(format!("{base}/channels/live/720p.m3u8"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        422
+    );
+}
+
 #[tokio::test]
 async fn worker_registration_and_sync_contract() {
     let tmp = TempDir::new("worker-contract");
@@ -693,16 +1290,15 @@ async fn worker_registration_and_sync_contract() {
     assert_eq!(created.status().as_u16(), 201);
     let updated = register_worker(&client, base, "worker-a", "http://worker.test").await;
     assert_eq!(updated.status().as_u16(), 200);
-    let preparing = sync_worker(&client, base, "worker-a", cached("720p", 0..5)).await;
-    let preparing_body: Value = preparing.json().await.unwrap();
-    assert_eq!(preparing_body["state"], "PREPARING");
+    // 最新の 5 がまだなくても、連続して保持している 0..4 を公開する
+    let partial = sync_worker(&client, base, "worker-a", cached("720p", 0..5)).await;
+    let partial_body: Value = partial.json().await.unwrap();
     assert_eq!(
-        preparing_body["fetch_segments"],
+        partial_body["fetch_segments"],
         json!([{ "channel_id": "live", "quality": "720p", "sequence": 5 }])
     );
     let ready = sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     let ready_body: Value = ready.json().await.unwrap();
-    assert_eq!(ready_body["state"], "READY");
     assert!(ready_body["fetch_segments"].as_array().unwrap().is_empty());
     let unknown = sync_worker(&client, base, "unknown", cached("720p", 0..6)).await;
     assert_eq!(unknown.status().as_u16(), 404);
@@ -946,7 +1542,7 @@ async fn controller_restart_restarts_numbering() {
     assert!(storage.join("live/720p/1.ts").exists());
 }
 
-/// 登録を更新すると報告済みのキャッシュを無効にし、READY の worker を選ばなくなる
+/// 登録を更新すると報告済みのキャッシュを無効にし、配信先に使わなくなる
 #[tokio::test]
 async fn registration_resets_cached_segments() {
     let tmp = TempDir::new("registration-reset");
@@ -967,7 +1563,7 @@ async fn registration_resets_cached_segments() {
         200
     );
 
-    // worker は登録のたびにキャッシュを捨てるため、登録を更新した時点で READY ではなくなる
+    // worker は登録のたびにキャッシュを捨てるため、登録を更新した時点で配信先に使えなくなる
     let updated = register_worker(&client, base, "worker-a", "http://worker.test").await;
     assert_eq!(updated.status().as_u16(), 200);
     assert_eq!(
@@ -981,7 +1577,7 @@ async fn registration_resets_cached_segments() {
         503
     );
 
-    // 次の sync で報告し直せば READY に戻る
+    // 次の sync で報告し直せば配信先に戻る
     sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
     assert_eq!(
         client
@@ -1009,9 +1605,10 @@ async fn end_to_end_publish_sync_playlist_serve() {
     .await;
     let client = reqwest::Client::new();
     publish_series(&client, &controller.base_url, "720p", 0..6).await;
-    let media = wait_for_playlist(
+    let media = wait_for_playlist_contains(
         &client,
         &format!("{}/channels/live/720p.m3u8", controller.base_url),
+        &format!("{}/segments/live/720p/5.ts", worker.base_url),
     )
     .await;
     assert!(media.contains(&format!("{}/segments/live/720p/5.ts", worker.base_url)));
@@ -1025,6 +1622,56 @@ async fn end_to_end_publish_sync_playlist_serve() {
         segment.bytes().await.unwrap().as_ref(),
         b"segment-720p-seg-5"
     );
+}
+
+/// 連続してセグメントを PUT しても、公開待ちの間に playlist が 503 にならない
+#[tokio::test]
+async fn continuous_publish_keeps_playlist_available() {
+    let tmp = TempDir::new("continuous-publish");
+    let controller =
+        spawn_controller_with_publish_wait(any_addr(), tmp.path.join("storage"), 6, 50, 1000, 200)
+            .await;
+    // 前の公開範囲と新しい範囲を同時に保持できるよう、playlist_segments より 1 つ多くする
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        7,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/channels/live/720p.m3u8", controller.base_url);
+    publish_series(&client, &controller.base_url, "720p", 0..6).await;
+    wait_for_playlist(&client, &url).await;
+
+    for index in 6..9 {
+        assert_eq!(
+            publish_segment(
+                &client,
+                &controller.base_url,
+                "720p",
+                &format!("seg-{index}")
+            )
+            .await,
+            index
+        );
+        // 公開範囲が進むまでは前の範囲を返し、503 にはしない
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "公開待ちの間に 503 になった"
+        );
+        wait_for_playlist_contains(&client, &url, &format!("/{index}.ts")).await;
+    }
+
+    wait_for_segment(
+        &client,
+        &format!("{}/segments/live/720p/8.ts", worker.base_url),
+        b"segment-720p-seg-8",
+    )
+    .await;
 }
 
 #[tokio::test]

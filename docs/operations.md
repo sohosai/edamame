@@ -24,7 +24,8 @@ client には、controller に到達できる URL を設定する。
 | `--storage-dir` | 必須 | 正規セグメントファイルを保存するディレクトリ |
 | `--playlist-segments` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
 | `--sync-interval-ms` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
-| `--sync-timeout-ms` | 必須 | worker を `DEAD` と見なすまでの sync の待ち時間をミリ秒で指定する（1 以上の整数） |
+| `--sync-timeout-ms` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
+| `--publish-wait-ms` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
 | `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
 ## worker の CLI
@@ -39,7 +40,7 @@ client には、controller に到達できる URL を設定する。
 | `--cache-limit` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
 | `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
-`--cors-origin` 以外の option は必須で、既定値はない。
+`--publish-wait-ms` と `--cors-origin` 以外の option は必須で、既定値はない。
 `--public-url` は `--bind` から推測しない。
 `0.0.0.0` など client から到達できないアドレスを待ち受ける場合でも、client から到達できる URL を指定する。
 `--controller-url` は query と fragment を含まない絶対 URL とし、末尾の `/` は取り除いて使う。
@@ -55,6 +56,7 @@ edamame-controller \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
+  --publish-wait-ms 2000 \
   --cors-origin '*'
 ```
 
@@ -84,8 +86,9 @@ curl -i -X PUT \
 この例では 0 になる。
 
 worker は次の sync でセグメントファイルを取得する。
-メディアプレイリストは worker が `READY` になるまで 503 を返すことがある。
-503 の間は再試行する。
+最初の公開範囲ができるまで、メディアプレイリストは 503 を返すことがある。
+公開範囲ができた後は、新しいセグメントファイルを PUT しても `--publish-wait-ms` の間は前のプレイリストを返す。
+503 が続く場合は、その quality の公開範囲を保持している worker がいるか確認する。
 
 ```bash
 curl -i --retry 30 --retry-delay 1 --retry-connrefused \
@@ -101,16 +104,33 @@ curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
 ## sync とタイムアウト
 
 worker は登録時に受け取った `sync_interval_ms` の間隔で controller に sync を送る。
-controller は `--sync-timeout-ms` を超えて sync が届かない worker を `DEAD` にして、プレイリストの選択対象から外す。
+controller は `--sync-timeout-ms` を超えて sync が届かない worker を配信先の候補から外す。
 
 `--sync-timeout-ms` は `--sync-interval-ms` の 3 倍以上を推奨する。
-1 回や 2 回の sync が遅れても `DEAD` にしないためである。
+1 回や 2 回の sync が遅れても配信先から外さないためである。
 
-新しいセグメントファイルを PUT した直後は、worker が取得して次の sync で報告するまでプレイリストが 503 になることがある。
-この間を短くするには `--sync-interval-ms` をセグメントの `duration_ms` より十分小さくする。
+新しいセグメントファイルを PUT してから、controller がプレイリストに反映するまでには公開待ちがある。
+controller は最初の未公開セグメントファイルを PUT した時刻から `--publish-wait-ms` だけ待つ。
+追加の PUT では待ち時間を延長しない。
+公開待ちの間は、未公開セグメントを公開範囲の候補にもフォールバックにも含めない。
+公開待ちが終わった時点で存在するセグメントを公開可能として扱う。
 
-worker のキャッシュ上限（`--cache-limit`）は controller の `--playlist-segments` 以上にする。
-キャッシュ上限が `--playlist-segments` より小さい場合、セグメントファイルが増えると worker はキャッシュ対象のセグメントファイルを削除して `READY` を失い、`PREPARING` と `READY` を繰り返す。
+各 quality の公開範囲は、sync を受けた時に、sync が届いている worker が連続してキャッシュしている公開可能範囲のうち最新のものになる。
+quality ごとに独立して決まり、quality 間で範囲を一致させる必要はない。
+media sequence は前進・後退・飛び得る。
+現在の公開範囲を保持している worker がいれば、より新しい候補が出るまで維持する。
+現在の公開範囲を保持している worker がいなければ、次の sync で、より古い範囲も含めて配信可能な最新の候補へ更新する。更新までのプレイリストリクエストは 503 になることがある。
+公開範囲の切り替えは sync の処理で行い、プレイリストのリクエストでは行わない。
+
+公開範囲が変わるまで、プレイリストは前の公開範囲を返す。
+初回など公開範囲がまだない場合と、公開範囲を保持する worker がいない quality は、次の sync で公開範囲が更新されるまで 503 になる。
+`--publish-wait-ms` の推奨値は `--sync-interval-ms` の 2 倍とする。
+1 回目の sync で取得し、次の sync で報告する時間を確保するためである。
+`--sync-interval-ms` はセグメントの `duration_ms` より十分小さくする。
+
+worker のキャッシュ上限（`--cache-limit`）は controller の `--playlist-segments` より 1 以上大きくすることを推奨する。
+公開待ちの間は前の公開範囲と新しい範囲の両方を保持できるため、公開待ちの途中で古い範囲へフォールバックしにくくなる。
+キャッシュ上限が小さい場合、controller は次の sync で保持されている最新の連続範囲へ切り替える。
 
 ## 容量
 
@@ -132,7 +152,7 @@ controller を再起動すると、channel、quality、セグメントのメタ�
 `storage_dir` のセグメントファイルは削除しない。前の実行で保存したファイルは残り、新しいセグメントと番号が重なった時点で上書きされる。
 `GET /segments/...` は、同じ番号のファイルがまだ上書きされていなければ前の実行のファイルを返す。
 プレイリストは再起動後に PUT されたセグメントファイルから作り直すため、publisher がセグメントファイルを PUT するまで 404 になる。
-worker は sync の 404 を契機に再登録し、登録に成功した時点でキャッシュを捨てて取り直す。新しい範囲のセグメントファイルを取得すれば `READY` に戻る。
+worker は sync の 404 を契機に再登録し、登録に成功した時点でキャッシュを捨てて取り直す。取得と sync を再開すれば配信先に戻る。
 client はプレイリストを取り直し、メディアシーケンスが 0 から始まるプレイリストに合わせて再同期する。
 
 メタデータは最初に成功した PUT の属性から作り直す。
@@ -156,15 +176,15 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | 状況 | 動作 |
 | --- | --- |
 | controller が停止した | client はプレイリストを取得できず、worker はキャッシュしているセグメントファイルを配信し続けて sync の失敗を繰り返し、controller の復帰後に再登録してキャッシュを捨てる |
-| worker が停止した | controller は `--sync-timeout-ms` の経過後に `DEAD` にし、他の `READY` の worker があればプレイリストはその worker を使い、なければ 503 になる |
-| セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得し、`PREPARING` のままになる |
+| worker が停止した | controller は `--sync-timeout-ms` の経過後にその worker を配信先の候補から外す。その quality の公開範囲を保持する他の worker があればそれを使い、なければ次の sync で公開範囲が更新されるまで 503 になる |
+| セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得する。公開範囲を保持していなければ配信先に使われない |
 | セグメントファイルが欠落した | controller はその quality のプレイリストを生成せず 422 を返し、キャッシュ済みセグメントファイルの配信は続く |
 | セグメントファイルを後から削除した | 番号には影響しない。次の実行で同じ番号のセグメントを PUT したときに上書きされる |
 | controller の `storage_dir` への書き込みに失敗した | controller は 500 を返し、書き込み途中のセグメントファイルを読み手に見せず、保存済みとして扱わない |
 | worker の `cache_dir` への書き込みに失敗した | worker はログを出し、そのセグメントファイルをキャッシュ済みとして扱わず、次の sync で再取得する |
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
 | controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
-| client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗し、client がプレイリストを取得し直すと controller は別の `READY` の worker を選ぶ |
+| client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗し、client がプレイリストを取得し直すと controller はその quality の公開範囲を保持する別の worker を選ぶ |
 
 ## セキュリティと信頼境界
 

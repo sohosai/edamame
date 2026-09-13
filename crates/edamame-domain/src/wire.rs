@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::segment::SegmentKey;
-use crate::state::WorkerStateKind;
 
 /// セグメントファイルの登録レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +31,5 @@ pub struct SyncRequest {
 /// worker の sync レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
-    pub state: WorkerStateKind,
     pub fetch_segments: Vec<SegmentKey>,
 }
