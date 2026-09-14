@@ -13,31 +13,31 @@ pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
 #[command(name = "edamame-controller", about = "Edamame controller")]
 pub struct ControllerConfig {
     /// HTTP server の待ち受けアドレス
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
     /// 正規セグメントファイルの保存先
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_STORAGE_DIR")]
     pub storage_dir: PathBuf,
 
     /// メディアプレイリストに含めるセグメント数
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_PLAYLIST_SEGMENTS")]
     pub playlist_segments: u64,
 
     /// worker に指示する sync の間隔
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_SYNC_INTERVAL_MS")]
     pub sync_interval_ms: u64,
 
     /// sync が届かない worker を配信先から外すまでの待ち時間
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_SYNC_TIMEOUT_MS")]
     pub sync_timeout_ms: u64,
 
     /// 新しいセグメントを公開する前に worker の取得を待つ時間
-    #[arg(long)]
+    #[arg(long, env = "EDAMAME_PUBLISH_WAIT_MS")]
     pub publish_wait_ms: Option<u64>,
 
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', env = "EDAMAME_CORS_ORIGIN")]
     pub cors_origin: Vec<String>,
 }
 
@@ -76,55 +76,44 @@ impl ControllerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::BTreeMap;
 
-    fn base_args() -> Vec<&'static str> {
-        vec![
-            "edamame-controller",
-            "--bind",
-            "127.0.0.1:9000",
-            "--storage-dir",
-            ".edamame/controller",
-            "--playlist-segments",
-            "6",
-            "--sync-interval-ms",
-            "1000",
-            "--sync-timeout-ms",
-            "10000",
-        ]
+    use super::*;
+    use clap::CommandFactory;
+
+    /// テストで使う設定。option の解析は実バイナリのテストで確認する
+    fn config() -> ControllerConfig {
+        ControllerConfig {
+            bind: "127.0.0.1:9000".parse().unwrap(),
+            storage_dir: PathBuf::from(".edamame/controller"),
+            playlist_segments: 6,
+            sync_interval_ms: 1000,
+            sync_timeout_ms: 10000,
+            publish_wait_ms: None,
+            cors_origin: Vec::new(),
+        }
     }
 
     #[test]
-    fn parses_documented_arguments() {
-        let config = ControllerConfig::try_parse_from(base_args()).unwrap();
-        assert_eq!(config.playlist_segments, 6);
-        assert_eq!(config.sync_interval_ms, 1000);
-        config.validate().unwrap();
+    fn accepts_valid_values() {
+        config().validate().unwrap();
     }
 
     #[test]
     fn rejects_short_playlist_segments() {
-        let mut args = base_args();
-        let index = args
-            .iter()
-            .position(|value| *value == "--playlist-segments")
-            .unwrap();
-        args[index + 1] = "5";
-        let config = ControllerConfig::try_parse_from(args).unwrap();
+        let mut config = config();
+        config.playlist_segments = 5;
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn parses_cors_origins() {
-        let mut args = base_args();
-        args.extend([
-            "--cors-origin",
-            "http://a.test,http://b.test",
-            "--cors-origin",
-            "http://a.test",
-        ]);
-        let config = ControllerConfig::try_parse_from(args).unwrap();
-        assert_eq!(config.cors_origin.len(), 3);
+    fn normalizes_and_deduplicates_cors_origins() {
+        let mut config = config();
+        config.cors_origin = vec![
+            "http://a.test".to_owned(),
+            "http://b.test".to_owned(),
+            "http://a.test".to_owned(),
+        ];
         assert_eq!(
             config.cors_origins().unwrap(),
             CorsOrigins::List(vec!["http://a.test".to_owned(), "http://b.test".to_owned()])
@@ -133,31 +122,58 @@ mod tests {
 
     #[test]
     fn treats_missing_cors_origin_as_disabled() {
-        let config = ControllerConfig::try_parse_from(base_args()).unwrap();
-        assert!(config.cors_origin.is_empty());
-        assert_eq!(config.cors_origins().unwrap(), CorsOrigins::Disabled);
+        assert_eq!(config().cors_origins().unwrap(), CorsOrigins::Disabled);
     }
 
     #[test]
     fn uses_default_publish_wait_when_missing() {
-        let config = ControllerConfig::try_parse_from(base_args()).unwrap();
-        assert_eq!(config.publish_wait_ms, None);
-        assert_eq!(config.publish_wait_ms(), DEFAULT_PUBLISH_WAIT_MS);
+        assert_eq!(config().publish_wait_ms(), DEFAULT_PUBLISH_WAIT_MS);
     }
 
     #[test]
     fn accepts_explicit_publish_wait() {
-        let mut args = base_args();
-        args.extend(["--publish-wait-ms", "0"]);
-        let config = ControllerConfig::try_parse_from(args).unwrap();
+        let mut config = config();
+        config.publish_wait_ms = Some(0);
         assert_eq!(config.publish_wait_ms(), 0);
     }
 
     #[test]
     fn rejects_cors_origin_combined_with_none() {
-        let mut args = base_args();
-        args.extend(["--cors-origin", "none", "--cors-origin", "http://a.test"]);
-        let config = ControllerConfig::try_parse_from(args).unwrap();
+        let mut config = config();
+        config.cors_origin = vec!["none".to_owned(), "http://a.test".to_owned()];
         assert!(config.cors_origins().is_err());
+    }
+
+    #[test]
+    fn splits_cors_origins_with_comma() {
+        // コマンドライン引数と環境変数のどちらでもカンマ区切りを受け付ける
+        let delimiter = ControllerConfig::command()
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "cors_origin")
+            .and_then(|arg| arg.get_value_delimiter());
+        assert_eq!(delimiter, Some(','));
+    }
+
+    #[test]
+    fn names_environment_variables() {
+        // 全 option に `EDAMAME_` と option 名からなる環境変数名が設定されている
+        let names = ControllerConfig::command()
+            .get_arguments()
+            .filter_map(|arg| {
+                let name = arg.get_env()?;
+                Some((
+                    arg.get_id().as_str().to_owned(),
+                    name.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(names.len(), 7);
+        assert_eq!(names["bind"], "EDAMAME_BIND");
+        assert_eq!(names["storage_dir"], "EDAMAME_STORAGE_DIR");
+        assert_eq!(names["playlist_segments"], "EDAMAME_PLAYLIST_SEGMENTS");
+        assert_eq!(names["sync_interval_ms"], "EDAMAME_SYNC_INTERVAL_MS");
+        assert_eq!(names["sync_timeout_ms"], "EDAMAME_SYNC_TIMEOUT_MS");
+        assert_eq!(names["publish_wait_ms"], "EDAMAME_PUBLISH_WAIT_MS");
+        assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
     }
 }

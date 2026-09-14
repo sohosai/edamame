@@ -15,3 +15,5 @@ tower-http.workspace = true
 [dev-dependencies]
 edamame-worker = { path = "../edamame-worker" }
 reqwest.workspace = true
+# 設定のテストで実バイナリを起動して出力を読むために使う
+tokio = { workspace = true, features = ["io-util", "process"] }
