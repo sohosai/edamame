@@ -41,6 +41,10 @@ cargo run -p edamame-worker -- \
   --cors-origin '*'
 ```
 
+controller と worker の option は環境変数でも指定できる。
+環境変数の名前は option 名の `-` を `_` に変えて `EDAMAME_` を付けたものにする（例: `--bind` は `EDAMAME_BIND`）。
+コマンドライン引数と環境変数の両方を指定した場合はコマンドライン引数を優先する。
+
 ## Dockerでの起動
 
 `compose.yaml` の例：
@@ -49,14 +53,14 @@ cargo run -p edamame-worker -- \
 services:
   controller:
     image: ghcr.io/sohosai/edamame-controller:latest
-    command:
-      - --bind=0.0.0.0:9000
-      - --storage-dir=/data
-      - --playlist-segments=6
-      - --sync-interval-ms=1000
-      - --sync-timeout-ms=10000
-      - --publish-wait-ms=2000
-      - --cors-origin=*
+    environment:
+      EDAMAME_BIND: 0.0.0.0:9000
+      EDAMAME_STORAGE_DIR: /data
+      EDAMAME_PLAYLIST_SEGMENTS: 6
+      EDAMAME_SYNC_INTERVAL_MS: 1000
+      EDAMAME_SYNC_TIMEOUT_MS: 10000
+      EDAMAME_PUBLISH_WAIT_MS: 2000
+      EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9000:9000"
     volumes:
@@ -66,14 +70,14 @@ services:
     image: ghcr.io/sohosai/edamame-worker:latest
     depends_on:
       - controller
-    command:
-      - --worker-id=worker-a
-      - --bind=0.0.0.0:9001
-      - --public-url=http://127.0.0.1:9001
-      - --controller-url=http://controller:9000
-      - --cache-dir=/cache
-      - --cache-limit=12
-      - --cors-origin=*
+    environment:
+      EDAMAME_WORKER_ID: worker-a
+      EDAMAME_BIND: 0.0.0.0:9001
+      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
+      EDAMAME_CONTROLLER_URL: http://controller:9000
+      EDAMAME_CACHE_DIR: /cache
+      EDAMAME_CACHE_LIMIT: 12
+      EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9001:9001"
     volumes:

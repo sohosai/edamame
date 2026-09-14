@@ -16,29 +16,32 @@ controller <-- sync/GET ---- worker
 client は外部の HLS player であり、Edamame の CLI option では設定しない。
 client には、controller に到達できる URL を設定する。
 
-## controller の CLI
+## controller の設定
 
-| option | 必須 | 説明 |
-| --- | --- | --- |
-| `--bind` | 必須 | HTTP server が待ち受けるアドレスであり、client や worker が接続する URL ではない |
-| `--storage-dir` | 必須 | 正規セグメントファイルを保存するディレクトリ |
-| `--playlist-segments` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
-| `--sync-interval-ms` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
-| `--sync-timeout-ms` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
-| `--publish-wait-ms` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
-| `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
+環境変数の名前は、option 名の `-` を `_` に変えて `EDAMAME_` を付けたものにする。
+各 option はコマンドライン引数か環境変数で指定する。両方を指定した場合はコマンドライン引数を優先する。
 
-## worker の CLI
+| option | 環境変数 | 必須 | 説明 |
+| --- | --- | --- | --- |
+| `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレスであり、client や worker が接続する URL ではない |
+| `--storage-dir` | `EDAMAME_STORAGE_DIR` | 必須 | 正規セグメントファイルを保存するディレクトリ |
+| `--playlist-segments` | `EDAMAME_PLAYLIST_SEGMENTS` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
+| `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
+| `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
+| `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
+| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
-| option | 必須 | 説明 |
-| --- | --- | --- |
-| `--worker-id` | 必須 | controller に登録する worker の識別子 |
-| `--bind` | 必須 | HTTP server が待ち受けるアドレス |
-| `--public-url` | 必須 | client に公開する worker の URL であり、`http://` で始まる絶対 URL |
-| `--controller-url` | 必須 | controller に接続するための、worker から到達できる URL |
-| `--cache-dir` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
-| `--cache-limit` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
-| `--cors-origin` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
+## worker の設定
+
+| option | 環境変数 | 必須 | 説明 |
+| --- | --- | --- | --- |
+| `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | controller に登録する worker の識別子 |
+| `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレス |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http://` で始まる絶対 URL |
+| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | controller に接続するための、worker から到達できる URL |
+| `--cache-dir` | `EDAMAME_CACHE_DIR` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
+| `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
+| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
 `--publish-wait-ms` と `--cors-origin` 以外の option は必須で、既定値はない。
 `--public-url` は `--bind` から推測しない。
