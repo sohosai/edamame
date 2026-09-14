@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""loop-publisher.py: mp4 を MPEG-TS に変換し、controller へ継続的に PUT するテスト用 publisher
+"""loop-publisher.py: mp4 をセグメントに分割し、controller へ継続的に PUT するテスト用 publisher
 
 同じ mp4 を無限に繰り返し、指定した長さのセグメントを controller に送り続ける。
 セグメントごとにランダムな識別子を付け、controller が割り当てた番号を受け取る。
+再エンコードはしないため、素材にはセグメント長の倍数の位置にキーフレームが必要である。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from bisect import bisect_left
 from pathlib import Path
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -61,13 +63,15 @@ def handle_stop_signal(_signum, _frame):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="mp4 を MPEG-TS に変換して controller へ継続的に PUT するテスト用 publisher",
+        description="mp4 をセグメントに分割して controller へ継続的に PUT するテスト用 publisher",
     )
     parser.add_argument("--source", required=True, type=Path, help="入力 mp4 のパス")
     parser.add_argument("--controller-url", required=True, help="controller の絶対 http URL")
     parser.add_argument("--channel-id", required=True, help="channel の識別子")
     parser.add_argument("--quality", required=True, help="quality の識別子")
-    parser.add_argument("--bandwidth", required=True, type=int, help="目標ビットレート（bit/s）")
+    parser.add_argument(
+        "--bandwidth", required=True, type=int, help="controller へ宣言するビットレート（bit/s）"
+    )
     parser.add_argument(
         "--segment-duration-ms",
         required=True,
@@ -105,65 +109,244 @@ def validate_args(args, parser):
     if "?" in args.controller_url or "#" in args.controller_url:
         parser.error("controller-url must not contain a query or fragment")
     args.controller_url = args.controller_url.rstrip("/")
-    validate_frame_rate(args, parser)
 
 
-def validate_frame_rate(args, parser):
-    """セグメント長に 1 フレーム以上含まれることを確認する"""
+def run_ffprobe(args, parser, options):
     try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=avg_frame_rate,r_frame_rate",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(args.source),
-            ],
+        return subprocess.run(
+            ["ffprobe", "-v", "error", *options, str(args.source)],
             capture_output=True,
             text=True,
         )
     except FileNotFoundError:
         parser.error("ffprobe not found in PATH")
+
+
+def probe_keyframe_times(args, parser):
+    """素材にあるキーフレームの位置を返す"""
+    result = run_ffprobe(
+        args,
+        parser,
+        [
+            "-select_streams",
+            "v:0",
+            "-skip_frame",
+            "nokey",
+            "-show_entries",
+            "frame=pts_time",
+            "-of",
+            "csv=p=0",
+        ],
+    )
     if result.returncode != 0:
         parser.error(f"ffprobe failed: {result.stderr.strip()}")
 
-    frame_rate = 0.0
+    times = []
     for line in result.stdout.splitlines():
-        numerator_text, separator, denominator_text = line.partition("/")
-        if not separator:
-            continue
         try:
-            numerator = float(numerator_text)
-            denominator = float(denominator_text)
+            times.append(float(line.strip().rstrip(",")))
         except ValueError:
             continue
-        if numerator > 0 and denominator > 0:
-            frame_rate = numerator / denominator
-            break
-    if frame_rate <= 0:
+    # open-GOP の素材では ffprobe がキーフレームを順不同で返すことがある
+    times.sort()
+    return times
+
+
+def probe_duration_seconds(args, parser):
+    """素材の長さを秒で返す"""
+    result = run_ffprobe(
+        args, parser, ["-show_entries", "format=duration", "-of", "csv=p=0"]
+    )
+    if result.returncode != 0:
+        parser.error(f"ffprobe failed: {result.stderr.strip()}")
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        parser.error("could not determine the source duration")
+
+
+def probe_frame_duration_seconds(args, parser):
+    """映像の 1 フレームの長さを秒で返す"""
+    result = run_ffprobe(
+        args,
+        parser,
+        ["-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"],
+    )
+    if result.returncode != 0:
+        parser.error(f"ffprobe failed: {result.stderr.strip()}")
+
+    text = result.stdout.strip()
+    numerator_text, separator, denominator_text = text.partition("/")
+    try:
+        numerator = float(numerator_text)
+        denominator = float(denominator_text) if separator else 1.0
+    except ValueError:
         parser.error("could not determine the input video frame rate")
-    if frame_rate * args.segment_duration_ms / 1000 < 1:
+    if numerator <= 0 or denominator <= 0:
+        parser.error("could not determine the input video frame rate")
+    return denominator / numerator
+
+
+def probe_priming_seconds(args, parser):
+    """素材の先頭にある負の PTS の大きさを秒で返す（無ければ 0）
+
+    AAC はエンコーダの遅延（プリミング）を先頭のパケットの負の PTS として持つ。
+    ffmpeg は 1 周ごとにタイムスタンプを余分に進めるため、周回の前進量は素材の
+    長さよりこの値だけ大きくなる。終了時刻は素材の長さと一致するため、先頭の
+    パケットだけを読む。
+    """
+    lowest = None
+    for stream in ("v:0", "a:0"):
+        result = run_ffprobe(
+            args,
+            parser,
+            [
+                "-select_streams",
+                stream,
+                # 先頭の 1 秒だけを読む。音声が無い素材では空になる
+                "-read_intervals",
+                "%+1",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+            ],
+        )
+        if result.returncode != 0:
+            parser.error(f"ffprobe failed: {result.stderr.strip()}")
+        for line in result.stdout.splitlines():
+            try:
+                start = float(line.strip().rstrip(","))
+            except ValueError:
+                continue
+            lowest = start if lowest is None else min(lowest, start)
+    if lowest is None:
+        parser.error("could not find a packet in the source")
+    return max(0.0, -lowest)
+
+
+def to_microseconds(seconds):
+    """時刻をマイクロ秒に丸める
+
+    ffprobe の時刻はマイクロ秒までの精度しかないため、境界の計算で生じた浮動小数点
+    誤差を吸収できるよう、比較する時刻を同じ精度にそろえる。
+    """
+    return round(seconds * 1000000)
+
+
+def find_cut(times, period, boundary):
+    """周期的に繰り返すキーフレームのうち boundary 以降で最初の位置と番号を返す
+
+    時刻はマイクロ秒の整数で扱い、切り位置が次の周回に入った場合も返す。
+    """
+    lap = boundary // period
+    first_lap = lap
+    while True:
+        index = bisect_left(times, boundary - lap * period)
+        if index < len(times):
+            return lap * period + times[index], index, lap > first_lap
+        lap += 1
+
+
+def plan_segments(args, parser):
+    """copy で指定した長さに分割できる素材か確認し、切り位置の計画を返す
+
+    copy ではキーフレームの位置でしか分割できない。HLS muxer はセグメントの開始から
+    セグメント長以上たった最初のキーフレームで切るため、キーフレームが境界から
+    1 フレームを超えてずれると、前後のセグメントの長さが変わってしまう。
+    同じキーフレームは周回ごとに前進量だけずれて現れるので、切り位置も同じだけずれる。
+    戻り値は (先頭の切り位置, 1 周期分の切り位置, 1 周期の前進量, プリミング,
+    素材の映像の先頭の時刻) で、いずれもマイクロ秒である。
+    """
+    segment = args.segment_duration_ms * 1000
+    frame = to_microseconds(probe_frame_duration_seconds(args, parser))
+    duration = to_microseconds(probe_duration_seconds(args, parser))
+    priming = to_microseconds(probe_priming_seconds(args, parser))
+    advance = duration + priming
+    if segment < frame:
         parser.error("segment-duration-ms is shorter than one frame of the input video")
+    if advance < segment:
+        parser.error("source is shorter than one segment")
+
+    times = [to_microseconds(time) for time in probe_keyframe_times(args, parser)]
+    if not times:
+        parser.error("could not find a keyframe in the source video")
+    if times[0] > frame:
+        parser.error("the source video must start with a keyframe")
+
+    # muxer と同じ規則で切り位置をたどり、境界から 1 フレーム以内で切れるか確認する。
+    # 切り位置がどのキーフレームになるかで次の切り位置も決まるため、同じキーフレームが
+    # 再び現れるまでたどると、以降は同じ切り方を前進量だけずらして繰り返す
+    cuts = [0]
+    index = None
+    seen = {}
+    while index not in seen:
+        seen[index] = len(cuts) - 1
+        boundary = cuts[-1] + segment
+        cut, index, next_lap = find_cut(times, advance, boundary)
+        # 周回をまたぐ切り位置は次の周回の先頭のキーフレームになり、プリミングの分だけ
+        # 境界より後ろになる。素材の長さの端数と同じく避けられないずれなので許容する
+        allowed = frame + priming if next_lap else frame
+        if cut - boundary > allowed:
+            parser.error(
+                f"source video has no keyframe within one frame of "
+                f"{format_seconds(boundary // 1000)}s; "
+                "keyframes must align with the segment duration"
+            )
+        cuts.append(cut)
+    first = seen[index]
+    return cuts[:first], cuts[first:-1], cuts[-1] - cuts[first], priming, times[0]
+
+
+def segment_start_microseconds(plan, sequence):
+    """指定した番号のセグメントが始まる素材内の時刻を返す"""
+    head, cycle, stride, _, _ = plan
+    if sequence < len(head):
+        return head[sequence]
+    sequence -= len(head)
+    lap, position = divmod(sequence, len(cycle))
+    return cycle[position] + lap * stride
+
+
+def output_offset_microseconds(plan, sequence):
+    """再起動した publisher が -output_ts_offset に渡す時刻を返す
+
+    ffmpeg は実行ごとに出力の先頭の時刻を muxer の基準に合わせるため、素材の先頭から
+    読む実行は、先頭パケットの負の PTS の分だけ後ろの時刻から始まる。プリミングを
+    足して、再起動後の先頭の時刻を続きの時刻に合わせる。
+
+    再起動した実行は素材の映像の先頭をもう一度読むため、映像が 0 以外から始まる
+    素材では、その分だけ後ろにずれる。先頭の時刻を差し引いて合わせる。
+
+    切り位置は各実行が素材の先頭から数え直すため、セグメントの長さと切り位置は
+    実行をまたぐと素材の長さの端数、プリミング、キーフレームの量子化の分だけ
+    変わりうる。ここで合わせるのは先頭の映像の時刻だけである。
+    """
+    return segment_start_microseconds(plan, sequence) + plan[3] - plan[4]
+
+
+def format_microseconds(microseconds):
+    """マイクロ秒を丸めずに ffmpeg が解釈できる秒の文字列にする
+
+    負の値では divmod が返す整数部も負になるため、符号を外してから分ける。
+    """
+    sign = "-" if microseconds < 0 else ""
+    whole, fraction = divmod(abs(microseconds), 1000000)
+    if fraction == 0:
+        return f"{sign}{whole}"
+    return f"{sign}{whole}.{fraction:06d}".rstrip("0")
 
 
 def format_seconds(milliseconds):
     """ミリ秒を丸めずに ffmpeg が解釈できる秒の文字列にする"""
-    whole, fraction = divmod(milliseconds, 1000)
-    if fraction == 0:
-        return str(whole)
-    return f"{whole}.{fraction:03d}".rstrip("0")
+    return format_microseconds(milliseconds * 1000)
 
 
-def build_ffmpeg_command(args, work_dir, start_offset_ms):
+def build_ffmpeg_command(args, work_dir, start_offset_microseconds):
     # セグメント長はミリ秒で受けるが、ffmpeg には丸めずに秒で渡す
     segment_seconds_text = format_seconds(args.segment_duration_ms)
-    # 再起動時にタイムスタンプが巻き戻ると HLS client が再同期するため、次の番号の分だけ進める
-    start_offset_text = format_seconds(start_offset_ms)
+    # 再起動時にタイムスタンプが巻き戻ると HLS client が再同期するため、続きの時刻から始める
+    start_offset_text = format_microseconds(start_offset_microseconds)
     return [
         "ffmpeg",
         "-hide_banner",
@@ -178,28 +361,9 @@ def build_ffmpeg_command(args, work_dir, start_offset_ms):
         "0:v:0",
         "-map",
         "0:a:0?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        str(args.bandwidth),
-        "-maxrate",
-        str(args.bandwidth),
-        "-bufsize",
-        str(args.bandwidth * 2),
-        "-force_key_frames",
-        f"expr:gte(t,n_forced*{segment_seconds_text})",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
+        # 再エンコードは等倍に間に合わないためコピーする。区切りは素材のキーフレームに任せる
+        "-c",
+        "copy",
         "-output_ts_offset",
         start_offset_text,
         "-f",
@@ -402,7 +566,7 @@ def stop_ffmpeg(process):
         process.wait()
 
 
-def run(args):
+def run(args, plan):
     global stop_requested
     stop_requested = False
     signal.signal(signal.SIGINT, handle_stop_signal)
@@ -422,7 +586,7 @@ def run(args):
     print(f"work directory is {work_dir}", flush=True)
     print(f"next sequence is {next_sequence}", flush=True)
     command = build_ffmpeg_command(
-        args, work_dir, next_sequence * args.segment_duration_ms
+        args, work_dir, output_offset_microseconds(plan, next_sequence)
     )
     print("starting ffmpeg: " + " ".join(command), flush=True)
     try:
@@ -493,7 +657,8 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     validate_args(args, parser)
-    return run(args)
+    plan = plan_segments(args, parser)
+    return run(args, plan)
 
 
 if __name__ == "__main__":
