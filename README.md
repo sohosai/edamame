@@ -46,6 +46,7 @@ cargo run -p edamame-worker -- \
 controller と worker の option は環境変数でも指定できる。
 環境変数の名前は option 名の `-` を `_` に変えて `EDAMAME_` を付けたものにする（例: `--bind` は `EDAMAME_BIND`）。
 コマンドライン引数と環境変数の両方を指定した場合はコマンドライン引数を優先する。
+複数の worker を置く場合は `--weight` で相対的な配信能力を指定する。省略すると 1 になる。
 `--auth-token` は controller と worker で同じ値にし、推測しにくい値に変える。
 publisher もセグメントファイルの PUT に `Authorization: Bearer {token}` を付ける。
 省略すると PUT の認証は無効になり、controller が起動時に警告を出す。

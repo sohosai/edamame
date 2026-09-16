@@ -138,7 +138,8 @@ PUT /workers/{worker_id}
 
 ```json
 {
-  "public_url": "http://127.0.0.1:9001"
+  "public_url": "http://127.0.0.1:9001",
+  "weight": 1
 }
 ```
 
@@ -146,6 +147,8 @@ PUT /workers/{worker_id}
 末尾の `/` は取り除いて保存する。
 query と fragment を含めない。
 パスを含めてもよい。その場合はパスの後ろに `/segments/...` を付けた URL をプレイリストに書く。
+`weight` は 1 以上の整数とし、worker の相対的な配信能力を表す。
+controller は配信先の worker を選ぶときにこの値を使い、値が大きい worker ほど多く選ばれる。
 worker は起動時に登録する。
 controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。worker は `--auth-token` を指定すると、この PUT に同じトークンを付ける。
 controller が worker を知らない場合は、sync の 404 を契機に再登録する。
@@ -165,9 +168,9 @@ worker は `sync_interval_ms` の間隔で sync を送る。
 ステータス：
 
 - `201 Created`：新しい worker を登録し、タイムアウトの基準時刻を現在時刻にする
-- `200 OK`：登録済みの worker の `public_url` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は変えず、sync だけで更新する
+- `200 OK`：登録済みの worker の `public_url` と `weight` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は変えず、sync だけで更新する
 - `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
-- `400 Bad Request`：`worker_id` または `public_url` が不正である
+- `400 Bad Request`：`worker_id`、`public_url` または `weight` が不正である
 
 worker は登録のたびにキャッシュを捨てて取り直すため、controller も登録に合わせて報告済みのキャッシュを無効にする。
 sync が `--sync-timeout-ms` を超えて届かない worker は配信先の候補から外れる。

@@ -42,10 +42,11 @@ client には、controller に到達できる URL を設定する。
 | `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | controller に接続するための、worker から到達できる URL |
 | `--cache-dir` | `EDAMAME_CACHE_DIR` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
+| `--weight` | `EDAMAME_WEIGHT` | 任意 | worker の相対的な配信能力（1 以上の整数、省略時は 1） |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | controller の `--auth-token` と同じトークン（省略すると登録の PUT に `Authorization` ヘッダーを付けない） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
-`--publish-wait-ms`、`--auth-token`、`--cors-origin` 以外の option は必須で、既定値はない。
+`--weight`、`--auth-token`、`--cors-origin` 以外の option は必須で、既定値はない。
 `--public-url` は `--bind` から推測しない。
 `0.0.0.0` など client から到達できないアドレスを待ち受ける場合でも、client から到達できる URL を指定する。
 `--controller-url` は query と fragment を含まない絶対 URL とし、末尾の `/` は取り除いて使う。
@@ -140,6 +141,24 @@ worker のキャッシュ上限（`--cache-limit`）は controller の `--playli
 公開待ちの間は前の公開範囲と新しい範囲の両方を保持できるため、公開待ちの途中で古い範囲へフォールバックしにくくなる。
 キャッシュ上限が小さい場合、controller は次の sync で保持されている最新の連続範囲へ切り替える。
 
+## worker の選択
+
+メディアプレイリストは quality ごとに、公開範囲をキャッシュしている worker から配信先を選ぶ。
+候補が複数ある場合は、登録された重みの比に従って選ぶ。
+重み 4 の worker と重み 1 の worker があれば、5 回のうち 4 回は重み 4 の worker を選ぶ。
+
+重みは相対値であり、選ばれる回数の比になる。
+同じスペックのホストなら同じ値にし、速いホストほど大きい値にする。
+例えば 4 vCPU のホストを `--weight 1`、16 vCPU のホストを `--weight 4` にする。
+`--weight` を省略した worker は 1 として扱う。
+
+重みを変えたときと、配信先の候補の worker が増減したときは、その時点から重みの比で選び直す。
+controller は worker の負荷情報（CPU 使用率、同時接続数、配信量）を扱わない。
+そのため、一時的に性能が落ちた worker でも重みの分だけ選ばれる。
+
+controller と worker は同じ版を使う。
+worker が古いと `weight` が送られず登録が 400 になり、controller が古いと `weight` が無視される。
+
 ## 容量
 
 controller は実行中にセグメントファイルを削除しない。
@@ -193,7 +212,7 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | worker のトークンが controller と一致しない | controller は登録の PUT に 401 を返し、worker はログを出して 1 秒後に再試行する |
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
 | controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
-| client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗し、client がプレイリストを取得し直すと controller はその quality の公開範囲を保持する別の worker を選ぶ |
+| client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗する。controller は `--sync-timeout-ms` の経過後にその worker を候補から外すまで同じ worker を選ぶことがある（重みが複数台にある場合は他の worker も選ばれる） |
 
 ## セキュリティと信頼境界
 
