@@ -29,6 +29,7 @@ client には、controller に到達できる URL を設定する。
 | `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
 | `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
 | `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | PUT の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると PUT を認証せず、起動時に警告を出す） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
 ## worker の設定
@@ -41,9 +42,10 @@ client には、controller に到達できる URL を設定する。
 | `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | controller に接続するための、worker から到達できる URL |
 | `--cache-dir` | `EDAMAME_CACHE_DIR` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | controller の `--auth-token` と同じトークン（省略すると登録の PUT に `Authorization` ヘッダーを付けない） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
 
-`--publish-wait-ms` と `--cors-origin` 以外の option は必須で、既定値はない。
+`--publish-wait-ms`、`--auth-token`、`--cors-origin` 以外の option は必須で、既定値はない。
 `--public-url` は `--bind` から推測しない。
 `0.0.0.0` など client から到達できないアドレスを待ち受ける場合でも、client から到達できる URL を指定する。
 `--controller-url` は query と fragment を含まない絶対 URL とし、末尾の `/` は取り除いて使う。
@@ -60,6 +62,7 @@ edamame-controller \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
   --publish-wait-ms 2000 \
+  --auth-token example-token \
   --cors-origin '*'
 ```
 
@@ -73,6 +76,7 @@ edamame-worker \
   --controller-url http://127.0.0.1:9000 \
   --cache-dir .edamame/worker-a \
   --cache-limit 12 \
+  --auth-token example-token \
   --cors-origin '*'
 ```
 
@@ -81,6 +85,7 @@ edamame-worker \
 ```bash
 printf 'segment-1' > /tmp/segment-1.ts
 curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
   --data-binary @/tmp/segment-1.ts \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
@@ -185,13 +190,14 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | セグメントファイルを後から削除した | 番号には影響しない。次の実行で同じ番号のセグメントを PUT したときに上書きされる |
 | controller の `storage_dir` への書き込みに失敗した | controller は 500 を返し、書き込み途中のセグメントファイルを読み手に見せず、保存済みとして扱わない |
 | worker の `cache_dir` への書き込みに失敗した | worker はログを出し、そのセグメントファイルをキャッシュ済みとして扱わず、次の sync で再取得する |
+| worker のトークンが controller と一致しない | controller は登録の PUT に 401 を返し、worker はログを出して 1 秒後に再試行する |
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
 | controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
 | client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗し、client がプレイリストを取得し直すと controller はその quality の公開範囲を保持する別の worker を選ぶ |
 
 ## セキュリティと信頼境界
 
-- private network で使い、認証と TLS はない
+- controller は `--auth-token` を指定すると PUT に Bearer トークンを要求し、指定しなければ警告を出して PUT を認証しない
 - publisher が送るセグメント識別子は文字種を限定し、controller は識別子をファイル名に使わず `storage_dir` の外にファイルを作らない
 - worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
 - `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く

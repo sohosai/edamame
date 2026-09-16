@@ -149,6 +149,6 @@ quality ごとに別の worker を選んでもよい。
 - controller のメタデータの永続化
 - メトリクス用のエンドポイント
 - CDN 連携
-- 認証と TLS
+- TLS
 - 複数の controller
 - 全 quality の公開範囲を一致させること

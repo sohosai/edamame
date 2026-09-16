@@ -49,7 +49,8 @@ python3 scripts/loop-publisher.py \
   --quality 720p \
   --bandwidth 3000000 \
   --segment-duration-ms 6000 \
-  --resolution 1280x720
+  --resolution 1280x720 \
+  --auth-token example-token
 ```
 
 セグメントの識別子はセグメントごとにランダムに生成する。
@@ -82,6 +83,7 @@ ffmpeg は実行ごとに素材の先頭から読み、セグメントの区切�
 | `--bandwidth` | 必須 | controller に宣言する `bandwidth`（bit/s）。素材の実ビットレートに合わせる |
 | `--segment-duration-ms` | 必須 | セグメント長（500 以上の整数、ミリ秒）。素材の 1 フレーム以上にし、キーフレーム間隔と長さに合わせる |
 | `--resolution` | 任意 | controller に宣言する解像度（`WIDTHxHEIGHT`）。素材の解像度に合わせる |
+| `--auth-token` | 任意 | controller の `--auth-token` と同じトークン（空白と制御文字を除く表示可能 ASCII、省略すると `Authorization` ヘッダーを送らない） |
 
 ### 注意
 
@@ -92,4 +94,3 @@ ffmpeg は実行ごとに素材の先頭から読み、セグメントの区切�
 - 再起動した実行では、セグメントの長さと切り位置が連続実行とずれることがある（再起動の節を参照）
 - セグメントの識別子は毎回ランダムに生成する
 - master playlist または media playlist を取得できない場合は、ffmpeg を起動する前に終了する
-- PUT に失敗した場合は作業ディレクトリを残し、ファイルのパスと再送用の curl コマンドを出力する

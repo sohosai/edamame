@@ -25,6 +25,7 @@ cargo run -p edamame-controller -- \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
   --publish-wait-ms 2000 \
+  --auth-token example-token \
   --cors-origin '*'
 ```
 
@@ -38,12 +39,16 @@ cargo run -p edamame-worker -- \
   --controller-url http://127.0.0.1:9000 \
   --cache-dir .edamame/worker-a \
   --cache-limit 12 \
+  --auth-token example-token \
   --cors-origin '*'
 ```
 
 controller と worker の option は環境変数でも指定できる。
 環境変数の名前は option 名の `-` を `_` に変えて `EDAMAME_` を付けたものにする（例: `--bind` は `EDAMAME_BIND`）。
 コマンドライン引数と環境変数の両方を指定した場合はコマンドライン引数を優先する。
+`--auth-token` は controller と worker で同じ値にし、推測しにくい値に変える。
+publisher もセグメントファイルの PUT に `Authorization: Bearer {token}` を付ける。
+省略すると PUT の認証は無効になり、controller が起動時に警告を出す。
 
 ## Dockerでの起動
 
@@ -60,6 +65,7 @@ services:
       EDAMAME_SYNC_INTERVAL_MS: 1000
       EDAMAME_SYNC_TIMEOUT_MS: 10000
       EDAMAME_PUBLISH_WAIT_MS: 2000
+      EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9000:9000"
@@ -77,6 +83,7 @@ services:
       EDAMAME_CONTROLLER_URL: http://controller:9000
       EDAMAME_CACHE_DIR: /cache
       EDAMAME_CACHE_LIMIT: 12
+      EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9001:9001"
@@ -95,6 +102,7 @@ volumes:
 ```bash
 printf 'segment-1' > /tmp/segment-1.ts
 curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
   --data-binary @/tmp/segment-1.ts \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
@@ -134,4 +142,4 @@ cargo test --workspace
 - quality ごとに公開範囲は独立して決まり、メディアプレイリストは前進・後退・飛び得る。
 - worker の `--cache-limit` は controller の `--playlist-segments` より 1 以上大きくすることを推奨する。小さい場合、前の公開範囲を保持できず、controller が次の sync で保持されている最新の連続範囲へ切り替える。
 - worker は登録に成功した時点でキャッシュを捨てて取り直す。起動時は `--cache-dir` を走査し、登録できるまでその内容を配信する。
-- 認証と TLS はない。private network で使う。
+- PUT の認証は controller と worker の `--auth-token` で行い、GET と sync の POST には認証がない。TLS はないため private network で使う。

@@ -15,9 +15,9 @@
 - JSON を返すレスポンスの Content-Type は `application/json` とする
 - エラー本文は英語の plain text とし、Content-Type は `text/plain; charset=utf-8` とする
 - プレイリストの Content-Type は `application/vnd.apple.mpegurl`、セグメントファイルの Content-Type は `application/octet-stream` とする
-- 認証はなく、private network で使う前提とする
+- PUT は controller の `--auth-token` を指定したときだけ `Authorization: Bearer {token}` を要求し、ヘッダーが欠落またはトークンが不一致なら 401 を返す。GET と POST は認証を要求しない
 - ブラウザからは GET だけ cross-origin で読める。許可する origin は controller と worker の `--cors-origin` で指定し、省略すると CORS ヘッダを返さない
-- ステータスコードは 400、404、422、503 の順に判定し、入力が不正なら 400、対象が存在しなければ 404、公開範囲のセグメントファイルが欠落していれば 422、公開範囲または配信先 worker がなければ 503 を返す
+- ステータスコードは 401、400、404、422、503 の順に判定し、認証がなければ 401、入力が不正なら 400、対象が存在しなければ 404、公開範囲のセグメントファイルが欠落していれば 422、公開範囲または配信先 worker がなければ 503 を返す
 - 予期しない内部エラーは 500 を返す
 
 ## controller の API
@@ -32,11 +32,13 @@ publisher が正規セグメントファイルを登録する。
 `identifier` はセグメントごとに publisher が付ける識別子であり、同じセグメントには quality をまたいで同じ値を使う。
 `duration_ms` と `bandwidth` は必須で、`resolution` は任意とする。
 `duration_ms` は 500 以上の整数、`bandwidth` は正の整数、`resolution` は `{width}x{height}` の形式にする。
+controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。
 
 例：
 
 ```bash
 curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
   --data-binary @segment-1.ts \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
@@ -58,6 +60,7 @@ controller は起動するたびに channel ごとの連番を 0 から新しい
 
 - `201 Created`：新しいセグメントファイルを保存した
 - `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
+- `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
 - `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution` の形式が不正、または `duration_ms` が 500 未満
 - `409 Conflict`：同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
 - `500 Internal Server Error`：セグメント番号の上限に達した、またはディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
@@ -144,6 +147,7 @@ PUT /workers/{worker_id}
 query と fragment を含めない。
 パスを含めてもよい。その場合はパスの後ろに `/segments/...` を付けた URL をプレイリストに書く。
 worker は起動時に登録する。
+controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。worker は `--auth-token` を指定すると、この PUT に同じトークンを付ける。
 controller が worker を知らない場合は、sync の 404 を契機に再登録する。
 
 レスポンス：
@@ -162,6 +166,7 @@ worker は `sync_interval_ms` の間隔で sync を送る。
 
 - `201 Created`：新しい worker を登録し、タイムアウトの基準時刻を現在時刻にする
 - `200 OK`：登録済みの worker の `public_url` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は変えず、sync だけで更新する
+- `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
 - `400 Bad Request`：`worker_id` または `public_url` が不正である
 
 worker は登録のたびにキャッシュを捨てて取り直すため、controller も登録に合わせて報告済みのキャッシュを無効にする。
