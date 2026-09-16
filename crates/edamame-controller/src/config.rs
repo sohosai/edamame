@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use edamame_domain::{CorsOrigins, EdamameError};
+use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token};
 
 pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
 
@@ -36,6 +36,10 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_PUBLISH_WAIT_MS")]
     pub publish_wait_ms: Option<u64>,
 
+    /// PUT の認証に使うトークン。省略すると PUT の認証を無効にし、起動時に警告を出す
+    #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
+    pub auth_token: Option<String>,
+
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
     #[arg(long, value_delimiter = ',', env = "EDAMAME_CORS_ORIGIN")]
     pub cors_origin: Vec<String>,
@@ -58,6 +62,9 @@ impl ControllerConfig {
             return Err(EdamameError::BadRequest(
                 "sync timeout must be positive".to_owned(),
             ));
+        }
+        if let Some(token) = &self.auth_token {
+            validate_auth_token(token)?;
         }
         Ok(())
     }
@@ -90,6 +97,7 @@ mod tests {
             sync_interval_ms: 1000,
             sync_timeout_ms: 10000,
             publish_wait_ms: None,
+            auth_token: None,
             cors_origin: Vec::new(),
         }
     }
@@ -138,6 +146,27 @@ mod tests {
     }
 
     #[test]
+    fn treats_missing_auth_token_as_disabled() {
+        let mut config = config();
+        config.auth_token = None;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_auth_token() {
+        let mut config = config();
+        config.auth_token = Some("example-token".to_owned());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_auth_token() {
+        let mut config = config();
+        config.auth_token = Some(String::new());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_cors_origin_combined_with_none() {
         let mut config = config();
         config.cors_origin = vec!["none".to_owned(), "http://a.test".to_owned()];
@@ -167,13 +196,14 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["storage_dir"], "EDAMAME_STORAGE_DIR");
         assert_eq!(names["playlist_segments"], "EDAMAME_PLAYLIST_SEGMENTS");
         assert_eq!(names["sync_interval_ms"], "EDAMAME_SYNC_INTERVAL_MS");
         assert_eq!(names["sync_timeout_ms"], "EDAMAME_SYNC_TIMEOUT_MS");
         assert_eq!(names["publish_wait_ms"], "EDAMAME_PUBLISH_WAIT_MS");
+        assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");
         assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
     }
 }

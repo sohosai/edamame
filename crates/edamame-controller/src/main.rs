@@ -18,6 +18,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --publish-wait-ms is not specified; using {DEFAULT_PUBLISH_WAIT_MS} ms"
         );
     }
+    if config.auth_token.is_none() {
+        eprintln!("warning: --auth-token is not specified; PUT requests are not authenticated");
+    }
     let cors = config.cors_origins()?;
     if config.cors_origin.is_empty() {
         eprintln!(
@@ -33,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.sync_timeout_ms,
         config.publish_wait_ms(),
     );
-    let app = router(state, &cors);
+    let app = router(state, &cors, config.auth_token.as_deref());
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("edamame-controller listening on {}", config.bind);
     axum::serve(listener, app).await?;

@@ -7,9 +7,9 @@ use std::time::Duration;
 use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
 use support::{
-    TempDir, spawn_controller, spawn_controller_with_cors, spawn_controller_with_publish_wait,
-    spawn_worker, spawn_worker_with_cors, wait_for_playlist, wait_for_playlist_contains,
-    wait_for_segment,
+    TempDir, spawn_controller, spawn_controller_with_auth, spawn_controller_with_cors,
+    spawn_controller_with_publish_wait, spawn_worker, spawn_worker_with_auth,
+    spawn_worker_with_cors, wait_for_playlist, wait_for_playlist_contains, wait_for_segment,
 };
 
 fn any_addr() -> std::net::SocketAddr {
@@ -27,7 +27,16 @@ struct PublishInput<'a> {
 }
 
 async fn publish(client: &reqwest::Client, input: PublishInput<'_>) -> reqwest::Response {
-    client
+    publish_with_token(client, input, None).await
+}
+
+/// 認証トークンを付けてセグメントを PUT する
+async fn publish_with_token(
+    client: &reqwest::Client,
+    input: PublishInput<'_>,
+    auth_token: Option<&str>,
+) -> reqwest::Response {
+    let request = client
         .put(format!(
             "{}/segments/live/{}/{}?duration_ms={}&bandwidth={}&resolution={}",
             input.base_url,
@@ -37,10 +46,12 @@ async fn publish(client: &reqwest::Client, input: PublishInput<'_>) -> reqwest::
             input.bandwidth,
             input.resolution
         ))
-        .body(input.body.to_vec())
-        .send()
-        .await
-        .unwrap()
+        .body(input.body.to_vec());
+    let request = match auth_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    request.send().await.unwrap()
 }
 
 /// 代表的な属性でセグメントを PUT し、割り当てられた番号を返す
@@ -1859,4 +1870,146 @@ async fn worker_discards_cache_on_registration() {
         b"segment-720p-seg-5",
     )
     .await;
+}
+
+/// controller は認証トークンを設定したときだけ PUT に Authorization ヘッダーを要求する
+#[tokio::test]
+async fn put_requires_bearer_token_when_auth_token_is_set() {
+    let tmp = TempDir::new("put-auth");
+    let controller = spawn_controller_with_auth(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        100,
+        10_000,
+        "example-token",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let segment_url = format!(
+        "{}/segments/live/720p/seg-0?duration_ms=6000&bandwidth=3000000&resolution=1280x720",
+        controller.base_url
+    );
+
+    // トークンなしの PUT は 401 になり、セグメントファイルを保存しない
+    let response = client
+        .put(&segment_url)
+        .body("segment-720p-seg-0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .unwrap(),
+        "Bearer"
+    );
+    assert_eq!(response.text().await.unwrap(), "unauthorized");
+
+    // 違うトークンの PUT も 401 になる
+    let response = client
+        .put(&segment_url)
+        .bearer_auth("wrong-token")
+        .body("segment-720p-seg-0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+
+    // 正しいトークンの PUT は成功する。番号が 0 なので、401 の PUT は番号を消費していない
+    let response = client
+        .put(&segment_url)
+        .bearer_auth("example-token")
+        .body("segment-720p-seg-0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["sequence"], 0);
+
+    // worker の登録も同じトークンを要求する
+    let register_url = format!("{}/workers/worker-a", controller.base_url);
+    let response = register_worker(
+        &client,
+        &controller.base_url,
+        "worker-a",
+        "http://127.0.0.1:9001",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 401);
+    let response = client
+        .put(&register_url)
+        .bearer_auth("example-token")
+        .json(&json!({ "public_url": "http://127.0.0.1:9001" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201);
+
+    // 読み取りの GET はトークンなしで使える
+    let response = client
+        .get(format!("{}/channels/live/720p.m3u8", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status().as_u16(), 401);
+    controller.shutdown().await;
+}
+
+/// worker は認証トークンを設定すると登録 PUT に Authorization ヘッダーを付ける
+#[tokio::test]
+async fn worker_registers_with_bearer_token_and_syncs() {
+    let tmp = TempDir::new("worker-auth");
+    let controller = spawn_controller_with_auth(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        10_000,
+        "example-token",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let worker = spawn_worker_with_auth(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+        "example-token",
+    )
+    .await;
+    let response = publish_with_token(
+        &client,
+        PublishInput {
+            base_url: &controller.base_url,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"segment-720p-seg-0",
+        },
+        Some("example-token"),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+
+    // 認証下でも登録と sync が通り、worker がセグメントファイルを配信できる
+    let media = wait_for_playlist(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+    )
+    .await;
+    assert!(media.contains(&format!("{}/segments/live/720p/0.ts", worker.base_url)));
+    wait_for_segment(
+        &client,
+        &format!("{}/segments/live/720p/0.ts", worker.base_url),
+        b"segment-720p-seg-0",
+    )
+    .await;
+    controller.shutdown().await;
 }

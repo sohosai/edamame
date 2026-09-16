@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = router(state.clone(), &cors);
     let sync_state = state.clone();
     tokio::spawn(async move {
-        run_sync_loop(sync_state).await;
+        run_sync_loop(sync_state, config.auth_token).await;
     });
     println!(
         "edamame-worker {} listening on {}",

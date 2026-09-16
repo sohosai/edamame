@@ -19,6 +19,7 @@ async fn reads_configuration_from_environment() {
         .env("EDAMAME_SYNC_INTERVAL_MS", "100")
         .env("EDAMAME_SYNC_TIMEOUT_MS", "1000")
         .env("EDAMAME_PUBLISH_WAIT_MS", "2000")
+        .env("EDAMAME_AUTH_TOKEN", "example-token")
         // 環境変数の値は不正だが、CLI の値が優先される
         .env("EDAMAME_PLAYLIST_SEGMENTS", "5")
         // CORS は未指定にする

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use edamame_domain::{CorsOrigins, EdamameError, validate_identifier};
+use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token, validate_identifier};
 
 /// `edamame-worker` の設定
 #[derive(Debug, Clone, Parser)]
@@ -34,6 +34,10 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
     pub cache_limit: u64,
 
+    /// controller の認証に使うトークン。省略すると Authorization ヘッダーを送らない
+    #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
+    pub auth_token: Option<String>,
+
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
     #[arg(long, value_delimiter = ',', env = "EDAMAME_CORS_ORIGIN")]
     pub cors_origin: Vec<String>,
@@ -43,6 +47,9 @@ impl WorkerConfig {
     /// 設定値を検証する
     pub fn validate(&self) -> Result<(), EdamameError> {
         validate_identifier("worker_id", &self.worker_id)?;
+        if let Some(token) = &self.auth_token {
+            validate_auth_token(token)?;
+        }
         if self.cache_limit == 0 {
             return Err(EdamameError::BadRequest(
                 "cache limit must be positive".to_owned(),
@@ -73,6 +80,7 @@ mod tests {
             controller_url: "http://127.0.0.1:9000".to_owned(),
             cache_dir: PathBuf::from(".edamame/worker-a"),
             cache_limit: 12,
+            auth_token: None,
             cors_origin: Vec::new(),
         }
     }
@@ -109,6 +117,27 @@ mod tests {
     }
 
     #[test]
+    fn treats_missing_auth_token_as_disabled() {
+        let mut config = config();
+        config.auth_token = None;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_auth_token() {
+        let mut config = config();
+        config.auth_token = Some("example-token".to_owned());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_auth_token() {
+        let mut config = config();
+        config.auth_token = Some(String::new());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn splits_cors_origins_with_comma() {
         // コマンドライン引数と環境変数のどちらでもカンマ区切りを受け付ける
         let delimiter = WorkerConfig::command()
@@ -131,13 +160,14 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert_eq!(names["worker_id"], "EDAMAME_WORKER_ID");
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
         assert_eq!(names["controller_url"], "EDAMAME_CONTROLLER_URL");
         assert_eq!(names["cache_dir"], "EDAMAME_CACHE_DIR");
         assert_eq!(names["cache_limit"], "EDAMAME_CACHE_LIMIT");
+        assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");
         assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
     }
 }

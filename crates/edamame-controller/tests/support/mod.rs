@@ -73,11 +73,14 @@ pub async fn spawn_controller(
     spawn_controller_with_options(
         addr,
         storage_dir,
-        playlist_segments,
-        sync_interval_ms,
-        sync_timeout_ms,
-        0,
-        CorsOrigins::Disabled,
+        ControllerOptions {
+            playlist_segments,
+            sync_interval_ms,
+            sync_timeout_ms,
+            publish_wait_ms: 0,
+            cors: CorsOrigins::Disabled,
+            auth_token: None,
+        },
     )
     .await
 }
@@ -94,11 +97,14 @@ pub async fn spawn_controller_with_publish_wait(
     spawn_controller_with_options(
         addr,
         storage_dir,
-        playlist_segments,
-        sync_interval_ms,
-        sync_timeout_ms,
-        publish_wait_ms,
-        CorsOrigins::Disabled,
+        ControllerOptions {
+            playlist_segments,
+            sync_interval_ms,
+            sync_timeout_ms,
+            publish_wait_ms,
+            cors: CorsOrigins::Disabled,
+            auth_token: None,
+        },
     )
     .await
 }
@@ -115,37 +121,70 @@ pub async fn spawn_controller_with_cors(
     spawn_controller_with_options(
         addr,
         storage_dir,
-        playlist_segments,
-        sync_interval_ms,
-        sync_timeout_ms,
-        0,
-        cors,
+        ControllerOptions {
+            playlist_segments,
+            sync_interval_ms,
+            sync_timeout_ms,
+            publish_wait_ms: 0,
+            cors,
+            auth_token: None,
+        },
     )
     .await
+}
+
+/// 認証トークンを指定して controller を実際の HTTP サーバーとして起動する
+pub async fn spawn_controller_with_auth(
+    addr: SocketAddr,
+    storage_dir: PathBuf,
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    auth_token: &str,
+) -> ControllerHandle {
+    spawn_controller_with_options(
+        addr,
+        storage_dir,
+        ControllerOptions {
+            playlist_segments,
+            sync_interval_ms,
+            sync_timeout_ms,
+            publish_wait_ms: 0,
+            cors: CorsOrigins::Disabled,
+            auth_token: Some(auth_token),
+        },
+    )
+    .await
+}
+
+/// controller の起動オプション
+struct ControllerOptions<'a> {
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    publish_wait_ms: u64,
+    cors: CorsOrigins,
+    auth_token: Option<&'a str>,
 }
 
 /// controller の全設定を指定して実際の HTTP サーバーとして起動する
 async fn spawn_controller_with_options(
     addr: SocketAddr,
     storage_dir: PathBuf,
-    playlist_segments: u64,
-    sync_interval_ms: u64,
-    sync_timeout_ms: u64,
-    publish_wait_ms: u64,
-    cors: CorsOrigins,
+    options: ControllerOptions<'_>,
 ) -> ControllerHandle {
     tokio::fs::create_dir_all(&storage_dir).await.unwrap();
     let store = CanonicalStore::new(storage_dir);
     let state = ControllerState::new(
         store,
-        playlist_segments,
-        sync_interval_ms,
-        sync_timeout_ms,
-        publish_wait_ms,
+        options.playlist_segments,
+        options.sync_interval_ms,
+        options.sync_timeout_ms,
+        options.publish_wait_ms,
     );
     let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = controller_router(state.clone(), &cors);
+    let app = controller_router(state.clone(), &options.cors, options.auth_token);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     tokio::spawn(async move {
         axum::serve(listener, app)
@@ -177,13 +216,14 @@ pub async fn spawn_worker(
     cache_limit: u64,
     start_sync: bool,
 ) -> WorkerHandle {
-    spawn_worker_with_cors(
+    spawn_worker_with_options(
         worker_id,
         controller_url,
         cache_dir,
         cache_limit,
         start_sync,
         CorsOrigins::Disabled,
+        None,
     )
     .await
 }
@@ -196,6 +236,48 @@ pub async fn spawn_worker_with_cors(
     cache_limit: u64,
     start_sync: bool,
     cors: CorsOrigins,
+) -> WorkerHandle {
+    spawn_worker_with_options(
+        worker_id,
+        controller_url,
+        cache_dir,
+        cache_limit,
+        start_sync,
+        cors,
+        None,
+    )
+    .await
+}
+
+/// 認証トークンを指定して worker を実際の HTTP サーバーとして起動する
+pub async fn spawn_worker_with_auth(
+    worker_id: &str,
+    controller_url: &str,
+    cache_dir: PathBuf,
+    cache_limit: u64,
+    start_sync: bool,
+    auth_token: &str,
+) -> WorkerHandle {
+    spawn_worker_with_options(
+        worker_id,
+        controller_url,
+        cache_dir,
+        cache_limit,
+        start_sync,
+        CorsOrigins::Disabled,
+        Some(auth_token.to_owned()),
+    )
+    .await
+}
+
+async fn spawn_worker_with_options(
+    worker_id: &str,
+    controller_url: &str,
+    cache_dir: PathBuf,
+    cache_limit: u64,
+    start_sync: bool,
+    cors: CorsOrigins,
+    auth_token: Option<String>,
 ) -> WorkerHandle {
     tokio::fs::create_dir_all(&cache_dir).await.unwrap();
     let cache = Cache::scan(cache_dir, cache_limit).await.unwrap();
@@ -216,7 +298,7 @@ pub async fn spawn_worker_with_cors(
     if start_sync {
         let sync_state = state.clone();
         tokio::spawn(async move {
-            edamame_worker::run_sync_loop(sync_state).await;
+            edamame_worker::run_sync_loop(sync_state, auth_token).await;
         });
     }
     WorkerHandle {

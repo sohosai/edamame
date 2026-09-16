@@ -6,7 +6,8 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use edamame_domain::{
@@ -27,7 +28,7 @@ const REGISTER_BODY_LIMIT: usize = 4 * 1024 * 1024;
 const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// controller のルーター
-pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins) -> Router {
+pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins, auth_token: Option<&str>) -> Router {
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
     // PUT の第 3 要素はセグメント識別子、GET の第 3 要素はセグメント番号のファイル名として同じ形のパスを使う
     let read = Router::new()
@@ -40,7 +41,7 @@ pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins) -> Router {
         Some(layer) => read.layer(layer),
         None => read,
     };
-    Router::new()
+    let write = Router::new()
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
             put(put_segment).layer(DefaultBodyLimit::max(SEGMENT_BODY_LIMIT)),
@@ -48,13 +49,57 @@ pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins) -> Router {
         .route(
             "/workers/{worker_id}",
             put(put_worker).layer(DefaultBodyLimit::max(REGISTER_BODY_LIMIT)),
-        )
-        .route(
-            "/workers/{worker_id}/sync",
-            post(post_sync).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
-        )
-        .merge(read)
-        .with_state(state)
+        );
+    // 認証は書き込み系の PUT だけに要求し、読み取りと sync には要求しない
+    let write = match auth_token {
+        Some(token) => write.layer(middleware::from_fn_with_state(
+            Arc::<str>::from(token),
+            authorize_put,
+        )),
+        None => write,
+    };
+    let sync = Router::new().route(
+        "/workers/{worker_id}/sync",
+        post(post_sync).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
+    );
+    write.merge(sync).merge(read).with_state(state)
+}
+
+/// PUT の Authorization ヘッダーを検証する
+async fn authorize_put(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
+    let authorized =
+        bearer_token(request.headers()).is_some_and(|provided| tokens_match(provided, &expected));
+    if authorized {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        "unauthorized",
+    )
+        .into_response()
+}
+
+/// Authorization ヘッダーから Bearer トークンを取り出す
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
+/// 一致した文字数からトークンを推測されないよう、すべてのバイトを比較する
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    let (provided, expected) = (provided.as_bytes(), expected.as_bytes());
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .iter()
+        .zip(expected)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 /// 許可する origin から読み取り用の CORS 層を作る

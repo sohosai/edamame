@@ -4,6 +4,7 @@ pub mod cors;
 pub mod error;
 pub mod playlist;
 pub mod segment;
+pub mod token;
 pub mod url;
 pub mod wire;
 
@@ -17,6 +18,7 @@ pub use segment::{
     SegmentId, SegmentKey, parse_sequence_filename, render_filename, validate_identifier,
     validate_quality, validate_resolution,
 };
+pub use token::validate_auth_token;
 pub use url::normalize_http_url;
 pub use wire::{RegisterRequest, RegisterResponse, SegmentPutResponse, SyncRequest, SyncResponse};
 

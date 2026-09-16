@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import os
 import re
 import shlex
 import signal
@@ -79,6 +80,7 @@ def build_parser():
         help="セグメント長（ミリ秒で 500 以上）",
     )
     parser.add_argument("--resolution", help="controller へ宣言する解像度（WIDTHxHEIGHT）")
+    parser.add_argument("--auth-token", help="controller の PUT に使う Bearer トークン")
     return parser
 
 
@@ -95,6 +97,12 @@ def validate_args(args, parser):
         parser.error("segment-duration-ms must be at least 500")
     if args.resolution is not None and RESOLUTION_PATTERN.fullmatch(args.resolution) is None:
         parser.error("resolution must be WIDTHxHEIGHT")
+    if args.auth_token is not None:
+        # HTTP ヘッダーにそのまま載せられる値だけを受け付け、送信時の例外とトークンの取り違えを防ぐ
+        if not args.auth_token or not all(
+            0x21 <= ord(character) <= 0x7E for character in args.auth_token
+        ):
+            parser.error("auth-token must be non-empty printable ASCII without spaces")
 
     try:
         parsed_url = urllib.parse.urlsplit(args.controller_url)
@@ -497,6 +505,8 @@ def put_segment(args, identifier, segment_path):
     url = segment_url(args, identifier)
     request = urllib.request.Request(url, data=segment_path.read_bytes(), method="PUT")
     request.add_header("Content-Type", "application/octet-stream")
+    if args.auth_token is not None:
+        request.add_header("Authorization", f"Bearer {args.auth_token}")
     try:
         with urllib.request.urlopen(request, timeout=PUT_TIMEOUT_SECONDS) as response:
             status = response.status
@@ -546,12 +556,28 @@ def put_segment_with_retry(args, identifier, segment_path):
 def print_resend_instructions(args, identifier, segment_path, reason):
     print(reason, file=sys.stderr, flush=True)
     print(f"the segment is kept at {segment_path}", file=sys.stderr, flush=True)
+    curl_options = []
+    if args.auth_token is not None:
+        # トークンは値も引用符もログに出さず、curl だけが読む設定ファイルに書く
+        config_path = segment_path.parent / "resend-curl.conf"
+        escaped_token = args.auth_token.replace("\\", "\\\\").replace('"', '\\"')
+        descriptor = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as config:
+            config.write(f'header = "Authorization: Bearer {escaped_token}"\n')
+        curl_options.append(f"--config {shlex.quote(str(config_path))}")
     print(
-        f"resend with: curl -X PUT --data-binary {shlex.quote(f'@{segment_path}')} "
+        f"resend with: curl {' '.join([*curl_options, '-X', 'PUT'])} "
+        f"--data-binary {shlex.quote(f'@{segment_path}')} "
         f"{shlex.quote(segment_url(args, identifier))}",
         file=sys.stderr,
         flush=True,
     )
+    if args.auth_token is not None:
+        print(
+            "the config file contains the auth token; delete it after the resend",
+            file=sys.stderr,
+            flush=True,
+        )
     print("restart the publisher after the resend succeeds", file=sys.stderr, flush=True)
 
 

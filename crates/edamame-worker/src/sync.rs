@@ -15,7 +15,7 @@ enum SyncOutcome {
 }
 
 /// 登録と sync を永続的に実行する
-pub async fn run_sync_loop(state: Arc<WorkerState>) {
+pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) {
     let mut registered = false;
     let mut interval_ms = 1000_u64;
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -23,7 +23,7 @@ pub async fn run_sync_loop(state: Arc<WorkerState>) {
         if !registered {
             // 前の登録で始めた取得が残っていると、捨てたキャッシュを古い内容で埋め直すため止める
             stop_fetch(&mut fetch_task).await;
-            match register(&state).await {
+            match register(&state, auth_token.as_deref()).await {
                 Ok(received_interval_ms) => {
                     registered = true;
                     interval_ms = received_interval_ms;
@@ -88,14 +88,17 @@ async fn discard_cache(state: &WorkerState) {
     }
 }
 
-async fn register(state: &WorkerState) -> Result<u64, EdamameError> {
+async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, EdamameError> {
     let url = format!("{}/workers/{}", state.controller_url, state.worker_id);
-    let response = state
-        .client
-        .put(&url)
-        .json(&RegisterRequest {
-            public_url: state.public_url.clone(),
-        })
+    let request = state.client.put(&url).json(&RegisterRequest {
+        public_url: state.public_url.clone(),
+    });
+    // 認証が必要なのは登録 PUT だけのため、指定時のみ Authorization ヘッダーを付ける
+    let request = match auth_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let response = request
         .send()
         .await
         .map_err(|error| EdamameError::Internal(format!("registration request failed: {error}")))?;
