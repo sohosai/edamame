@@ -222,8 +222,7 @@ pub async fn spawn_worker(
         cache_dir,
         cache_limit,
         start_sync,
-        CorsOrigins::Disabled,
-        None,
+        WorkerOptions::default(),
     )
     .await
 }
@@ -243,8 +242,10 @@ pub async fn spawn_worker_with_cors(
         cache_dir,
         cache_limit,
         start_sync,
-        cors,
-        None,
+        WorkerOptions {
+            cors,
+            ..WorkerOptions::default()
+        },
     )
     .await
 }
@@ -264,10 +265,52 @@ pub async fn spawn_worker_with_auth(
         cache_dir,
         cache_limit,
         start_sync,
-        CorsOrigins::Disabled,
-        Some(auth_token.to_owned()),
+        WorkerOptions {
+            auth_token: Some(auth_token.to_owned()),
+            ..WorkerOptions::default()
+        },
     )
     .await
+}
+
+/// 重みを指定して worker を実際の HTTP サーバーとして起動する
+pub async fn spawn_worker_with_weight(
+    worker_id: &str,
+    controller_url: &str,
+    cache_dir: PathBuf,
+    cache_limit: u64,
+    start_sync: bool,
+    weight: u32,
+) -> WorkerHandle {
+    spawn_worker_with_options(
+        worker_id,
+        controller_url,
+        cache_dir,
+        cache_limit,
+        start_sync,
+        WorkerOptions {
+            weight,
+            ..WorkerOptions::default()
+        },
+    )
+    .await
+}
+
+/// worker を起動するときの追加設定
+struct WorkerOptions {
+    cors: CorsOrigins,
+    auth_token: Option<String>,
+    weight: u32,
+}
+
+impl Default for WorkerOptions {
+    fn default() -> Self {
+        Self {
+            cors: CorsOrigins::Disabled,
+            auth_token: None,
+            weight: 1,
+        }
+    }
 }
 
 async fn spawn_worker_with_options(
@@ -276,9 +319,13 @@ async fn spawn_worker_with_options(
     cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
-    cors: CorsOrigins,
-    auth_token: Option<String>,
+    options: WorkerOptions,
 ) -> WorkerHandle {
+    let WorkerOptions {
+        cors,
+        auth_token,
+        weight,
+    } = options;
     tokio::fs::create_dir_all(&cache_dir).await.unwrap();
     let cache = Cache::scan(cache_dir, cache_limit).await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -288,6 +335,7 @@ async fn spawn_worker_with_options(
         worker_id.to_owned(),
         controller_url.to_owned(),
         public_url.clone(),
+        weight,
         cache,
     )
     .unwrap();

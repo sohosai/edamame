@@ -14,6 +14,8 @@ pub struct SegmentPutResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub public_url: String,
+    /// worker の相対的な配信能力
+    pub weight: u32,
 }
 
 /// worker の登録レスポンス

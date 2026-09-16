@@ -92,6 +92,7 @@ async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, 
     let url = format!("{}/workers/{}", state.controller_url, state.worker_id);
     let request = state.client.put(&url).json(&RegisterRequest {
         public_url: state.public_url.clone(),
+        weight: state.weight,
     });
     // 認証が必要なのは登録 PUT だけのため、指定時のみ Authorization ヘッダーを付ける
     let request = match auth_token {

@@ -64,6 +64,8 @@ impl ChannelState {
 pub struct QualityState {
     pub bandwidth: u64,
     pub resolution: Option<String>,
+    /// 配信先の選択で使う worker ごとの現在値
+    pub current_weights: BTreeMap<String, i64>,
     /// 公開済みのセグメント番号
     pub published: BTreeSet<u64>,
     /// 未公開セグメントの公開待ちが終わる時刻
@@ -79,6 +81,8 @@ pub struct QualityState {
 /// worker の登録内容と最後の報告
 pub struct WorkerState {
     pub public_url: String,
+    /// 相対的な配信能力
+    pub weight: i64,
     pub last_sync_ms: u64,
     pub cached: BTreeSet<SegmentId>,
 }
@@ -246,6 +250,7 @@ impl ControllerState {
             .or_insert_with(|| QualityState {
                 bandwidth,
                 resolution: resolution.clone(),
+                current_weights: BTreeMap::new(),
                 published: BTreeSet::new(),
                 publish_due_ms: None,
                 allowed_through: None,
@@ -271,27 +276,38 @@ impl ControllerState {
         &self,
         worker_id: &str,
         public_url: &str,
+        weight: u32,
         now_ms: u64,
     ) -> Result<bool, EdamameError> {
         validate_identifier("worker_id", worker_id)?;
+        if weight == 0 {
+            return Err(EdamameError::BadRequest(
+                "weight must be positive".to_owned(),
+            ));
+        }
         let public_url = normalize_http_url(public_url)?;
         let mut inner = self.inner.lock().await;
-        if let Some(worker) = inner.workers.get_mut(worker_id) {
+        let created = if let Some(worker) = inner.workers.get_mut(worker_id) {
             worker.public_url = public_url;
+            worker.weight = i64::from(weight);
             // worker は登録のたびにキャッシュを捨てるため、報告済みのキャッシュも無効にする
             worker.cached = BTreeSet::new();
-            Ok(false)
+            false
         } else {
             inner.workers.insert(
                 worker_id.to_owned(),
                 WorkerState {
                     public_url,
+                    weight: i64::from(weight),
                     last_sync_ms: now_ms,
                     cached: BTreeSet::new(),
                 },
             );
-            Ok(true)
-        }
+            true
+        };
+        // 重みが変わると前の周期が合わなくなるため、全 quality の現在値をやり直す
+        reset_current_weights(&mut inner.channels);
+        Ok(created)
     }
 
     /// sync を受け付けて取得一覧を返す
@@ -349,27 +365,29 @@ impl ControllerState {
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
         let (segment_duration_ms, published, worker_url) = {
-            let inner = self.inner.lock().await;
-            let Inner { channels, workers } = &*inner;
+            let mut inner = self.inner.lock().await;
+            let Inner { channels, workers } = &mut *inner;
             let channel = channels
-                .get(channel_id)
+                .get_mut(channel_id)
                 .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
             let quality_state = channel
                 .qualities
-                .get(quality)
+                .get_mut(quality)
                 .ok_or_else(|| EdamameError::NotFound("quality not found".to_owned()))?;
             if quality_state.published.is_empty() {
                 return Err(EdamameError::Unavailable(
                     "playlist is not published yet".to_owned(),
                 ));
             }
-            let worker_url = workers
-                .values()
-                .find(|worker| {
-                    is_alive(worker, now_ms, self.sync_timeout_ms)
-                        && holds_segments(worker, channel_id, quality, &quality_state.published)
-                })
-                .map(|worker| worker.public_url.clone());
+            let worker_url = select_serving_worker(
+                workers,
+                &mut quality_state.current_weights,
+                channel_id,
+                quality,
+                &quality_state.published,
+                now_ms,
+                self.sync_timeout_ms,
+            );
             (
                 channel.segment_duration_ms,
                 quality_state.published.clone(),
@@ -517,6 +535,74 @@ fn validate_segment_metadata(
 /// 期限内に sync した worker か
 fn is_alive(worker: &WorkerState, now_ms: u64, sync_timeout_ms: u64) -> bool {
     now_ms.saturating_sub(worker.last_sync_ms) <= sync_timeout_ms
+}
+
+/// 全 quality の選択の周期をやり直す
+fn reset_current_weights(channels: &mut BTreeMap<String, ChannelState>) {
+    for channel in channels.values_mut() {
+        for quality_state in channel.qualities.values_mut() {
+            quality_state.current_weights.clear();
+        }
+    }
+}
+
+/// 公開範囲を保持している worker から重みの比に従って 1 台選び、公開 URL を返す
+fn select_serving_worker(
+    workers: &BTreeMap<String, WorkerState>,
+    current_weights: &mut BTreeMap<String, i64>,
+    channel_id: &str,
+    quality: &str,
+    published: &BTreeSet<u64>,
+    now_ms: u64,
+    sync_timeout_ms: u64,
+) -> Option<String> {
+    let candidates: Vec<&str> = workers
+        .iter()
+        .filter(|(_, worker)| {
+            is_alive(worker, now_ms, sync_timeout_ms)
+                && holds_segments(worker, channel_id, quality, published)
+        })
+        .map(|(worker_id, _)| worker_id.as_str())
+        .collect();
+    if candidates.is_empty() {
+        current_weights.clear();
+        return None;
+    }
+
+    // 候補が増減したら、その時点から重みの比で選び直す
+    let keep_cycle = candidates.len() == current_weights.len()
+        && candidates
+            .iter()
+            .all(|worker_id| current_weights.contains_key(*worker_id));
+    if !keep_cycle {
+        current_weights.clear();
+    }
+    let total_weight: i64 = candidates
+        .iter()
+        .map(|worker_id| workers[*worker_id].weight)
+        .sum();
+
+    // 現在値に重みを足し、最大の worker に配る。選んだ worker からは合計重みを引く
+    let mut selected: Option<&str> = None;
+    let mut highest = i64::MIN;
+    for worker_id in &candidates {
+        let weight = workers[*worker_id].weight;
+        let current = current_weights.entry((*worker_id).to_owned()).or_insert(0);
+        *current += weight;
+        // 現在値が同じときは worker_id の昇順で先頭を残す
+        if *current > highest {
+            highest = *current;
+            selected = Some(*worker_id);
+        }
+    }
+
+    let selected = selected?;
+    if let Some(current) = current_weights.get_mut(selected) {
+        *current -= total_weight;
+    }
+    workers
+        .get(selected)
+        .map(|worker| worker.public_url.clone())
 }
 
 /// worker が指定された quality のセグメントをすべて保持しているか
@@ -800,6 +886,7 @@ mod tests {
             QualityState {
                 bandwidth: 3_000_000,
                 resolution: None,
+                current_weights: BTreeMap::new(),
                 published: published.iter().copied().collect(),
                 publish_due_ms,
                 allowed_through,
@@ -826,9 +913,314 @@ mod tests {
         }
         WorkerState {
             public_url: "http://worker.test".to_owned(),
+            weight: 1,
             last_sync_ms: 0,
             cached,
         }
+    }
+
+    /// 重みを指定した worker を作る
+    fn worker_with_weight(url: &str, weight: i64, sequences: &[u64]) -> WorkerState {
+        let mut worker = worker_with_cached("live", "720p", sequences);
+        worker.public_url = url.to_owned();
+        worker.weight = weight;
+        worker
+    }
+
+    #[test]
+    fn selects_serving_workers_by_weight() {
+        // 重み 4 と 1 では、5 回のうち 1 回だけ軽い worker を選ぶ
+        let workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_weight("http://a.test", 4, &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_weight("http://b.test", 1, &[0, 1]),
+            ),
+        ]);
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut current_weights = BTreeMap::new();
+        let mut selected = Vec::new();
+        for _ in 0..5 {
+            selected.push(
+                select_serving_worker(
+                    &workers,
+                    &mut current_weights,
+                    "live",
+                    "720p",
+                    &published,
+                    0,
+                    1_000,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            selected,
+            vec![
+                "http://a.test",
+                "http://a.test",
+                "http://b.test",
+                "http://a.test",
+                "http://a.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_same_weight_workers_alternately() {
+        // 重みが同じなら順番に選ぶ
+        let workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_weight("http://a.test", 1, &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_weight("http://b.test", 1, &[0, 1]),
+            ),
+        ]);
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut current_weights = BTreeMap::new();
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            selected.push(
+                select_serving_worker(
+                    &workers,
+                    &mut current_weights,
+                    "live",
+                    "720p",
+                    &published,
+                    0,
+                    1_000,
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            selected,
+            vec![
+                "http://a.test",
+                "http://b.test",
+                "http://a.test",
+                "http://b.test"
+            ]
+        );
+    }
+
+    #[test]
+    fn resets_current_weight_of_worker_without_published_range() {
+        // 公開範囲を持たない worker は候補から外れ、現在値も消す
+        let workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_weight("http://a.test", 1, &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_weight("http://b.test", 1, &[1]),
+            ),
+        ]);
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut current_weights = BTreeMap::from([("worker-b".to_owned(), 5)]);
+        assert_eq!(
+            select_serving_worker(
+                &workers,
+                &mut current_weights,
+                "live",
+                "720p",
+                &published,
+                0,
+                1_000
+            )
+            .unwrap(),
+            "http://a.test"
+        );
+        assert!(!current_weights.contains_key("worker-b"));
+    }
+
+    #[test]
+    fn resets_current_weight_of_timed_out_worker() {
+        // sync が届いていない worker も候補から外れ、現在値を消す
+        let mut workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_weight("http://a.test", 1, &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_weight("http://b.test", 1, &[0, 1]),
+            ),
+        ]);
+        workers.get_mut("worker-a").unwrap().last_sync_ms = 5_000;
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut current_weights = BTreeMap::from([("worker-b".to_owned(), -5)]);
+        assert_eq!(
+            select_serving_worker(
+                &workers,
+                &mut current_weights,
+                "live",
+                "720p",
+                &published,
+                5_000,
+                1_000
+            )
+            .unwrap(),
+            "http://a.test"
+        );
+        assert!(!current_weights.contains_key("worker-b"));
+    }
+
+    #[test]
+    fn resets_selection_when_candidate_set_changes() {
+        // 3 台のうち 1 台が候補から外れたら、残った候補で重みの比をやり直す
+        let mut workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_weight("http://a.test", 1, &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_weight("http://b.test", 1, &[0, 1]),
+            ),
+            (
+                "worker-c".to_owned(),
+                worker_with_weight("http://c.test", 1, &[0, 1]),
+            ),
+        ]);
+        for worker in workers.values_mut() {
+            worker.last_sync_ms = 5_000;
+        }
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut current_weights = BTreeMap::new();
+        assert_eq!(
+            select_serving_worker(
+                &workers,
+                &mut current_weights,
+                "live",
+                "720p",
+                &published,
+                5_000,
+                1_000
+            )
+            .unwrap(),
+            "http://a.test"
+        );
+        // worker-c の sync が届かなくなる
+        workers.get_mut("worker-c").unwrap().last_sync_ms = 0;
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            let url = select_serving_worker(
+                &workers,
+                &mut current_weights,
+                "live",
+                "720p",
+                &published,
+                5_000,
+                1_000,
+            )
+            .unwrap();
+            selected.push(if url == "http://a.test" { "a" } else { "b" });
+        }
+        assert_eq!(selected, vec!["a", "b", "a", "b"]);
+    }
+
+    #[test]
+    fn keeps_selection_state_per_quality() {
+        // 720p の選択状態は、候補が違う 480p のリクエストで影響を受けない
+        let mut workers = BTreeMap::from([
+            (
+                "worker-a".to_owned(),
+                worker_with_cached("live", "720p", &[0, 1]),
+            ),
+            (
+                "worker-b".to_owned(),
+                worker_with_cached("live", "720p", &[0, 1]),
+            ),
+            (
+                "worker-c".to_owned(),
+                worker_with_cached("live", "480p", &[0, 1]),
+            ),
+        ]);
+        workers.get_mut("worker-a").unwrap().public_url = "http://a.test".to_owned();
+        workers.get_mut("worker-b").unwrap().public_url = "http://b.test".to_owned();
+        workers.get_mut("worker-c").unwrap().public_url = "http://c.test".to_owned();
+        let published: BTreeSet<u64> = [0, 1].into_iter().collect();
+        let mut hd_weights = BTreeMap::new();
+        let mut sd_weights = BTreeMap::new();
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            // 480p の選択を挟んでも 720p は a、b の順に選ぶ
+            assert_eq!(
+                select_serving_worker(
+                    &workers,
+                    &mut sd_weights,
+                    "live",
+                    "480p",
+                    &published,
+                    0,
+                    1_000
+                )
+                .unwrap(),
+                "http://c.test"
+            );
+            let url = select_serving_worker(
+                &workers,
+                &mut hd_weights,
+                "live",
+                "720p",
+                &published,
+                0,
+                1_000,
+            )
+            .unwrap();
+            selected.push(if url == "http://a.test" { "a" } else { "b" });
+        }
+        assert_eq!(selected, vec!["a", "b", "a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn resets_current_weights_on_registration() {
+        let state = ControllerState::new(
+            CanonicalStore::new(std::path::PathBuf::from("/tmp/edamame-test")),
+            6,
+            1_000,
+            10_000,
+            0,
+        );
+        state
+            .register_worker("worker-a", "http://a.test", 4, 0)
+            .await
+            .unwrap();
+        state
+            .register_worker("worker-b", "http://b.test", 1, 0)
+            .await
+            .unwrap();
+        {
+            let mut inner = state.inner.lock().await;
+            let mut channel = channel_with_quality(&[0, 1], &[0, 1], None, None, &[]);
+            let quality_state = channel.qualities.get_mut("720p").unwrap();
+            quality_state
+                .current_weights
+                .insert("worker-a".to_owned(), 500);
+            quality_state
+                .current_weights
+                .insert("worker-b".to_owned(), -500);
+            inner.channels.insert("live".to_owned(), channel);
+        }
+        // 再登録すると選択の周期をやり直す
+        state
+            .register_worker("worker-a", "http://a.test", 1, 0)
+            .await
+            .unwrap();
+        let inner = state.inner.lock().await;
+        assert!(
+            inner.channels["live"].qualities["720p"]
+                .current_weights
+                .is_empty()
+        );
     }
 
     #[test]

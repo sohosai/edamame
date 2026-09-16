@@ -36,6 +36,7 @@ async fn serves_segments_under_public_url_path_prefix() {
         "worker-a".to_owned(),
         "http://127.0.0.1:9000".to_owned(),
         "http://127.0.0.1:9001/base".to_owned(),
+        1,
         cache,
     )
     .unwrap();
@@ -71,6 +72,7 @@ async fn missing_file_removes_index_entry() {
         "worker-a".to_owned(),
         "http://127.0.0.1:9000".to_owned(),
         format!("http://{addr}"),
+        1,
         cache,
     )
     .unwrap();
@@ -102,6 +104,7 @@ async fn unreadable_file_removes_index_entry() {
         "worker-a".to_owned(),
         "http://127.0.0.1:9000".to_owned(),
         format!("http://{addr}"),
+        1,
         cache,
     )
     .unwrap();
@@ -136,6 +139,7 @@ async fn serves_segments_under_path_prefix_with_route_characters() {
             "worker-a".to_owned(),
             "http://127.0.0.1:9000".to_owned(),
             format!("http://{addr}{path}"),
+            1,
             cache,
         )
         .unwrap();

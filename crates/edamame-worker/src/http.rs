@@ -21,6 +21,7 @@ pub struct WorkerState {
     pub worker_id: String,
     pub controller_url: String,
     pub public_url: String,
+    pub weight: u32,
     pub path_prefix: String,
     pub cache: Mutex<Cache>,
     pub client: reqwest::Client,
@@ -32,6 +33,7 @@ impl WorkerState {
         worker_id: String,
         controller_url: String,
         public_url: String,
+        weight: u32,
         cache: Cache,
     ) -> Result<Arc<Self>, EdamameError> {
         let client = reqwest::Client::builder()
@@ -47,6 +49,7 @@ impl WorkerState {
             worker_id,
             controller_url,
             public_url,
+            weight,
             path_prefix,
             cache: Mutex::new(cache),
             client,

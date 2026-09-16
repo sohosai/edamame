@@ -227,7 +227,7 @@ async fn put_worker(
     ValidatedJson(request): ValidatedJson<RegisterRequest>,
 ) -> Result<Response, HttpError> {
     let created = state
-        .register_worker(&worker_id, &request.public_url, now_ms())
+        .register_worker(&worker_id, &request.public_url, request.weight, now_ms())
         .await?;
     let status = if created {
         StatusCode::CREATED

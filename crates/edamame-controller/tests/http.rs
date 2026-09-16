@@ -9,7 +9,8 @@ use serde_json::{Value, json};
 use support::{
     TempDir, spawn_controller, spawn_controller_with_auth, spawn_controller_with_cors,
     spawn_controller_with_publish_wait, spawn_worker, spawn_worker_with_auth,
-    spawn_worker_with_cors, wait_for_playlist, wait_for_playlist_contains, wait_for_segment,
+    spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
+    wait_for_playlist_contains, wait_for_segment,
 };
 
 fn any_addr() -> std::net::SocketAddr {
@@ -128,10 +129,11 @@ async fn register_worker(
     base_url: &str,
     worker_id: &str,
     public_url: &str,
+    weight: u32,
 ) -> reqwest::Response {
     client
         .put(format!("{base_url}/workers/{worker_id}"))
-        .json(&json!({ "public_url": public_url }))
+        .json(&json!({ "public_url": public_url, "weight": weight }))
         .send()
         .await
         .unwrap()
@@ -460,6 +462,129 @@ async fn invalid_identifiers_are_rejected() {
     assert_eq!(allowed.status().as_u16(), 201);
 }
 
+/// メディアプレイリストに書かれた worker を a と b の記号で返す
+async fn selected_worker(client: &reqwest::Client, base_url: &str) -> &'static str {
+    let response = client
+        .get(format!("{base_url}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.text().await.unwrap();
+    if body.contains("http://worker-a.test") {
+        "a"
+    } else {
+        "b"
+    }
+}
+
+/// 重みの比に従ってプレイリストの worker を選ぶ
+#[tokio::test]
+async fn playlist_selects_workers_by_weight() {
+    let tmp = TempDir::new("weight");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 4).await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
+    for worker_id in ["worker-a", "worker-b"] {
+        let sync = sync_worker(&client, base, worker_id, cached("720p", sequences.clone())).await;
+        assert_eq!(sync.status().as_u16(), 200);
+    }
+
+    // 重み 4 と 1 では、5 回のうち 1 回だけ worker-b を選ぶ
+    let mut selected = Vec::new();
+    for _ in 0..5 {
+        selected.push(selected_worker(&client, base).await);
+    }
+    assert_eq!(selected, vec!["a", "a", "b", "a", "a"]);
+}
+
+/// 重みを変えたら前の周期を引き継がず、新しい比で選び直す
+#[tokio::test]
+async fn weight_change_resets_selection_cycle() {
+    let tmp = TempDir::new("weight-change");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 1000).await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
+    for worker_id in ["worker-a", "worker-b"] {
+        let sync = sync_worker(&client, base, worker_id, cached("720p", sequences.clone())).await;
+        assert_eq!(sync.status().as_u16(), 200);
+    }
+    // 大きい重みで選択の周期を作る
+    for _ in 0..10 {
+        assert_eq!(selected_worker(&client, base).await, "a");
+    }
+
+    // 重みを 1 に変えてキャッシュを報告し直すと、同じ重みとして順番に選ぶ
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 1).await;
+    for worker_id in ["worker-a", "worker-b"] {
+        let sync = sync_worker(&client, base, worker_id, cached("720p", sequences.clone())).await;
+        assert_eq!(sync.status().as_u16(), 200);
+    }
+    let mut selected = Vec::new();
+    for _ in 0..4 {
+        selected.push(selected_worker(&client, base).await);
+    }
+    assert_eq!(selected, vec!["a", "b", "a", "b"]);
+}
+
+/// 重みが不正な登録は 400 にする
+#[tokio::test]
+async fn worker_registration_rejects_invalid_weight() {
+    let tmp = TempDir::new("weight-invalid");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let zero = register_worker(&client, base, "worker-a", "http://worker.test", 0).await;
+    assert_eq!(zero.status().as_u16(), 400);
+    // 重みを省略した登録も 400 にする
+    let missing = client
+        .put(format!("{base}/workers/worker-a"))
+        .json(&json!({ "public_url": "http://worker.test" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status().as_u16(), 400);
+    let accepted = register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    assert_eq!(accepted.status().as_u16(), 201);
+}
+
+/// worker は設定した重みを登録で報告する
+#[tokio::test]
+async fn worker_registers_configured_weight() {
+    let tmp = TempDir::new("worker-weight");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _worker = spawn_worker_with_weight(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+        4,
+    )
+    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let inner = controller.state.inner.lock().await;
+            if let Some(worker) = inner.workers.get("worker-a") {
+                assert_eq!(worker.weight, 4);
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker の登録が届かなかった"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn playlist_contract_with_ready_worker() {
     let tmp = TempDir::new("playlist");
@@ -476,7 +601,7 @@ async fn playlist_contract_with_ready_worker() {
     assert_eq!(unavailable.status().as_u16(), 503);
 
     let worker_public_url = "http://worker.test";
-    let registration = register_worker(&client, base, "worker-a", worker_public_url).await;
+    let registration = register_worker(&client, base, "worker-a", worker_public_url, 1).await;
     assert_eq!(registration.status().as_u16(), 201);
     let registration_body: Value = registration.json().await.unwrap();
     assert_eq!(registration_body["sync_interval_ms"], 1000);
@@ -537,7 +662,7 @@ async fn playlist_gap_from_missing_quality_segment_is_filled() {
     // 欠落した範囲はまだ公開しない
     assert_eq!(gap.status().as_u16(), 503);
 
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     let sync = sync_worker(&client, base, "worker-a", cached("720p", 0..3)).await;
     assert_eq!(sync.status().as_u16(), 200);
     let gap_with_worker = client
@@ -599,7 +724,7 @@ async fn master_playlist_aligns_qualities_by_identifier() {
     assert_eq!(sequences_720p, vec![0, 1, 2, 3, 4, 5]);
     assert_eq!(sequences_720p, sequences_480p);
 
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     let mut cached_segments = cached("720p", sequences_720p);
     cached_segments.extend(cached("480p", sequences_480p));
     sync_worker(&client, base, "worker-a", cached_segments).await;
@@ -634,7 +759,7 @@ async fn media_playlist_reflects_new_segment() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
     let first = client
         .get(format!("{base}/channels/live/720p.m3u8"))
@@ -685,7 +810,7 @@ async fn publish_wait_keeps_previous_playlist_until_worker_catches_up() {
         .unwrap();
     assert_eq!(unavailable.status().as_u16(), 503);
 
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
     tokio::time::sleep(Duration::from_millis(350)).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
@@ -761,7 +886,7 @@ async fn starts_new_publish_wait_after_expired_batch() {
     // 最初の公開待ちが切れた後に次のセグメントを PUT する
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(publish_segment(&client, base, "720p", "seg-6").await, 6);
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     let mut all = sequences;
     all.push(6);
     sync_worker(&client, base, "worker-a", cached("720p", all.clone())).await;
@@ -806,7 +931,7 @@ async fn reput_pruned_segment_does_not_start_wait() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
     tokio::time::sleep(Duration::from_millis(2050)).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
@@ -852,7 +977,7 @@ async fn master_playlist_excludes_quality_until_published() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
 
     let master = client
@@ -919,8 +1044,8 @@ async fn uses_only_worker_that_has_published_range() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
-    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 1).await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
     sync_worker(&client, base, "worker-b", cached("720p", sequences.clone())).await;
 
     // worker-a はまだ公開範囲を持たないため、追いついた worker-b を使う
@@ -954,8 +1079,8 @@ async fn keeps_serving_when_qualities_advance_at_different_times() {
     let base = &controller.base_url;
     let initial_720p = publish_series(&client, base, "720p", 0..6).await;
     let initial_480p = publish_series(&client, base, "480p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
-    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 1).await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
 
     // 最初は両方の quality を worker-a から配信する
     let mut cached_a = cached("720p", initial_720p);
@@ -1010,7 +1135,7 @@ async fn publishes_when_worker_evicted_previous_range() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
@@ -1079,7 +1204,7 @@ async fn publishes_connectable_range_when_latest_has_a_gap() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
@@ -1132,7 +1257,7 @@ async fn allows_media_sequence_to_move_backwards() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     // 最初はセグメント 5 だけを公開する
     sync_worker(&client, base, "worker-a", cached("720p", 5..6)).await;
     let media_body = wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
@@ -1164,7 +1289,7 @@ async fn recovers_when_worker_is_farther_behind_than_the_window() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
 
@@ -1199,8 +1324,8 @@ async fn qualities_publish_different_ranges_with_different_workers() {
     // 720p は 0..8、480p は同じ識別子で 0..5 まで PUT する
     publish_series(&client, base, "720p", 0..9).await;
     publish_series(&client, base, "480p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker-a.test").await;
-    register_worker(&client, base, "worker-b", "http://worker-b.test").await;
+    register_worker(&client, base, "worker-a", "http://worker-a.test", 1).await;
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..9)).await;
     sync_worker(&client, base, "worker-b", cached("480p", 0..6)).await;
 
@@ -1238,7 +1363,7 @@ async fn file_deleted_in_range_returns_422() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
     assert_eq!(
         client
@@ -1272,12 +1397,12 @@ async fn file_deleted_without_worker_returns_422() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
 
     std::fs::remove_file(storage.join("live/720p/2.ts")).unwrap();
     // 再登録でキャッシュを無効にし、公開範囲を保持する worker をなくす
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(
         client
             .get(format!("{base}/channels/live/720p.m3u8"))
@@ -1297,9 +1422,9 @@ async fn worker_registration_and_sync_contract() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    let created = register_worker(&client, base, "worker-a", "http://worker.test").await;
+    let created = register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(created.status().as_u16(), 201);
-    let updated = register_worker(&client, base, "worker-a", "http://worker.test").await;
+    let updated = register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(updated.status().as_u16(), 200);
     // 最新の 5 がまだなくても、連続して保持している 0..4 を公開する
     let partial = sync_worker(&client, base, "worker-a", cached("720p", 0..5)).await;
@@ -1324,7 +1449,7 @@ async fn invalid_json_returns_400() {
     // public_url の型が違う登録は 400 にする
     let bad_type = client
         .put(format!("{}/workers/worker-a", controller.base_url))
-        .json(&json!({ "public_url": 1 }))
+        .json(&json!({ "public_url": 1, "weight": 1 }))
         .send()
         .await
         .unwrap();
@@ -1349,6 +1474,7 @@ async fn invalid_json_returns_400() {
         &controller.base_url,
         "worker-a",
         "http://worker.test",
+        1,
     )
     .await;
     // cached_segments の型が違う sync は 400 にする
@@ -1407,7 +1533,7 @@ async fn worker_timeout_and_recovery() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
@@ -1440,10 +1566,10 @@ async fn registration_update_does_not_extend_timeout() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let updated = register_worker(&client, base, "worker-a", "http://worker.test").await;
+    let updated = register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(updated.status().as_u16(), 200);
     assert_eq!(
         client
@@ -1561,7 +1687,7 @@ async fn registration_resets_cached_segments() {
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
-    register_worker(&client, base, "worker-a", "http://worker.test").await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences.clone())).await;
     assert_eq!(
         client
@@ -1575,7 +1701,7 @@ async fn registration_resets_cached_segments() {
     );
 
     // worker は登録のたびにキャッシュを捨てるため、登録を更新した時点で配信先に使えなくなる
-    let updated = register_worker(&client, base, "worker-a", "http://worker.test").await;
+    let updated = register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(updated.status().as_u16(), 200);
     assert_eq!(
         client
@@ -1937,13 +2063,14 @@ async fn put_requires_bearer_token_when_auth_token_is_set() {
         &controller.base_url,
         "worker-a",
         "http://127.0.0.1:9001",
+        1,
     )
     .await;
     assert_eq!(response.status().as_u16(), 401);
     let response = client
         .put(&register_url)
         .bearer_auth("example-token")
-        .json(&json!({ "public_url": "http://127.0.0.1:9001" }))
+        .json(&json!({ "public_url": "http://127.0.0.1:9001", "weight": 1 }))
         .send()
         .await
         .unwrap();

@@ -21,7 +21,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller_url = normalize_http_url(&config.controller_url)?;
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     let cache = Cache::scan(config.cache_dir.clone(), config.cache_limit).await?;
-    let state = WorkerState::new(config.worker_id.clone(), controller_url, public_url, cache)?;
+    let state = WorkerState::new(
+        config.worker_id.clone(),
+        controller_url,
+        public_url,
+        config.weight,
+        cache,
+    )?;
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let app = router(state.clone(), &cors);
     let sync_state = state.clone();

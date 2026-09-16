@@ -34,6 +34,10 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
     pub cache_limit: u64,
 
+    /// 相対的な配信能力
+    #[arg(long, env = "EDAMAME_WEIGHT", default_value_t = 1)]
+    pub weight: u32,
+
     /// controller の認証に使うトークン。省略すると Authorization ヘッダーを送らない
     #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
@@ -53,6 +57,11 @@ impl WorkerConfig {
         if self.cache_limit == 0 {
             return Err(EdamameError::BadRequest(
                 "cache limit must be positive".to_owned(),
+            ));
+        }
+        if self.weight == 0 {
+            return Err(EdamameError::BadRequest(
+                "weight must be positive".to_owned(),
             ));
         }
         Ok(())
@@ -80,6 +89,7 @@ mod tests {
             controller_url: "http://127.0.0.1:9000".to_owned(),
             cache_dir: PathBuf::from(".edamame/worker-a"),
             cache_limit: 12,
+            weight: 1,
             auth_token: None,
             cors_origin: Vec::new(),
         }
@@ -94,6 +104,13 @@ mod tests {
     fn rejects_zero_cache_limit() {
         let mut config = config();
         config.cache_limit = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_weight() {
+        let mut config = config();
+        config.weight = 0;
         assert!(config.validate().is_err());
     }
 
@@ -160,13 +177,14 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
         assert_eq!(names["worker_id"], "EDAMAME_WORKER_ID");
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
         assert_eq!(names["controller_url"], "EDAMAME_CONTROLLER_URL");
         assert_eq!(names["cache_dir"], "EDAMAME_CACHE_DIR");
         assert_eq!(names["cache_limit"], "EDAMAME_CACHE_LIMIT");
+        assert_eq!(names["weight"], "EDAMAME_WEIGHT");
         assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");
         assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
     }
