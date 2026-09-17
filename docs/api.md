@@ -25,13 +25,14 @@
 ### セグメントファイルを登録する
 
 ```
-PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}
+PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}
 ```
 
 publisher が正規セグメントファイルを登録する。
 `identifier` はセグメントごとに publisher が付ける識別子であり、同じセグメントには quality をまたいで同じ値を使う。
-`duration_ms` と `bandwidth` は必須で、`resolution` は任意とする。
+`duration_ms` と `bandwidth` は必須で、`resolution` と `key_uri` は任意とする。
 `duration_ms` は 500 以上の整数、`bandwidth` は正の整数、`resolution` は `{width}x{height}` の形式にする。
+`key_uri` は他の属性と違い競合にせず、同じ識別子の再 PUT では最後に受け取った値でそのセグメントの鍵 URI を置き換える。省略した場合は暗号化なしに戻す。
 controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。
 
 例：
@@ -41,6 +42,15 @@ curl -i -X PUT \
   -H 'Authorization: Bearer example-token' \
   --data-binary @segment-1.ts \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+```
+
+暗号化するセグメントは鍵 URI を付けて PUT する。
+
+```bash
+curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
+  --data-binary @segment-1.ts \
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720&key_uri=https%3A%2F%2Fkeys.example.test%2Flive%2Fkey-1'
 ```
 
 レスポンス：
@@ -61,7 +71,7 @@ controller は起動するたびに channel ごとの連番を 0 から新しい
 - `201 Created`：新しいセグメントファイルを保存した
 - `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
 - `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
-- `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution` の形式が不正、または `duration_ms` が 500 未満
+- `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution`、`key_uri` の形式が不正、または `duration_ms` が 500 未満
 - `409 Conflict`：同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
 - `500 Internal Server Error`：セグメント番号の上限に達した、またはディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
 

@@ -28,6 +28,7 @@ VOD は扱わない。
 | セグメントファイル | 1 つのセグメントを保存した MPEG-TS ファイル |
 | セグメント識別子 | publisher がセグメントごとに付ける名前であり、同じセグメントには quality をまたいで同じ値を使う |
 | セグメント番号 | controller が識別子に割り当てるセグメントの連番であり、0 以上の整数 |
+| 暗号鍵の URI | publisher が配信する AES-128 の暗号鍵を指す URL であり、セグメント PUT でセグメントごとに指定する |
 | キャッシュ一覧 | worker が現在キャッシュしているセグメントファイルの一覧であり、sync の `cached_segments` で送る |
 | 未キャッシュ | worker のキャッシュ一覧に含まれていないセグメントであり、`fetch_segments` で返す |
 | キャッシュ対象 | 直近のセグメントの範囲のセグメントファイルの集合 |
@@ -53,7 +54,8 @@ worker は全体の配置やプレイリストの生成を行わない。
 **publisher** はセグメントごとの識別子を付けてセグメントファイルを controller に PUT する。
 このとき `duration_ms` と `bandwidth` を指定する。
 同じセグメントには quality をまたいで同じ識別子を使う。
-publisher はプレイリストを PUT しない。
+セグメントを暗号化する場合は、鍵を指す `key_uri` も指定する。
+publisher は暗号鍵を自分で配信し、プレイリストを PUT しない。
 
 **client** は controller からプレイリストを取得し、プレイリストに書かれた worker からセグメントファイルを取得する。
 
@@ -76,6 +78,7 @@ controller は識別子にセグメント番号を 1 対 1 で対応させ、新
 - `duration_ms`：セグメントの長さをミリ秒で表す 500 以上の整数であり、PUT のたびに必須
 - `bandwidth`：quality のビットレートを bit/s で表す正の整数であり、PUT のたびに必須
 - `resolution`：quality の解像度を `{width}x{height}` で表す任意の属性
+- `key_uri`：セグメントの復号に使う AES-128 の暗号鍵を指す、`http` または `https` の絶対 URL であり、省略できる任意の属性
 
 channel ごとにセグメント長の基準値を 1 つ持つ。
 同じ channel の全セグメントの `duration_ms` は同じ値でなければならない。
@@ -92,13 +95,21 @@ channel や quality を作る専用の API はない。
 controller は `{storage_dir}/{channel_id}/{quality}/{sequence}.ts` にセグメントファイルを保存する。
 worker は `{cache_dir}/{channel_id}/{quality}/{sequence}.ts` にセグメントファイルを保存する。
 
+セグメントを暗号化する場合、publisher は `key_uri` に鍵の URL を指定する。
+鍵の実体は publisher が配信し、controller と worker は鍵を保存も配信もしない。
+`key_uri` を付けないセグメントは暗号化されていないセグメントとして扱う。
+controller はセグメント番号ごとに `key_uri` を記録し、値が変わったところをメディアプレイリストの `#EXT-X-KEY` に反映する。
+publisher は鍵 URI を何度でも変更でき、controller は変更の履歴を保持して追従する。
+公開範囲に鍵 URI の異なるセグメントが混ざる場合は、セグメントごとに `#EXT-X-KEY` を出し分ける。
+IV は扱わない。
+
 ## 不変条件
 
 controller が持つセグメントファイルが正規データであり、worker のセグメントファイルは再取得できるコピーである。
 
 同じ channel、quality、セグメント番号のセグメントは 1 つだけ存在する。
 同じ識別子で同じバイト列の再 PUT は 200 を返し、同じ識別子でバイト列が違う PUT は 409 を返す。
-識別子とセグメント番号の対応は controller のメモリ上だけにあり、controller の再起動で失われる。
+識別子とセグメント番号の対応と鍵 URI の変更履歴は controller のメモリ上だけにあり、controller の再起動で失われる。
 controller は起動するたびにセグメント番号を 0 から振り直し、前の実行で保存したファイルと同じ番号になった場合は上書きする。
 
 controller はセグメントファイルを削除しない。
@@ -148,7 +159,10 @@ quality ごとに別の worker を選んでもよい。
 ## 非目標
 
 - worker の負荷に応じた動的な配置
-- fMP4、LL-HLS、バイト範囲、暗号化、複数音声
+- fMP4、LL-HLS、バイト範囲、複数音声
+- 暗号鍵の保管と配信
+- 初期化ベクトル（IV）の指定
+- AES-128 以外の暗号化方式
 - controller のメタデータの永続化
 - メトリクス用のエンドポイント
 - CDN 連携

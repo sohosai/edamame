@@ -8,7 +8,8 @@ Edamame は publisher から受け取ったセグメントの属性からマス�
 - セグメントファイルは MPEG-TS (`.ts`) だけを扱う
 - `#EXT-X-VERSION` は 3 とする
 - ライブ配信だけを扱い、`#EXT-X-ENDLIST` は出力しない
-- fMP4、LL-HLS、バイト範囲、暗号化、複数音声、I フレーム用のプレイリストは扱わない
+- fMP4、LL-HLS、バイト範囲、複数音声、I フレーム用のプレイリストは扱わない
+- AES-128 の暗号化だけを扱い、`#EXT-X-KEY` の `IV` 属性は出力しない
 
 ## メディアプレイリスト
 
@@ -37,6 +38,39 @@ http://127.0.0.1:9001/segments/live/720p/102.ts
 - すべての URL は、controller がその quality の配信先として選んだ worker の `public_url` を使う
 - `public_url` は query と fragment を含まない URL とする
 - Content-Type は `application/vnd.apple.mpegurl` とする
+
+### 暗号化されたセグメント
+
+`key_uri` を付けて PUT されたセグメントには `#EXT-X-KEY` を出力する。
+鍵 URI は publisher が指定した絶対 URL をそのまま使い、controller は鍵を取得も検証もしない。
+セグメント番号ごとに鍵 URI を記録し、直前のセグメントと値が変わったところでタグを出し分ける。
+
+たとえばセグメント番号 101 と 102 が `https://keys.example.test/live/key-1`、103 と 104 が `https://keys.example.test/live/key-2` で、公開範囲が 101 から 104 の場合、出力は次のようになる。
+
+```text
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:101
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-1"
+#EXTINF:6.000,
+http://127.0.0.1:9001/segments/live/720p/101.ts
+#EXTINF:6.000,
+http://127.0.0.1:9001/segments/live/720p/102.ts
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-2"
+#EXTINF:6.000,
+http://127.0.0.1:9001/segments/live/720p/103.ts
+#EXTINF:6.000,
+http://127.0.0.1:9001/segments/live/720p/104.ts
+```
+
+各要素の決まりは次のとおり。
+
+- 鍵 URI があるセグメントの直前に `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` を出力する
+- 鍵 URI が別の値に変わるところでも同じ形式で出力し直す
+- 鍵 URI がないセグメントに戻るところでは `#EXT-X-KEY:METHOD=NONE` を出力する
+- 鍵 URI を 1 つも受け取っていない quality には `#EXT-X-KEY` を出力しない
+- 鍵 URI の変更履歴は controller のメモリ上だけにあり、controller の再起動で失われる
 
 ## マスタープレイリスト
 

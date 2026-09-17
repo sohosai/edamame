@@ -94,6 +94,22 @@ curl -i -X PUT \
 レスポンスの `sequence` が controller の割り当てたセグメント番号である。
 この例では 0 になる。
 
+セグメントを AES-128 で暗号化する場合は、鍵を指す `key_uri` を付けて PUT する。
+鍵の実体は publisher が配信し、controller は鍵を取得も検証もしない。
+
+```bash
+curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
+  --data-binary @/tmp/segment-1.ts \
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720&key_uri=https%3A%2F%2Fkeys.example.test%2Flive%2Fkey-1'
+```
+
+`key_uri` は `http` または `https` の絶対 URL とする。
+鍵 URI はセグメントごとに記録されるため、続くセグメントに同じ鍵を使う場合も、そのセグメントの PUT で同じ `key_uri` を指定する。
+鍵 URI を変えた PUT を送ると、そのセグメントのプレイリストに新しい鍵 URI が反映される。
+鍵 URI を付けない PUT は、そのセグメントだけを暗号化なしに戻す。
+client はプレイリストの `#EXT-X-KEY` に書かれた鍵 URI を自分で取得するため、鍵の配信元は client から到達できるようにする。
+
 worker は次の sync でセグメントファイルを取得する。
 最初の公開範囲ができるまで、メディアプレイリストは 503 を返すことがある。
 公開範囲ができた後は、新しいセグメントファイルを PUT しても `--publish-wait-ms` の間は前のプレイリストを返す。
@@ -213,6 +229,8 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
 | controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
 | client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗する。controller は `--sync-timeout-ms` の経過後にその worker を候補から外すまで同じ worker を選ぶことがある（重みが複数台にある場合は他の worker も選ばれる） |
+| 鍵 URI の配信元が停止した | client は鍵を取得できず、その鍵を使うセグメントを復号できない。controller と worker は鍵を保持しないため、鍵の可用性は publisher の配信元に依存する |
+| 公開範囲に鍵 URI の異なるセグメントが混ざった | メディアプレイリストはセグメントごとに `#EXT-X-KEY` を出し分ける。client はセグメントごとに適切な鍵を取得する |
 
 ## セキュリティと信頼境界
 
