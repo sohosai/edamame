@@ -1,4 +1,4 @@
-//! `public_url` と `controller_url` の検証と正規化
+//! `public_url`、`controller_url`、暗号鍵の URI の検証と正規化
 
 use url::Url;
 
@@ -35,6 +35,30 @@ pub fn normalize_http_url(value: &str) -> Result<String, EdamameError> {
     Ok(normalized)
 }
 
+/// 暗号鍵の URI を検証し、正規形を返す
+///
+/// 鍵は publisher が配信するため、`http` と `https` の絶対 URL だけを許可する。
+pub fn normalize_key_uri(value: &str) -> Result<String, EdamameError> {
+    let url = Url::parse(value)
+        .map_err(|_| EdamameError::BadRequest("key_uri must be an absolute URL".to_owned()))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(EdamameError::BadRequest(
+            "key_uri scheme must be http or https".to_owned(),
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(EdamameError::BadRequest(
+            "key_uri must contain a host".to_owned(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(EdamameError::BadRequest(
+            "key_uri must not contain a fragment".to_owned(),
+        ));
+    }
+    Ok(url.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +81,31 @@ mod tests {
         assert!(normalize_http_url("/relative").is_err());
         assert!(normalize_http_url("http://example.test/?x=1").is_err());
         assert!(normalize_http_url("http://example.test/#f").is_err());
+    }
+
+    #[test]
+    fn normalizes_key_uri() {
+        assert_eq!(
+            normalize_key_uri("https://keys.example.test/live/key-1").unwrap(),
+            "https://keys.example.test/live/key-1"
+        );
+        // 鍵の配信元は query で認証することがあるため、query は許可する
+        assert_eq!(
+            normalize_key_uri("http://127.0.0.1:8000/key?token=1").unwrap(),
+            "http://127.0.0.1:8000/key?token=1"
+        );
+        assert_eq!(
+            normalize_key_uri("https://keys.example.test").unwrap(),
+            "https://keys.example.test/"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_key_uri() {
+        assert!(normalize_key_uri("/keys/key-1").is_err());
+        assert!(normalize_key_uri("").is_err());
+        assert!(normalize_key_uri("ftp://keys.example.test/key").is_err());
+        assert!(normalize_key_uri("file:///tmp/key").is_err());
+        assert!(normalize_key_uri("https://keys.example.test/key#fragment").is_err());
     }
 }

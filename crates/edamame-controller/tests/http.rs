@@ -111,6 +111,48 @@ async fn publish_series(
     sequences
 }
 
+/// 鍵 URI を付けてセグメントを PUT する
+async fn publish_with_key_uri(
+    client: &reqwest::Client,
+    base_url: &str,
+    quality: &str,
+    identifier: &str,
+    key_uri: &str,
+) -> reqwest::Response {
+    let body = format!("segment-{quality}-{identifier}");
+    // 鍵 URI は query や `&` を含み得るため、文字列連結ではなく query として組み立てる
+    client
+        .put(format!("{base_url}/segments/live/{quality}/{identifier}"))
+        .query(&[
+            ("duration_ms", "6000"),
+            ("bandwidth", "3000000"),
+            ("resolution", "1280x720"),
+            ("key_uri", key_uri),
+        ])
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// 鍵 URI を付けてセグメントを PUT し、割り当てられた番号を返す
+async fn publish_segment_with_key(
+    client: &reqwest::Client,
+    base_url: &str,
+    quality: &str,
+    identifier: &str,
+    key_uri: &str,
+) -> u64 {
+    let response = publish_with_key_uri(client, base_url, quality, identifier, key_uri).await;
+    assert_eq!(
+        response.status().as_u16(),
+        201,
+        "鍵付きセグメントの PUT に失敗した"
+    );
+    let body: Value = response.json().await.unwrap();
+    body["sequence"].as_u64().unwrap()
+}
+
 fn cached(quality: &str, sequences: impl IntoIterator<Item = u64>) -> Vec<Value> {
     sequences
         .into_iter()
@@ -783,6 +825,87 @@ async fn media_playlist_reflects_new_segment() {
     assert!(second_body.contains("#EXT-X-MEDIA-SEQUENCE:1"));
     assert!(second_body.contains("http://worker.test/segments/live/720p/6.ts"));
     assert!(!second_body.contains("http://worker.test/segments/live/720p/0.ts"));
+}
+
+/// 鍵 URI はセグメント PUT からメディアプレイリストまで通り、省略した再 PUT で外れる
+#[tokio::test]
+async fn key_uri_is_reflected_in_media_playlist() {
+    let tmp = TempDir::new("key-uri");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let key = "https://keys.test/live/a";
+    let mut sequences = Vec::new();
+    for index in 0..6 {
+        sequences.push(
+            publish_segment_with_key(&client, base, "720p", &format!("seg-{index}"), key).await,
+        );
+    }
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
+
+    let playlist = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(playlist.status().as_u16(), 200);
+    let body = playlist.text().await.unwrap();
+    assert!(body.contains(&format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key}\"\n")));
+
+    // 鍵 URI は競合する属性ではないため、省略した再 PUT は 200 で通り、暗号化なしの区間が出る
+    let reput = client
+        .put(format!(
+            "{base}/segments/live/720p/seg-3?duration_ms=6000&bandwidth=3000000&resolution=1280x720"
+        ))
+        .body("segment-720p-seg-3")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reput.status().as_u16(), 200);
+
+    let playlist = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    let body = playlist.text().await.unwrap();
+    assert!(body.contains("#EXT-X-KEY:METHOD=NONE\n"));
+}
+
+/// 鍵 URI は絶対 http URL だけを受け付ける
+#[tokio::test]
+async fn key_uri_validation_rejects_invalid_urls() {
+    let tmp = TempDir::new("key-uri-invalid");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    for (index, key_uri) in [
+        "/keys/key-1",
+        "ftp://keys.test/key",
+        "https://keys.test/key#fragment",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let response =
+            publish_with_key_uri(&client, base, "720p", &format!("bad-{index}"), key_uri).await;
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "不正な key_uri を受け付けた: {key_uri}"
+        );
+    }
+    // 鍵の配信元が認証に使うことがあるため、query 付きの https は許可する
+    let accepted = publish_with_key_uri(
+        &client,
+        base,
+        "720p",
+        "good",
+        "https://keys.test/key?token=1",
+    )
+    .await;
+    assert_eq!(accepted.status().as_u16(), 201);
 }
 
 /// 公開待ちの間は前の範囲を返し、待ち時間が過ぎたら追いついた worker に合わせて公開範囲を進める

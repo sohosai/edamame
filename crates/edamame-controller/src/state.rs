@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use edamame_domain::{
-    EdamameError, QualityPlaylistInput, SegmentId, SegmentKey, SyncResponse, normalize_http_url,
-    now_ms, plan_master_playlist, plan_media_playlist, render_master_playlist,
-    render_media_playlist, validate_identifier, validate_quality, validate_resolution,
+    EdamameError, KeyChange, QualityPlaylistInput, SegmentId, SegmentKey, SyncResponse,
+    key_changes_for_segments, normalize_http_url, normalize_key_uri, now_ms, plan_master_playlist,
+    plan_media_playlist, record_key_change, render_master_playlist, render_media_playlist,
+    validate_identifier, validate_quality, validate_resolution,
 };
 use tokio::sync::Mutex;
 
@@ -64,6 +65,8 @@ impl ChannelState {
 pub struct QualityState {
     pub bandwidth: u64,
     pub resolution: Option<String>,
+    /// 鍵 URI の変更履歴であり、先頭の開始点より前のセグメントは暗号化されていない
+    pub key_changes: Vec<KeyChange>,
     /// 配信先の選択で使う worker ごとの現在値
     pub current_weights: BTreeMap<String, i64>,
     /// 公開済みのセグメント番号
@@ -104,6 +107,7 @@ pub struct SegmentIngest<'a> {
     pub duration_ms: u64,
     pub bandwidth: u64,
     pub resolution: Option<String>,
+    pub key_uri: Option<&'a str>,
     pub bytes: &'a [u8],
 }
 
@@ -140,6 +144,7 @@ impl ControllerState {
             duration_ms,
             bandwidth,
             resolution,
+            key_uri,
             bytes,
         } = input;
         validate_identifier("channel_id", channel_id)?;
@@ -158,6 +163,8 @@ impl ControllerState {
         if let Some(value) = &resolution {
             validate_resolution(value)?;
         }
+        // 鍵は publisher が配信するため、URL としての形式だけを確認する
+        let key_uri = key_uri.map(normalize_key_uri).transpose()?;
 
         // 属性の確認と番号の割り当てを直列化する。ファイル I/O の間も inner の mutex は保持しない。
         let _write_guard = self.write_lock.lock().await;
@@ -250,6 +257,7 @@ impl ControllerState {
             .or_insert_with(|| QualityState {
                 bandwidth,
                 resolution: resolution.clone(),
+                key_changes: Vec::new(),
                 current_weights: BTreeMap::new(),
                 published: BTreeSet::new(),
                 publish_due_ms: None,
@@ -260,6 +268,7 @@ impl ControllerState {
         if quality_state.resolution.is_none() {
             quality_state.resolution = resolution;
         }
+        record_key_change(&mut quality_state.key_changes, sequence, key_uri);
         register_segment_metadata(
             quality_state,
             sequence,
@@ -364,7 +373,7 @@ impl ControllerState {
     ) -> Result<String, EdamameError> {
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
-        let (segment_duration_ms, published, worker_url) = {
+        let (segment_duration_ms, published, key_changes, worker_url) = {
             let mut inner = self.inner.lock().await;
             let Inner { channels, workers } = &mut *inner;
             let channel = channels
@@ -391,6 +400,8 @@ impl ControllerState {
             (
                 channel.segment_duration_ms,
                 quality_state.published.clone(),
+                // プレイリストに出す範囲の分だけ複製し、履歴が長くても取得を重くしない
+                key_changes_for_segments(&quality_state.key_changes, &quality_state.published),
                 worker_url,
             )
         };
@@ -416,6 +427,7 @@ impl ControllerState {
             channel_id,
             quality,
             &public_url,
+            &key_changes,
         ))
     }
 
@@ -886,6 +898,7 @@ mod tests {
             QualityState {
                 bandwidth: 3_000_000,
                 resolution: None,
+                key_changes: Vec::new(),
                 current_weights: BTreeMap::new(),
                 published: published.iter().copied().collect(),
                 publish_due_ms,

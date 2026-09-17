@@ -159,6 +159,7 @@ struct SegmentQuery {
     duration_ms: u64,
     bandwidth: u64,
     resolution: Option<String>,
+    key_uri: Option<String>,
 }
 
 async fn put_segment(
@@ -175,6 +176,7 @@ async fn put_segment(
             duration_ms: query.duration_ms,
             bandwidth: query.bandwidth,
             resolution: query.resolution,
+            key_uri: query.key_uri.as_deref(),
             bytes: &body,
         })
         .await?;
