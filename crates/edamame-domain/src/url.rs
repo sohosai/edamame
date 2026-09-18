@@ -1,4 +1,4 @@
-//! `public_url`、`controller_url`、暗号鍵の URI の検証と正規化
+//! `public_url`、`controller_url`、外部 URL の検証と正規化
 
 use url::Url;
 
@@ -39,22 +39,34 @@ pub fn normalize_http_url(value: &str) -> Result<String, EdamameError> {
 ///
 /// 鍵は publisher が配信するため、`http` と `https` の絶対 URL だけを許可する。
 pub fn normalize_key_uri(value: &str) -> Result<String, EdamameError> {
+    normalize_fetch_url(value, "key_uri")
+}
+
+/// 外部配信の master m3u8 の URL を検証し、正規形を返す
+///
+/// controller が取得する URL のため、`http` と `https` の絶対 URL だけを許可する。
+pub fn normalize_external_m3u8(value: &str) -> Result<String, EdamameError> {
+    normalize_fetch_url(value, "external_m3u8")
+}
+
+/// controller が取得する URL を検証し、正規形を返す
+fn normalize_fetch_url(value: &str, name: &str) -> Result<String, EdamameError> {
     let url = Url::parse(value)
-        .map_err(|_| EdamameError::BadRequest("key_uri must be an absolute URL".to_owned()))?;
+        .map_err(|_| EdamameError::BadRequest(format!("{name} must be an absolute URL")))?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(EdamameError::BadRequest(
-            "key_uri scheme must be http or https".to_owned(),
-        ));
+        return Err(EdamameError::BadRequest(format!(
+            "{name} scheme must be http or https"
+        )));
     }
     if url.host_str().is_none() {
-        return Err(EdamameError::BadRequest(
-            "key_uri must contain a host".to_owned(),
-        ));
+        return Err(EdamameError::BadRequest(format!(
+            "{name} must contain a host"
+        )));
     }
     if url.fragment().is_some() {
-        return Err(EdamameError::BadRequest(
-            "key_uri must not contain a fragment".to_owned(),
-        ));
+        return Err(EdamameError::BadRequest(format!(
+            "{name} must not contain a fragment"
+        )));
     }
     Ok(url.to_string())
 }
@@ -107,5 +119,27 @@ mod tests {
         assert!(normalize_key_uri("ftp://keys.example.test/key").is_err());
         assert!(normalize_key_uri("file:///tmp/key").is_err());
         assert!(normalize_key_uri("https://keys.example.test/key#fragment").is_err());
+    }
+
+    #[test]
+    fn normalizes_external_m3u8() {
+        assert_eq!(
+            normalize_external_m3u8("https://px.example.imageflux.jp/abc/def.m3u8").unwrap(),
+            "https://px.example.imageflux.jp/abc/def.m3u8"
+        );
+        // 署名付きの URL を想定して query は許可する
+        assert_eq!(
+            normalize_external_m3u8("http://127.0.0.1:9000/master.m3u8?token=1").unwrap(),
+            "http://127.0.0.1:9000/master.m3u8?token=1"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_external_m3u8() {
+        assert!(normalize_external_m3u8("/master.m3u8").is_err());
+        assert!(normalize_external_m3u8("").is_err());
+        assert!(normalize_external_m3u8("rtmp://example.test/live").is_err());
+        assert!(normalize_external_m3u8("file:///tmp/master.m3u8").is_err());
+        assert!(normalize_external_m3u8("https://example.test/master.m3u8#fragment").is_err());
     }
 }

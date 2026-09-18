@@ -78,6 +78,7 @@ pub async fn spawn_controller(
             sync_interval_ms,
             sync_timeout_ms,
             publish_wait_ms: 0,
+            external_min_percent: 1,
             cors: CorsOrigins::Disabled,
             auth_token: None,
         },
@@ -102,6 +103,7 @@ pub async fn spawn_controller_with_publish_wait(
             sync_interval_ms,
             sync_timeout_ms,
             publish_wait_ms,
+            external_min_percent: 1,
             cors: CorsOrigins::Disabled,
             auth_token: None,
         },
@@ -126,6 +128,7 @@ pub async fn spawn_controller_with_cors(
             sync_interval_ms,
             sync_timeout_ms,
             publish_wait_ms: 0,
+            external_min_percent: 1,
             cors,
             auth_token: None,
         },
@@ -150,8 +153,35 @@ pub async fn spawn_controller_with_auth(
             sync_interval_ms,
             sync_timeout_ms,
             publish_wait_ms: 0,
+            external_min_percent: 1,
             cors: CorsOrigins::Disabled,
             auth_token: Some(auth_token),
+        },
+    )
+    .await
+}
+
+/// 外部配信へ流す最低の割合と公開待ち時間を指定して controller を起動する
+pub async fn spawn_controller_with_external_percent(
+    addr: SocketAddr,
+    storage_dir: PathBuf,
+    playlist_segments: u64,
+    sync_interval_ms: u64,
+    sync_timeout_ms: u64,
+    publish_wait_ms: u64,
+    external_min_percent: u8,
+) -> ControllerHandle {
+    spawn_controller_with_options(
+        addr,
+        storage_dir,
+        ControllerOptions {
+            playlist_segments,
+            sync_interval_ms,
+            sync_timeout_ms,
+            publish_wait_ms,
+            external_min_percent,
+            cors: CorsOrigins::Disabled,
+            auth_token: None,
         },
     )
     .await
@@ -163,6 +193,7 @@ struct ControllerOptions<'a> {
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
     publish_wait_ms: u64,
+    external_min_percent: u8,
     cors: CorsOrigins,
     auth_token: Option<&'a str>,
 }
@@ -181,18 +212,23 @@ async fn spawn_controller_with_options(
         options.sync_interval_ms,
         options.sync_timeout_ms,
         options.publish_wait_ms,
+        options.external_min_percent,
     );
     let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = controller_router(state.clone(), &options.cors, options.auth_token);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_receiver.await;
-            })
-            .await
-            .unwrap();
+        // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_receiver.await;
+        })
+        .await
+        .unwrap();
     });
     ControllerHandle {
         addr,

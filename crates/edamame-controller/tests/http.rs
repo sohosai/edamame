@@ -8,8 +8,8 @@ use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
 use support::{
     TempDir, spawn_controller, spawn_controller_with_auth, spawn_controller_with_cors,
-    spawn_controller_with_publish_wait, spawn_worker, spawn_worker_with_auth,
-    spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
+    spawn_controller_with_external_percent, spawn_controller_with_publish_wait, spawn_worker,
+    spawn_worker_with_auth, spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
     wait_for_playlist_contains, wait_for_segment,
 };
 
@@ -2261,5 +2261,493 @@ async fn worker_registers_with_bearer_token_and_syncs() {
         b"segment-720p-seg-0",
     )
     .await;
+    controller.shutdown().await;
+}
+
+/// 外部配信の master m3u8 を登録する。`None` で取り消す
+async fn declare_external_m3u8(
+    client: &reqwest::Client,
+    base_url: &str,
+    external_m3u8: Option<&str>,
+) -> reqwest::Response {
+    client
+        .put(format!("{base_url}/channels/live/external"))
+        .json(&json!({ "external_m3u8": external_m3u8 }))
+        .send()
+        .await
+        .unwrap()
+}
+
+/// リダイレクトを追わずに master playlist を取得する
+async fn get_master_without_redirect(url: &str) -> reqwest::Response {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    client.get(url).send().await.unwrap()
+}
+
+/// 外部配信として動く別の controller を起動し、その master m3u8 の URL を返す
+async fn spawn_external_origin(
+    dir: &TempDir,
+) -> (support::ControllerHandle, support::WorkerHandle, String) {
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        dir.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        1,
+    )
+    .await;
+    let worker = spawn_worker(
+        "worker-external",
+        &controller.base_url,
+        dir.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let master_url = format!("{}/channels/live/master.m3u8", controller.base_url);
+    wait_for_playlist(&client, &master_url).await;
+    (controller, worker, master_url)
+}
+
+/// シェアが 100% のときは master を外部配信の master m3u8 へ転送する
+#[tokio::test]
+async fn redirects_master_to_external_playlist() {
+    let external_dir = TempDir::new("external-origin");
+    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
+    let tmp = TempDir::new("redirect-external");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        100,
+    )
+    .await;
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let declared = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some(external_master.as_str()),
+    )
+    .await;
+    assert_eq!(declared.status().as_u16(), 204);
+    let _ = &worker;
+
+    let master_url = format!("{}/channels/live/master.m3u8", controller.base_url);
+    let response = get_master_without_redirect(&master_url).await;
+    assert_eq!(response.status().as_u16(), 302);
+    assert_eq!(
+        response.headers()[reqwest::header::LOCATION],
+        external_master.as_str()
+    );
+    // 接続元ごとの判定が中間キャッシュに固定されないようにする
+    assert_eq!(
+        response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    // 転送先は実際に取得できる
+    let followed = client.get(&master_url).send().await.unwrap();
+    assert_eq!(followed.status().as_u16(), 200);
+    assert!(followed.text().await.unwrap().contains("720p.m3u8"));
+
+    // publisher は external=0 で自前の master を読む
+    let local_url = format!("{master_url}?external=0");
+    wait_for_playlist(&client, &local_url).await;
+    let local = client.get(&local_url).send().await.unwrap();
+    assert_eq!(local.status().as_u16(), 200);
+    assert!(local.text().await.unwrap().contains("720p.m3u8"));
+
+    controller.shutdown().await;
+}
+
+/// シェアが 0% で自前の配信が使えるときは自前の master を返す
+#[tokio::test]
+async fn keeps_local_master_when_external_percent_is_zero() {
+    let external_dir = TempDir::new("external-origin");
+    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
+    let tmp = TempDir::new("local-master");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        0,
+    )
+    .await;
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let declared = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some(external_master.as_str()),
+    )
+    .await;
+    assert_eq!(declared.status().as_u16(), 204);
+    // 公開範囲が最新セグメントに追いつけば、遅れは 0 になり最低の割合のままになる
+    wait_for_playlist_contains(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+        &format!("{}/segments/live/720p/0.ts", worker.base_url),
+    )
+    .await;
+
+    let response = get_master_without_redirect(&format!(
+        "{}/channels/live/master.m3u8",
+        controller.base_url
+    ))
+    .await;
+    assert_eq!(response.status().as_u16(), 200);
+    // 接続元ごとに振り分ける応答は、共有キャッシュに固定されないようにする
+    assert_eq!(
+        response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    assert!(response.text().await.unwrap().contains("720p.m3u8"));
+
+    // external=1 は割合に関係なく外部配信へ振り分ける
+    let forced = get_master_without_redirect(&format!(
+        "{}/channels/live/master.m3u8?external=1",
+        controller.base_url
+    ))
+    .await;
+    assert_eq!(forced.status().as_u16(), 302);
+    assert_eq!(
+        forced.headers()[reqwest::header::LOCATION],
+        external_master.as_str()
+    );
+
+    // external=0 は割合に関係なく自前の master を返す
+    let local = get_master_without_redirect(&format!(
+        "{}/channels/live/master.m3u8?external=0",
+        controller.base_url
+    ))
+    .await;
+    assert_eq!(local.status().as_u16(), 200);
+
+    controller.shutdown().await;
+}
+
+/// 配信できる quality が 1 つもないときは、最低の割合が 0 でも外部配信へ逃がす
+#[tokio::test]
+async fn falls_back_to_external_when_no_quality_can_be_served() {
+    let external_dir = TempDir::new("external-origin");
+    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
+    let tmp = TempDir::new("fallback-external");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        0,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    // worker を起動しないため公開範囲ができず、自前では配信できない
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let declared = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some(external_master.as_str()),
+    )
+    .await;
+    assert_eq!(declared.status().as_u16(), 204);
+
+    let response = get_master_without_redirect(&format!(
+        "{}/channels/live/master.m3u8",
+        controller.base_url
+    ))
+    .await;
+    assert_eq!(response.status().as_u16(), 302);
+    assert_eq!(
+        response.headers()[reqwest::header::LOCATION],
+        external_master.as_str()
+    );
+
+    controller.shutdown().await;
+}
+
+/// controller は外部 playlist の到達確認をしないため、宣言があればそのまま転送する
+#[tokio::test]
+async fn routes_to_external_without_checking_reachability() {
+    let tmp = TempDir::new("external-unchecked");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        100,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    // 存在しない channel を外部として登録しても、そのまま転送する
+    let missing = format!("{}/channels/missing/master.m3u8", controller.base_url);
+    let declared =
+        declare_external_m3u8(&client, &controller.base_url, Some(missing.as_str())).await;
+    assert_eq!(declared.status().as_u16(), 204);
+
+    let response = get_master_without_redirect(&format!(
+        "{}/channels/live/master.m3u8",
+        controller.base_url
+    ))
+    .await;
+    assert_eq!(response.status().as_u16(), 302);
+    assert_eq!(
+        response.headers()[reqwest::header::LOCATION],
+        missing.as_str()
+    );
+
+    controller.shutdown().await;
+}
+
+/// `external_m3u8=none` で宣言を取り消すと自前の master を返す
+#[tokio::test]
+async fn clears_external_playlist_declaration() {
+    let tmp = TempDir::new("external-clear");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        100,
+    )
+    .await;
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let external = "https://px.example.test/abc/def.m3u8";
+    let declared = declare_external_m3u8(&client, &controller.base_url, Some(external)).await;
+    assert_eq!(declared.status().as_u16(), 204);
+
+    let master_url = format!("{}/channels/live/master.m3u8", controller.base_url);
+    let response = get_master_without_redirect(&master_url).await;
+    assert_eq!(response.status().as_u16(), 302);
+
+    // null で取り消すと、以後は自前の master を返す
+    let cleared = declare_external_m3u8(&client, &controller.base_url, None).await;
+    assert_eq!(cleared.status().as_u16(), 204);
+    wait_for_playlist_contains(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+        &format!("{}/segments/live/720p/0.ts", worker.base_url),
+    )
+    .await;
+    let response = get_master_without_redirect(&master_url).await;
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.text().await.unwrap().contains("720p.m3u8"));
+
+    controller.shutdown().await;
+}
+
+/// 同じ client の判定はリクエストをまたいでも変わらない
+#[tokio::test]
+async fn keeps_the_same_route_for_the_same_client() {
+    let external_dir = TempDir::new("external-origin");
+    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
+    let tmp = TempDir::new("sticky-route");
+    let controller = spawn_controller_with_external_percent(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        0,
+        50,
+    )
+    .await;
+    let worker = spawn_worker(
+        "worker-a",
+        &controller.base_url,
+        tmp.path.join("cache"),
+        12,
+        true,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let declared = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some(external_master.as_str()),
+    )
+    .await;
+    assert_eq!(declared.status().as_u16(), 204);
+    wait_for_playlist_contains(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+        &format!("{}/segments/live/720p/0.ts", worker.base_url),
+    )
+    .await;
+
+    let master_url = format!("{}/channels/live/master.m3u8", controller.base_url);
+    let first = get_master_without_redirect(&master_url).await;
+    let second = get_master_without_redirect(&master_url).await;
+    assert_eq!(first.status(), second.status());
+
+    controller.shutdown().await;
+}
+
+/// 外部配信の URL が不正な PUT は 400 を返す
+#[tokio::test]
+async fn rejects_invalid_external_m3u8() {
+    let tmp = TempDir::new("external-invalid");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    for value in [
+        "ftp://example.test/master.m3u8",
+        "/master.m3u8",
+        "https://example.test/master.m3u8#fragment",
+    ] {
+        let response = declare_external_m3u8(&client, &controller.base_url, Some(value)).await;
+        assert_eq!(response.status().as_u16(), 400, "accepted {value}");
+    }
+    controller.shutdown().await;
+}
+
+/// 接続情報を付けずに router を使っても、プレイリストの取得が 500 にならない
+#[tokio::test]
+async fn serves_playlist_without_connect_info() {
+    use tower::ServiceExt;
+
+    let tmp = TempDir::new("no-connect-info");
+    tokio::fs::create_dir_all(tmp.path.join("storage"))
+        .await
+        .unwrap();
+    let store = edamame_controller::CanonicalStore::new(tmp.path.join("storage"));
+    let state = edamame_controller::ControllerState::new(store, 6, 50, 1000, 0, 1);
+    let app = edamame_controller::router(state, &CorsOrigins::Disabled, None);
+    let request = axum::http::Request::builder()
+        .uri("/channels/live/master.m3u8")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    // 接続元が分からなくても、channel が無いことだけを理由に 404 を返す
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+/// channel が無いときの外部配信の登録は 404 を返す
+#[tokio::test]
+async fn requires_channel_to_register_external_m3u8() {
+    let tmp = TempDir::new("external-no-channel");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let client = reqwest::Client::new();
+    let response = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some("https://px.example.test/abc/def.m3u8"),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    controller.shutdown().await;
+}
+
+/// 認証を有効にすると外部配信の登録にもトークンが要る
+#[tokio::test]
+async fn registering_external_m3u8_requires_bearer_token() {
+    let tmp = TempDir::new("external-auth");
+    let controller = spawn_controller_with_auth(
+        any_addr(),
+        tmp.path.join("storage"),
+        6,
+        50,
+        1000,
+        "example-token",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    publish_with_token(
+        &client,
+        PublishInput {
+            base_url: &controller.base_url,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"segment-720p-seg-0",
+        },
+        Some("example-token"),
+    )
+    .await;
+
+    // トークンが無い登録は 401 になる
+    let response = declare_external_m3u8(
+        &client,
+        &controller.base_url,
+        Some("https://px.example.test/abc/def.m3u8"),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 401);
+
+    // トークンを付ければ登録できる
+    let response = client
+        .put(format!("{}/channels/live/external", controller.base_url))
+        .bearer_auth("example-token")
+        .json(&json!({ "external_m3u8": "https://px.example.test/abc/def.m3u8" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 204);
+    controller.shutdown().await;
+}
+
+/// `external` に 0 と 1 以外を指定すると 400 を返す
+#[tokio::test]
+async fn rejects_invalid_external_query() {
+    let tmp = TempDir::new("external-switch-invalid");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let client = reqwest::Client::new();
+    publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
+    let response = client
+        .get(format!(
+            "{}/channels/live/master.m3u8?external=2",
+            controller.base_url
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 400);
     controller.shutdown().await;
 }

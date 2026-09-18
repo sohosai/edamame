@@ -37,6 +37,7 @@ VOD は扱わない。
 | 公開待ち | 未公開セグメントを公開範囲の候補にできるようになるまでの待ち時間 |
 | キャッシュ上限 | worker が `(channel_id, quality)` ごとにキャッシュするセグメントファイルの最大数であり、`--cache-limit` で指定する |
 | 重み | worker の相対的な配信能力であり、登録時に宣言する 1 以上の整数 |
+| 外部配信 | Edamame 以外が配信する同じ内容の HLS であり、publisher が宣言した master m3u8 の URL から使う |
 | マスタープレイリスト | quality ごとのメディアプレイリストを列挙したプレイリスト |
 | メディアプレイリスト | 1 つの quality のセグメントを列挙したプレイリスト |
 
@@ -45,6 +46,7 @@ VOD は扱わない。
 **controller** は publisher から PUT されたセグメントファイルを検証し、セグメント識別子にセグメント番号を割り当てて `storage_dir` に正規データとして保存する。
 channel と quality ごとにセグメントファイルを管理し、quality ごとに公開範囲を決めてプレイリストを生成する。
 worker の登録と sync を受け、sync が届いている worker の中から quality ごとに配信先を選ぶ。
+publisher が宣言した外部配信の master m3u8 があるとき、client を外部配信へ振り分ける。
 
 **worker** は controller に登録し、登録応答で受け取った間隔で sync を送る。
 sync 応答の `fetch_segments` に従ってセグメントファイルを取得し、`cache_dir` に保存する。
@@ -88,6 +90,9 @@ channel が存在する間、この値は変わらない。
 HLS のライブ配信ではこの値を途中で変えられないため、controller は最初の PUT で基準値を固定する。
 `--playlist-segments` は 6 以上とするが、worker が保持している連続範囲が短い場合は、その短い範囲を公開することがある。
 
+channel ごとに外部配信の master m3u8 の URL を 1 つ持つ。
+publisher が `PUT /channels/{channel_id}/external` で指定する。
+
 `channel_id` と `quality` は、最初のセグメントファイルを PUT したときに作られる。
 channel や quality を作る専用の API はない。
 `quality` に `master` は使えない。
@@ -114,6 +119,9 @@ controller は起動するたびにセグメント番号を 0 から振り直し
 
 controller はセグメントファイルを削除しない。
 worker だけがキャッシュ上限に従ってセグメントファイルを削除する。
+
+外部配信のセグメントファイルは Edamame の正規データではない。
+client は外部配信から直接取得し、controller と worker は取得も保存もしない。
 
 プレイリストはリクエストごとに現在の公開範囲から生成する。
 
@@ -165,7 +173,6 @@ quality ごとに別の worker を選んでもよい。
 - AES-128 以外の暗号化方式
 - controller のメタデータの永続化
 - メトリクス用のエンドポイント
-- CDN 連携
 - TLS
 - 複数の controller
 - 全 quality の公開範囲を一致させること

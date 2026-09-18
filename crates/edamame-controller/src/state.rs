@@ -1,16 +1,18 @@
 //! controller のメモリ状態、インジェスト、registry、playlist 生成
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use edamame_domain::{
     EdamameError, KeyChange, QualityPlaylistInput, SegmentId, SegmentKey, SyncResponse,
-    key_changes_for_segments, normalize_http_url, normalize_key_uri, now_ms, plan_master_playlist,
-    plan_media_playlist, record_key_change, render_master_playlist, render_media_playlist,
-    validate_identifier, validate_quality, validate_resolution,
+    key_changes_for_segments, normalize_external_m3u8, normalize_http_url, normalize_key_uri,
+    now_ms, plan_master_playlist, plan_media_playlist, record_key_change, render_master_playlist,
+    render_media_playlist, validate_identifier, validate_quality, validate_resolution,
 };
 use tokio::sync::Mutex;
 
+use crate::external;
 use crate::storage::CanonicalStore;
 
 /// controller の共有状態
@@ -20,6 +22,8 @@ pub struct ControllerState {
     pub sync_interval_ms: u64,
     pub sync_timeout_ms: u64,
     pub publish_wait_ms: u64,
+    /// 外部配信へ流す最低の割合（%）
+    pub external_min_percent: u8,
     pub inner: Mutex<Inner>,
     /// セグメントの属性確認と番号の割り当てからメタデータの更新までを直列化する
     write_lock: Mutex<()>,
@@ -36,6 +40,8 @@ pub struct Inner {
 pub struct ChannelState {
     pub segment_duration_ms: u64,
     pub qualities: BTreeMap<String, QualityState>,
+    /// 外部配信の master m3u8 の URL。publisher が PUT で宣言する
+    pub external_m3u8: Option<String>,
     /// セグメント識別子から割り当てたセグメント番号への対応
     pub identifiers: BTreeMap<String, IdentifierState>,
     /// 次に新しい識別子へ割り当てるセグメント番号
@@ -54,6 +60,7 @@ impl ChannelState {
         Self {
             segment_duration_ms,
             qualities: BTreeMap::new(),
+            external_m3u8: None,
             identifiers: BTreeMap::new(),
             next_sequence,
         }
@@ -120,6 +127,7 @@ impl ControllerState {
         sync_interval_ms: u64,
         sync_timeout_ms: u64,
         publish_wait_ms: u64,
+        external_min_percent: u8,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
@@ -127,9 +135,28 @@ impl ControllerState {
             sync_interval_ms,
             sync_timeout_ms,
             publish_wait_ms,
+            external_min_percent,
             inner: Mutex::new(Inner::default()),
             write_lock: Mutex::new(()),
         })
+    }
+
+    /// channel の外部配信の master m3u8 を登録する。`None` で取り消す
+    pub async fn set_external_m3u8(
+        &self,
+        channel_id: &str,
+        external_m3u8: Option<&str>,
+    ) -> Result<(), EdamameError> {
+        validate_identifier("channel_id", channel_id)?;
+        // 形式だけを確認する。取得するかどうかは client に任せる
+        let external_m3u8 = external_m3u8.map(normalize_external_m3u8).transpose()?;
+        let mut inner = self.inner.lock().await;
+        let channel = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
+        channel.external_m3u8 = external_m3u8;
+        Ok(())
     }
 
     /// セグメントを検証し、識別子にセグメント番号を割り当てて保存する
@@ -431,21 +458,26 @@ impl ControllerState {
         ))
     }
 
-    /// マスタープレイリストを生成する
+    /// マスタープレイリストを生成する。外部配信へ流す場合は転送先の URL を返す
+    ///
+    /// 外部配信へ振り分けるかどうかは `routing` で指定する。外部配信が登録されていなければ、
+    /// 振り分ける指定でも自前のマスタープレイリストを返す。
     pub async fn master_playlist(
         &self,
         channel_id: &str,
         now_ms: u64,
-    ) -> Result<String, EdamameError> {
+        routing: ExternalRouting,
+    ) -> Result<MasterResponse, EdamameError> {
         validate_identifier("channel_id", channel_id)?;
-        // ファイル確認の間は mutex を保持せず、公開範囲と配信可否を先に集める
-        let (segment_duration_ms, published) = {
+        // ファイル確認と外部への確認の間は mutex を保持せず、公開範囲と配信可否を先に集める
+        let (segment_duration_ms, published, external_m3u8, external_percent) = {
             let inner = self.inner.lock().await;
             let Inner { channels, workers } = &*inner;
             let channel = channels
                 .get(channel_id)
                 .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
             let mut published = BTreeMap::new();
+            let mut external_percent = 0;
             for (quality, quality_state) in &channel.qualities {
                 if quality_state.published.is_empty() {
                     continue;
@@ -454,6 +486,31 @@ impl ControllerState {
                     is_alive(worker, now_ms, self.sync_timeout_ms)
                         && holds_segments(worker, channel_id, quality, &quality_state.published)
                 });
+                if served {
+                    // 公開範囲が最新セグメントに追いついていないほど、外部へ流す割合を上げる
+                    let latest_published = quality_state
+                        .published
+                        .iter()
+                        .next_back()
+                        .copied()
+                        .unwrap_or_default();
+                    let latest_segment = quality_state
+                        .segments
+                        .iter()
+                        .next_back()
+                        .copied()
+                        .unwrap_or(latest_published);
+                    let published_delay = latest_segment.saturating_sub(latest_published);
+                    let normal_delay = self
+                        .publish_wait_ms
+                        .div_ceil(channel.segment_duration_ms.max(1));
+                    external_percent = external_percent.max(external::external_routing_percent(
+                        published_delay,
+                        normal_delay,
+                        self.playlist_segments,
+                        self.external_min_percent,
+                    ));
+                }
                 published.insert(
                     quality.clone(),
                     (
@@ -464,13 +521,32 @@ impl ControllerState {
                     ),
                 );
             }
-            if published.is_empty() {
-                return Err(EdamameError::Unavailable(
-                    "playlist is not published yet".to_owned(),
-                ));
+            // 配信できる quality が 1 つもないときは全量を外部へ逃がす
+            if !published.values().any(|(_, _, _, served)| *served) {
+                external_percent = 100;
             }
-            (channel.segment_duration_ms, published)
+            (
+                channel.segment_duration_ms,
+                published,
+                channel.external_m3u8.clone(),
+                external_percent,
+            )
         };
+        let route_external = match routing {
+            ExternalRouting::LocalOnly => false,
+            ExternalRouting::ExternalOnly => true,
+            ExternalRouting::ByClient(client_ip) => {
+                external::routes_to_external(channel_id, client_ip, external_percent)
+            }
+        };
+        if route_external && let Some(url) = &external_m3u8 {
+            return Ok(MasterResponse::External(url.clone()));
+        }
+        if published.is_empty() {
+            return Err(EdamameError::Unavailable(
+                "playlist is not published yet".to_owned(),
+            ));
+        }
         for (quality, (_, _, segments, _)) in &published {
             for sequence in segments {
                 if !self
@@ -505,8 +581,26 @@ impl ControllerState {
             ));
         }
         let entries = plan_master_playlist(&inputs, segment_duration_ms, self.playlist_segments)?;
-        Ok(render_master_playlist(&entries))
+        Ok(MasterResponse::Local(render_master_playlist(&entries)))
     }
+}
+
+/// `master.m3u8` を外部配信へ振り分けるかどうかの指定
+pub enum ExternalRouting {
+    /// 接続元ごとの割合で判定する
+    ByClient(IpAddr),
+    /// 振り分けず、自前のマスタープレイリストを返す
+    LocalOnly,
+    /// 外部配信へ振り分ける
+    ExternalOnly,
+}
+
+/// `master.m3u8` の応答
+pub enum MasterResponse {
+    /// 自前のマスタープレイリストを返す
+    Local(String),
+    /// 外部配信の master m3u8 へ転送する
+    External(String),
 }
 
 /// 既存の channel と quality の属性に入力が一致するか確認する
@@ -1202,6 +1296,7 @@ mod tests {
             1_000,
             10_000,
             0,
+            1,
         );
         state
             .register_worker("worker-a", "http://a.test", 4, 0)

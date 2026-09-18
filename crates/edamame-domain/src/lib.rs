@@ -20,7 +20,7 @@ pub use segment::{
     validate_quality, validate_resolution,
 };
 pub use token::validate_auth_token;
-pub use url::{normalize_http_url, normalize_key_uri};
+pub use url::{normalize_external_m3u8, normalize_http_url, normalize_key_uri};
 pub use wire::{RegisterRequest, RegisterResponse, SegmentPutResponse, SyncRequest, SyncResponse};
 
 use std::time::{SystemTime, UNIX_EPOCH};

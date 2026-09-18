@@ -35,10 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.sync_interval_ms,
         config.sync_timeout_ms,
         config.publish_wait_ms(),
+        config.external_min_percent,
     );
     let app = router(state, &cors, config.auth_token.as_deref());
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("edamame-controller listening on {}", config.bind);
-    axum::serve(listener, app).await?;
+    // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

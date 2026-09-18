@@ -31,6 +31,7 @@ client には、controller に到達できる URL を設定する。
 | `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | PUT の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると PUT を認証せず、起動時に警告を出す） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
+| `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 外部配信へ流す最低の割合（%、0 以上 100 以下、省略時は 1） |
 
 ## worker の設定
 
@@ -231,6 +232,8 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗する。controller は `--sync-timeout-ms` の経過後にその worker を候補から外すまで同じ worker を選ぶことがある（重みが複数台にある場合は他の worker も選ばれる） |
 | 鍵 URI の配信元が停止した | client は鍵を取得できず、その鍵を使うセグメントを復号できない。controller と worker は鍵を保持しないため、鍵の可用性は publisher の配信元に依存する |
 | 公開範囲に鍵 URI の異なるセグメントが混ざった | メディアプレイリストはセグメントごとに `#EXT-X-KEY` を出し分ける。client はセグメントごとに適切な鍵を取得する |
+| 外部配信が停止した | controller は外部の状態を確認しないため、外部配信の登録を取り消すか、controller を再起動するまで振り分けを続ける |
+| controller が再起動した | 登録された外部配信は失われ、publisher が再登録するまで外部へ振り分けない |
 
 ## セキュリティと信頼境界
 
@@ -238,6 +241,8 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 - publisher が送るセグメント識別子は文字種を限定し、controller は識別子をファイル名に使わず `storage_dir` の外にファイルを作らない
 - worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
 - `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く
+- controller は登録された外部配信の URL を取得しない。client が外部配信から直接取得する
+- 外部配信へ流すかどうかは接続元の IP で決めるため、プロキシや NAT 配下では複数の client が同じ扱いになる
 - CORS は GET の読み取りだけを許可し、`PUT` と `POST` には CORS ヘッダを付けない
 
 ## ログ

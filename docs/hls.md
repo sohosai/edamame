@@ -95,6 +95,15 @@ quality は昇順に出力する。
 - メディアプレイリストへの URL は `{quality}.m3u8` の相対 URL とし、client は controller からメディアプレイリストを取得する
 - Content-Type は `application/vnd.apple.mpegurl` とする
 
+### 外部配信への振り分け
+
+channel に外部配信の master m3u8 が登録されているとき、`master.m3u8` は client ごとに固定した判定で `302 Found` を返し、`Location` にその URL を返すことがある。
+外部へ流す割合は、配信できる quality の公開範囲が最新セグメントに追いついていない度合いで上げ、`--external-min-percent` を下限とする。配信できる quality が 1 つもないときは全量を外部へ流す。
+controller は外部のプレイリストを取得せず、振り分け先が使えるかどうかも確認しない。
+外部配信を停止するときは、`PUT /channels/{channel_id}/external` に `null` を送って登録を取り消す。
+`master.m3u8?external=0` のように `external=0` を付けたリクエストには振り分けを適用しない。
+`external=1` を付けると割合に関係なく外部配信へ振り分ける。外部配信が登録されていなければ自前のマスタープレイリストを返す。
+
 ## プレイリストを生成できる条件
 
 controller は quality ごとに公開範囲を決める。
@@ -126,5 +135,5 @@ worker が保持しているセグメントに欠落がある場合、controller
 controller は生成済みのプレイリストを保存しない。
 公開範囲が変わっていない間は、同じ公開範囲のプレイリストを返す。
 
-ステータスコードは 400、404、422、503 の順に判定する。
+ステータスコードは 400、404、302、422、503 の順に判定する。
 公開範囲またはその quality の配信先 worker がない場合は 503 を返し、controller のセグメントファイルの URL には逃がさない。

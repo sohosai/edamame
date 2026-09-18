@@ -81,6 +81,10 @@ def build_parser():
     )
     parser.add_argument("--resolution", help="controller へ宣言する解像度（WIDTHxHEIGHT）")
     parser.add_argument("--auth-token", help="controller の PUT に使う Bearer トークン")
+    parser.add_argument(
+        "--external-m3u8",
+        help="channel の外部配信の master m3u8 の URL。controller が client を振り分ける",
+    )
     return parser
 
 
@@ -464,7 +468,8 @@ def next_sequence_from_playlist(args):
     channel がまだ無い場合だけ 0 から採番される。quality だけが無い場合や他の quality が
     先行している場合も、既存 quality の最新番号の次に採番される。
     """
-    master_url = f"{args.controller_url}/channels/{args.channel_id}/master.m3u8"
+    # `external=0` を付けて、外部配信への振り分けではなく自前の採番を読む
+    master_url = f"{args.controller_url}/channels/{args.channel_id}/master.m3u8?external=0"
     try:
         # 422 と 503 は quality の配信範囲や worker の準備が整うまで待つ
         master = fetch_playlist_with_retry(master_url, (422, 503))
@@ -498,6 +503,28 @@ def segment_url(args, identifier):
         f"{args.controller_url}/segments/{args.channel_id}/{args.quality}/{identifier}"
         f"?{urllib.parse.urlencode(query)}"
     )
+
+
+def declare_external_m3u8(args):
+    """外部配信の master m3u8 を controller に登録する"""
+    payload = json.dumps({"external_m3u8": args.external_m3u8}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{args.controller_url}/channels/{args.channel_id}/external",
+        data=payload,
+        method="PUT",
+    )
+    request.add_header("Content-Type", "application/json")
+    if args.auth_token is not None:
+        request.add_header("Authorization", f"Bearer {args.auth_token}")
+    try:
+        with urllib.request.urlopen(request, timeout=PUT_TIMEOUT_SECONDS) as response:
+            status = response.status
+    except urllib.error.HTTPError as error:
+        raise PublisherError(f"failed to register the external m3u8: status {error.code}") from error
+    except CONNECTION_ERRORS as error:
+        raise PublisherError(f"failed to register the external m3u8: {error}") from error
+    if status != 204:
+        raise PublisherError(f"failed to register the external m3u8: status {status}")
 
 
 def put_segment(args, identifier, segment_path):
@@ -623,6 +650,8 @@ def run(args, plan):
         return 1
 
     keep_work_dir = False
+    # channel ができた後でないと登録できないため、最初のセグメントを公開してから登録する
+    external_registered = args.external_m3u8 is None
     try:
         while not stop_requested:
             segments = ready_segments(work_dir)
@@ -671,6 +700,14 @@ def run(args, plan):
                     f"published identifier={identifier} sequence={sequence}",
                     flush=True,
                 )
+                if not external_registered:
+                    try:
+                        declare_external_m3u8(args)
+                    except PublisherError as error:
+                        print(error, file=sys.stderr, flush=True)
+                        return 1
+                    print("registered the external m3u8", flush=True)
+                    external_registered = True
     finally:
         stop_ffmpeg(process)
         print("stopped", flush=True)

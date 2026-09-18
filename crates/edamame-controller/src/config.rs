@@ -43,6 +43,10 @@ pub struct ControllerConfig {
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
     #[arg(long, value_delimiter = ',', env = "EDAMAME_CORS_ORIGIN")]
     pub cors_origin: Vec<String>,
+
+    /// 外部配信へ流す最低の割合（%）
+    #[arg(long, env = "EDAMAME_EXTERNAL_MIN_PERCENT", default_value_t = 1)]
+    pub external_min_percent: u8,
 }
 
 impl ControllerConfig {
@@ -65,6 +69,11 @@ impl ControllerConfig {
         }
         if let Some(token) = &self.auth_token {
             validate_auth_token(token)?;
+        }
+        if self.external_min_percent > 100 {
+            return Err(EdamameError::BadRequest(
+                "external min percent must be 100 or less".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -99,6 +108,7 @@ mod tests {
             publish_wait_ms: None,
             auth_token: None,
             cors_origin: Vec::new(),
+            external_min_percent: 1,
         }
     }
 
@@ -174,6 +184,17 @@ mod tests {
     }
 
     #[test]
+    fn accepts_external_min_percent_range() {
+        let mut config = config();
+        for value in [0, 1, 100] {
+            config.external_min_percent = value;
+            config.validate().unwrap();
+        }
+        config.external_min_percent = 101;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn splits_cors_origins_with_comma() {
         // コマンドライン引数と環境変数のどちらでもカンマ区切りを受け付ける
         let delimiter = ControllerConfig::command()
@@ -196,7 +217,7 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 9);
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["storage_dir"], "EDAMAME_STORAGE_DIR");
         assert_eq!(names["playlist_segments"], "EDAMAME_PLAYLIST_SEGMENTS");
@@ -205,5 +226,9 @@ mod tests {
         assert_eq!(names["publish_wait_ms"], "EDAMAME_PUBLISH_WAIT_MS");
         assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");
         assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
+        assert_eq!(
+            names["external_min_percent"],
+            "EDAMAME_EXTERNAL_MIN_PERCENT"
+        );
     }
 }

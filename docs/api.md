@@ -88,6 +88,45 @@ controller を再起動すると識別子とセグメント番号の対応は失
 再起動後に同じ識別子を PUT すると、新しい番号を割り当てて保存する。
 前の起動で保存したセグメントファイルは削除せず、新しいセグメントと番号が重なった時点で上書きする。
 
+### channel の外部配信を登録する
+
+```
+PUT /channels/{channel_id}/external
+```
+
+publisher が channel の外部配信の master m3u8 の URL を登録する。
+`external_m3u8` は `http` または `https` の絶対 URL で host を持ち、fragment を含めない。query は許可する。
+`null` を送ると登録を取り消す。
+controller は登録された URL を取得せず、client が外部配信から直接取得する。
+channel がまだ無い場合は 404 を返す。channel は最初のセグメントファイルを PUT したときに作られる。
+
+リクエスト：
+
+```json
+{ "external_m3u8": "https://px.example.test/abc/def.m3u8" }
+```
+
+```json
+{ "external_m3u8": null }
+```
+
+例：
+
+```bash
+curl -i -X PUT \
+  -H 'Authorization: Bearer example-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"external_m3u8":"https://px.example.test/abc/def.m3u8"}' \
+  'http://127.0.0.1:9000/channels/live/external'
+```
+
+ステータス：
+
+- `204 No Content`：登録した
+- `400 Bad Request`：`channel_id` または `external_m3u8` の形式が不正である
+- `401 Unauthorized`：`--auth-token` を指定しているのにトークンが無い、または一致しない
+- `404 Not Found`：channel が存在しない
+
 ### セグメントファイルを取得する
 
 ```
@@ -115,12 +154,16 @@ GET /channels/{channel_id}/master.m3u8
 ステータス：
 
 - `200 OK`：マスタープレイリストを返す
+- `302 Found`：外部配信へ振り分ける。`Location` に宣言された外部の master m3u8 の URL を返す
 - `400 Bad Request`：`channel_id` が不正である
 - `404 Not Found`：channel が存在しない
 - `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
 - `503 Service Unavailable`：配信できる quality がない
 
 quality 間で公開範囲が違ってもよい。
+振り分けの判定は接続元ごとに固定し、リクエストのたびに行う。外部配信が登録されていなければ 302 を返さない。
+query に `external=1` を付けると外部配信へ振り分け、`external=0` を付けると自前のマスタープレイリストを返す。省略時は接続元ごとの割合で判定する。
+`external=0` は publisher が自前の採番を確認するために使う。外部配信が登録されていなければ、`external=1` でも自前のマスタープレイリストを返す。
 
 ### メディアプレイリストを取得する
 
