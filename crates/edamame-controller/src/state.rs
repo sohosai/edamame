@@ -254,7 +254,7 @@ impl ControllerState {
                 .get(channel_id, quality, sequence)
                 .map_err(|_| EdamameError::Internal("stored segment is missing".to_owned()))?;
             // 同じ識別子の再 PUT は、保存済みのバイト列と同じ場合だけ受け付ける
-            if existing != bytes {
+            if existing.as_ref() != bytes {
                 return Err(EdamameError::Conflict(
                     "segment bytes differ from the canonical file".to_owned(),
                 ));

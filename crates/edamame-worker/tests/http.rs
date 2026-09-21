@@ -1,5 +1,6 @@
 //! worker の HTTP 配信を実サーバーで確認する
 
+use bytes::Bytes;
 use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router};
 
@@ -8,7 +9,12 @@ fn cache_with(segments: &[(&str, &str, u64, &[u8])]) -> Cache {
     let mut cache = Cache::new(12).unwrap();
     for (channel_id, quality, sequence, bytes) in segments {
         cache
-            .put(channel_id, quality, *sequence, bytes.to_vec())
+            .put(
+                channel_id,
+                quality,
+                *sequence,
+                Bytes::copy_from_slice(bytes),
+            )
             .unwrap();
     }
     cache

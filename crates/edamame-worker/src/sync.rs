@@ -163,12 +163,7 @@ async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKe
                 Ok(bytes) => {
                     let removed = {
                         let mut cache = state.cache.lock().await;
-                        match cache.put(
-                            &item.channel_id,
-                            &item.quality,
-                            item.sequence,
-                            bytes.to_vec(),
-                        ) {
+                        match cache.put(&item.channel_id, &item.quality, item.sequence, bytes) {
                             Ok(removed) => removed,
                             Err(error) => {
                                 eprintln!(

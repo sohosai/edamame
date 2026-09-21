@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
+bytes.workspace = true
 clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
 serde.workspace = true

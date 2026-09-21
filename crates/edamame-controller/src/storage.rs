@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use bytes::Bytes;
 use edamame_domain::{EdamameError, SegmentKey};
 
 /// セグメントファイルをメモリ上に保存する正規ストア
@@ -22,7 +23,7 @@ struct StoreInner {
 }
 
 struct StoredSegment {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     order: u64,
 }
 
@@ -51,12 +52,13 @@ impl CanonicalStore {
     }
 
     /// セグメントファイルを読み込む
+    /// 参照カウンタを進めるだけなので、同時に取得してもバイト列は複製されない
     pub fn get(
         &self,
         channel_id: &str,
         quality: &str,
         sequence: u64,
-    ) -> Result<Vec<u8>, EdamameError> {
+    ) -> Result<Bytes, EdamameError> {
         let inner = self.inner.lock().expect("store lock is not poisoned");
         match inner
             .segments
@@ -94,7 +96,7 @@ impl CanonicalStore {
         inner.segments.insert(
             key.clone(),
             StoredSegment {
-                bytes: bytes.to_vec(),
+                bytes: Bytes::copy_from_slice(bytes),
                 order,
             },
         );
@@ -155,7 +157,7 @@ mod tests {
         let removed = store.put("live", "720p", 0, b"segment-0").unwrap();
         assert!(removed.is_empty());
         assert!(store.contains("live", "720p", 0));
-        assert_eq!(store.get("live", "720p", 0).unwrap(), b"segment-0");
+        assert_eq!(store.get("live", "720p", 0).unwrap().as_ref(), b"segment-0");
         assert_eq!(store.used_bytes(), 9);
         assert!(store.get("live", "720p", 1).is_err());
     }

@@ -296,6 +296,7 @@ name = "edamame-controller"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "edamame-domain",
  "edamame-worker",
@@ -341,6 +342,7 @@ name = "edamame-worker"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "edamame-domain",
  "reqwest",

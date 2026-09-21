@@ -2703,7 +2703,7 @@ async fn worker_discards_cache_on_registration() {
                     "live",
                     "720p",
                     sequence,
-                    format!("old-segment-{sequence}").into_bytes(),
+                    axum::body::Bytes::from(format!("old-segment-{sequence}")),
                 )
                 .unwrap();
         }

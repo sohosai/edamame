@@ -4,13 +4,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
 use edamame_domain::{EdamameError, SegmentId, SegmentKey, validate_identifier, validate_quality};
 
 /// `(channel_id, quality)` ごとに直近のセグメントファイルを保持するキャッシュ
 #[derive(Debug)]
 pub struct Cache {
     limit: usize,
-    entries: BTreeMap<(String, String), BTreeMap<u64, Vec<u8>>>,
+    entries: BTreeMap<(String, String), BTreeMap<u64, Bytes>>,
 }
 
 impl Cache {
@@ -33,8 +34,9 @@ impl Cache {
     }
 
     /// キャッシュしているセグメントファイルを返す
+    /// 参照カウンタを進めるだけなので、同時に配信してもバイト列は複製されない
     #[must_use]
-    pub fn get(&self, channel_id: &str, quality: &str, sequence: u64) -> Option<Vec<u8>> {
+    pub fn get(&self, channel_id: &str, quality: &str, sequence: u64) -> Option<Bytes> {
         self.entries
             .get(&(channel_id.to_owned(), quality.to_owned()))
             .and_then(|segments| segments.get(&sequence))
@@ -47,7 +49,7 @@ impl Cache {
         channel_id: &str,
         quality: &str,
         sequence: u64,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> Result<Vec<SegmentKey>, EdamameError> {
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
@@ -136,10 +138,13 @@ mod tests {
     fn stores_and_reads_segments() {
         let mut cache = cache(12);
         cache
-            .put("live", "720p", 101, b"segment-101".to_vec())
+            .put("live", "720p", 101, Bytes::from_static(b"segment-101"))
             .unwrap();
         assert!(cache.contains("live", "720p", 101));
-        assert_eq!(cache.get("live", "720p", 101).unwrap(), b"segment-101");
+        assert_eq!(
+            cache.get("live", "720p", 101).unwrap().as_ref(),
+            b"segment-101"
+        );
         assert!(!cache.contains("live", "720p", 102));
         assert!(cache.get("live", "720p", 102).is_none());
     }
@@ -149,7 +154,7 @@ mod tests {
         let mut cache = cache(2);
         for sequence in [101, 102, 103] {
             cache
-                .put("live", "720p", sequence, format!("{sequence}").into_bytes())
+                .put("live", "720p", sequence, Bytes::from(format!("{sequence}")))
                 .unwrap();
         }
         assert!(!cache.contains("live", "720p", 101));
@@ -160,10 +165,16 @@ mod tests {
     #[test]
     fn reports_segment_removed_by_its_own_insert() {
         let mut cache = cache(2);
-        cache.put("live", "720p", 102, b"102".to_vec()).unwrap();
-        cache.put("live", "720p", 103, b"103".to_vec()).unwrap();
+        cache
+            .put("live", "720p", 102, Bytes::from_static(b"102"))
+            .unwrap();
+        cache
+            .put("live", "720p", 103, Bytes::from_static(b"103"))
+            .unwrap();
         // 上限まで埋まった状態で古い番号を入れると、入れたセグメント自身が削除される
-        let removed = cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
+        let removed = cache
+            .put("live", "720p", 101, Bytes::from_static(b"101"))
+            .unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].sequence, 101);
         assert!(!cache.contains("live", "720p", 101));
@@ -172,7 +183,9 @@ mod tests {
     #[test]
     fn remove_deletes_index_entry() {
         let mut cache = cache(2);
-        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
+        cache
+            .put("live", "720p", 101, Bytes::from_static(b"101"))
+            .unwrap();
         assert!(cache.contains("live", "720p", 101));
         cache.remove("live", "720p", 101);
         assert!(!cache.contains("live", "720p", 101));
@@ -181,9 +194,15 @@ mod tests {
     #[test]
     fn clear_removes_group_entries() {
         let mut cache = cache(12);
-        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
-        cache.put("live", "720p", 102, b"102".to_vec()).unwrap();
-        cache.put("live", "1080p", 101, b"101".to_vec()).unwrap();
+        cache
+            .put("live", "720p", 101, Bytes::from_static(b"101"))
+            .unwrap();
+        cache
+            .put("live", "720p", 102, Bytes::from_static(b"102"))
+            .unwrap();
+        cache
+            .put("live", "1080p", 101, Bytes::from_static(b"101"))
+            .unwrap();
         cache.clear("live", "720p");
         assert!(!cache.contains("live", "720p", 101));
         assert!(!cache.contains("live", "720p", 102));
@@ -193,8 +212,12 @@ mod tests {
     #[test]
     fn keys_and_cached_ids_list_all_segments() {
         let mut cache = cache(12);
-        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
-        cache.put("live", "1080p", 101, b"101".to_vec()).unwrap();
+        cache
+            .put("live", "720p", 101, Bytes::from_static(b"101"))
+            .unwrap();
+        cache
+            .put("live", "1080p", 101, Bytes::from_static(b"101"))
+            .unwrap();
         assert_eq!(cache.keys().len(), 2);
         assert_eq!(cache.cached_ids().len(), 2);
         cache.clear_all();
