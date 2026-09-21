@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use edamame_domain::{
     EdamameError, QualityPlaylistInput, SegmentEncryption, SegmentId, SegmentKey, SyncResponse,
-    normalize_external_m3u8, normalize_http_url, normalize_iv, normalize_key_uri, now_ms,
+    normalize_external_m3u8, normalize_iv, normalize_key_uri, normalize_public_url, now_ms,
     plan_master_playlist, plan_media_playlist, render_master_playlist, render_media_playlist,
     validate_identifier, validate_quality, validate_resolution,
 };
@@ -366,7 +366,7 @@ impl ControllerState {
                 "weight must be positive".to_owned(),
             ));
         }
-        let public_url = normalize_http_url(public_url)?;
+        let public_url = normalize_public_url(public_url)?;
         let mut inner = self.inner.lock().await;
         let created = if let Some(worker) = inner.workers.get_mut(worker_id) {
             worker.public_url = public_url;

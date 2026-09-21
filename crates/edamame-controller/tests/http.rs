@@ -2703,6 +2703,32 @@ async fn keeps_local_master_when_external_percent_is_zero() {
     controller.shutdown().await;
 }
 
+/// https の public_url を登録すると、メディアプレイリストにその URL が出る
+#[tokio::test]
+async fn registers_worker_with_https_public_url() {
+    let tmp = TempDir::new("https-public-url");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let sequences = publish_series(&client, base, "720p", 0..6).await;
+
+    let worker_public_url = "https://live02.nukanoto.net";
+    let registration = register_worker(&client, base, "worker-a", worker_public_url, 1).await;
+    assert_eq!(registration.status().as_u16(), 201);
+    let sync = sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
+    assert_eq!(sync.status().as_u16(), 200);
+
+    let media = wait_for_playlist_contains(
+        &client,
+        &format!("{base}/channels/live/720p.m3u8"),
+        "https://live02.nukanoto.net/segments/live/720p/5.ts",
+    )
+    .await;
+    assert!(media.contains("https://live02.nukanoto.net/segments/live/720p/0.ts"));
+
+    controller.shutdown().await;
+}
+
 /// 配信できる quality が 1 つもないときは、最低の割合が 0 でも外部配信へ逃がす
 #[tokio::test]
 async fn falls_back_to_external_when_no_quality_can_be_served() {

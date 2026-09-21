@@ -18,7 +18,7 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
-    /// client に公開する worker の URL
+    /// client に公開する worker の URL（http または https）
     #[arg(long, env = "EDAMAME_PUBLIC_URL")]
     pub public_url: String,
 

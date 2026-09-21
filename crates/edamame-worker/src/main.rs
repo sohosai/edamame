@@ -1,7 +1,7 @@
 //! `edamame-worker` の起動処理
 
 use clap::Parser;
-use edamame_domain::normalize_http_url;
+use edamame_domain::{normalize_http_url, normalize_public_url};
 use edamame_worker::cache::Cache;
 use edamame_worker::config::WorkerConfig;
 use edamame_worker::http::{WorkerState, router};
@@ -17,7 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --cors-origin is not specified; cross-origin browser access is disabled"
         );
     }
-    let public_url = normalize_http_url(&config.public_url)?;
+    // client へは TLS 終端の reverse proxy 越しに配信することがあるため、https も許可する
+    let public_url = normalize_public_url(&config.public_url)?;
+    // worker は TLS を使わないため、controller へは http で接続する
     let controller_url = normalize_http_url(&config.controller_url)?;
     tokio::fs::create_dir_all(&config.cache_dir).await?;
     let cache = Cache::scan(config.cache_dir.clone(), config.cache_limit).await?;

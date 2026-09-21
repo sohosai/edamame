@@ -198,7 +198,7 @@ PUT /workers/{worker_id}
 }
 ```
 
-`public_url` は `http://` で始まる絶対 URL とする。
+`public_url` は `http` または `https` で始まる絶対 URL とする。
 末尾の `/` は取り除いて保存する。
 query と fragment を含めない。
 パスを含めてもよい。その場合はパスの後ろに `/segments/...` を付けた URL をプレイリストに書く。

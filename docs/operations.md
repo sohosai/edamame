@@ -39,7 +39,7 @@ client には、controller に到達できる URL を設定する。
 | --- | --- | --- | --- |
 | `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | controller に登録する worker の識別子 |
 | `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレス |
-| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http://` で始まる絶対 URL |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http` または `https` で始まる絶対 URL（TLS 終端の reverse proxy を置く場合は `https`） |
 | `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | controller に接続するための、worker から到達できる URL |
 | `--cache-dir` | `EDAMAME_CACHE_DIR` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |

@@ -35,6 +35,39 @@ pub fn normalize_http_url(value: &str) -> Result<String, EdamameError> {
     Ok(normalized)
 }
 
+/// client に公開する worker の URL を検証し、末尾の `/` を取り除いて返す
+///
+/// 前段に TLS を終端する reverse proxy を置く構成があるため、`http` と `https` を許可する。
+pub fn normalize_public_url(value: &str) -> Result<String, EdamameError> {
+    let url = Url::parse(value)
+        .map_err(|_| EdamameError::BadRequest("url must be an absolute URL".to_owned()))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(EdamameError::BadRequest(
+            "url scheme must be http or https".to_owned(),
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(EdamameError::BadRequest(
+            "url must contain a host".to_owned(),
+        ));
+    }
+    if url.query().is_some() {
+        return Err(EdamameError::BadRequest(
+            "url must not contain a query".to_owned(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(EdamameError::BadRequest(
+            "url must not contain a fragment".to_owned(),
+        ));
+    }
+    let mut normalized = url.to_string();
+    while normalized.ends_with('/') {
+        normalized.pop();
+    }
+    Ok(normalized)
+}
+
 /// 暗号鍵の URI を検証し、正規形を返す
 ///
 /// 鍵は publisher が配信するため、`http` と `https` の絶対 URL だけを許可する。
@@ -93,6 +126,30 @@ mod tests {
         assert!(normalize_http_url("/relative").is_err());
         assert!(normalize_http_url("http://example.test/?x=1").is_err());
         assert!(normalize_http_url("http://example.test/#f").is_err());
+    }
+
+    #[test]
+    fn normalizes_public_url() {
+        assert_eq!(
+            normalize_public_url("http://127.0.0.1:9001/").unwrap(),
+            "http://127.0.0.1:9001"
+        );
+        assert_eq!(
+            normalize_public_url("https://live02.nukanoto.net/").unwrap(),
+            "https://live02.nukanoto.net"
+        );
+        assert_eq!(
+            normalize_public_url("https://live02.nukanoto.net").unwrap(),
+            "https://live02.nukanoto.net"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_public_url() {
+        assert!(normalize_public_url("/relative").is_err());
+        assert!(normalize_public_url("ftp://live02.nukanoto.net").is_err());
+        assert!(normalize_public_url("https://live02.nukanoto.net/?x=1").is_err());
+        assert!(normalize_public_url("https://live02.nukanoto.net/#f").is_err());
     }
 
     #[test]
