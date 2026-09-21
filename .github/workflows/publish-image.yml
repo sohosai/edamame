@@ -28,6 +28,8 @@ jobs:
             target: controller
           - name: worker
             target: worker
+          - name: publisher
+            target: publisher
 
     steps:
       - name: Checkout

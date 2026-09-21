@@ -1,0 +1,25 @@
+[package]
+name = "edamame-publisher"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aes.workspace = true
+cbc.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+aes.workspace = true
+axum.workspace = true
+cbc.workspace = true
+edamame-controller = { path = "../edamame-controller" }
+edamame-domain = { path = "../edamame-domain" }
+edamame-worker = { path = "../edamame-worker" }
+tokio.workspace = true

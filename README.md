@@ -6,6 +6,7 @@
 
 - Rust 1.85 以降（edition 2024）
 - controller と worker が同じ network から到達できること
+- publisher を動かす場合は、NVEnc と SRT を含む ffmpeg と NVIDIA の GPU とドライバ
 
 ## ビルド
 
@@ -51,6 +52,20 @@ controller と worker の option は環境変数でも指定できる。
 publisher もセグメントファイルの PUT に `Authorization: Bearer {token}` を付ける。
 省略すると PUT の認証は無効になり、controller が起動時に警告を出す。
 
+## publisher
+
+publisher は `crates/edamame-publisher` にあり、SRT で受け取った映像を NVEnc でエンコードしてセグメントを作り、
+controller へ PUT する。GPU と ffmpeg が要るため、controller と worker とは別の機械で動かす。
+
+```bash
+cargo run --release -p edamame-publisher -- \
+  --config crates/edamame-publisher/publisher.example.toml \
+  --controller-url http://127.0.0.1:9000 \
+  --auth-token example-token
+```
+
+設定、処理の流れ、暗号化の仕様、動作確認、失敗時の扱いは [publisher](./docs/publisher.md) に書く。
+
 ## Dockerでの起動
 
 `compose.yaml` の例：
@@ -94,6 +109,12 @@ services:
 volumes:
   controller-storage:
   worker-cache:
+```
+
+publisher のイメージは ffmpeg を含むため別のターゲットで作る。GPU は NVIDIA Container Toolkit で渡す。
+
+```bash
+docker build --target publisher -t edamame-publisher .
 ```
 
 ## 動作を確認する

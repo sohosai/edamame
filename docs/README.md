@@ -12,6 +12,7 @@ VOD は扱わない。
 - [HTTP API](./api.md)：controller と worker のエンドポイント、ステータスコード、sync の流れ
 - [HLS の出力](./hls.md)：マスタープレイリストとメディアプレイリストの形式
 - [運用](./operations.md)：CLI、起動、再起動、失敗時の扱い、制約
+- [publisher](./publisher.md)：publisher crate の導入手順と運用上の契約
 
 ## 用語
 

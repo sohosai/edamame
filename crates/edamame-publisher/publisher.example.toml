@@ -1,0 +1,94 @@
+# edamame-publisher の設定例
+# 3 系統の入力を、1080p はそのままコピーし、720p と 480p は NVEnc で作り直す。
+#
+# 鍵と配信 URL の登録は CLI で指定する。
+#   --stream-credentials-url https://live.example.test
+#   --stream-ingest-token <STREAM_INGEST_TOKEN>
+#   --key-file /var/lib/edamame-publisher/key.bin
+
+# 全 channel で共通のセグメント長。PUT の duration_ms にもこの値を使う
+segment_duration_ms = 6000
+
+# channel ごとの未送信セグメントの上限。segment_duration_ms を掛けた時間を過ぎた
+# セグメントは捨てて、ライブの遅れを取り戻す
+backlog_limit = 6
+
+[encoder]
+# 検証で GPU を使わない場合は libx264 にする
+codec = "h264_nvenc"
+preset = "p5"
+
+[[input]]
+channel_id = "uni"
+srt_url = "srt://0.0.0.0:9101?mode=listener&latency=200000"
+# controller の公開マスタープレイリスト。鍵と一緒に live2025-server へ登録する
+live_url = "https://live.example.test/channels/uni/master.m3u8"
+# メディアプレイリストに出す鍵 URI。再生側はここから鍵を取る
+key_uri = "https://live.example.test/key/uni"
+
+# bandwidth は controller へ宣言する値で、音声と MPEG-TS の多重化を含めた見積もりを書く
+[[input.rendition]]
+quality = "1080p"
+mode = "copy"
+resolution = "1920x1080"
+bandwidth = 12000000
+
+[[input.rendition]]
+quality = "720p"
+resolution = "1280x720"
+bandwidth = 6500000
+video_bitrate = 6000000
+
+[[input.rendition]]
+quality = "480p"
+resolution = "854x480"
+bandwidth = 1400000
+video_bitrate = 1200000
+
+[[input]]
+channel_id = "1A"
+srt_url = "srt://0.0.0.0:9102?mode=listener&latency=200000"
+live_url = "https://live.example.test/channels/1A/master.m3u8"
+key_uri = "https://live.example.test/key/1A"
+
+[[input.rendition]]
+quality = "1080p"
+mode = "copy"
+resolution = "1920x1080"
+bandwidth = 12000000
+
+[[input.rendition]]
+quality = "720p"
+resolution = "1280x720"
+bandwidth = 6500000
+video_bitrate = 6000000
+
+[[input.rendition]]
+quality = "480p"
+resolution = "854x480"
+bandwidth = 1400000
+video_bitrate = 1200000
+
+[[input]]
+channel_id = "kaikan"
+srt_url = "srt://0.0.0.0:9103?mode=listener&latency=200000"
+live_url = "https://live.example.test/channels/kaikan/master.m3u8"
+key_uri = "https://live.example.test/key/kaikan"
+
+[[input.rendition]]
+quality = "1080p"
+mode = "copy"
+resolution = "1920x1080"
+bandwidth = 12000000
+
+[[input.rendition]]
+quality = "720p"
+resolution = "1280x720"
+bandwidth = 6500000
+video_bitrate = 6000000
+
+[[input.rendition]]
+quality = "480p"
+resolution = "854x480"
+bandwidth = 1400000
+video_bitrate = 1200000

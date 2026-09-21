@@ -1,0 +1,534 @@
+//! 実プロセスを使った結合テスト
+//!
+//! controller、worker、ffmpeg、publisher をすべて起動し、暗号化したセグメントが
+//! controller に保存されて再生できるところまでを確認する。
+
+mod common;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+use common::{
+    Controller, Publisher, Sender, TestDir, Worker, assert_mpegts, decrypt_segment, free_port,
+    http_get, wait_for,
+};
+
+/// 設定ファイルを書く
+fn write_config(dir: &Path, text: &str) -> PathBuf {
+    let path = dir.join("publisher.toml");
+    fs::write(&path, text).expect("設定を書けません");
+    path
+}
+
+/// 1 つの channel の設定を組み立てる
+fn input_config(channel_id: &str, srt_port: u16, copy: bool) -> String {
+    if copy {
+        format!(
+            r#"
+[[input]]
+channel_id = "{channel_id}"
+srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 12000000
+"#
+        )
+    } else {
+        format!(
+            r#"
+[[input]]
+channel_id = "{channel_id}"
+srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+
+[[input.rendition]]
+quality = "main"
+resolution = "640x360"
+bandwidth = 1400000
+video_bitrate = 800000
+"#
+        )
+    }
+}
+
+/// 復号したセグメントを ffprobe で調べる
+fn probe_streams(dir: &Path, data: &[u8]) -> String {
+    let path = dir.join("probe.ts");
+    fs::write(&path, data).expect("セグメントを書けません");
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffprobe を実行できません");
+    assert!(
+        output.status.success(),
+        "ffprobe が失敗しました: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// プレイリストのメディアシーケンスと、セグメントごとの IV を取り出す
+///
+/// `#EXT-X-KEY` はセグメントごとに並ぶため、n 番目の IV はメディアシーケンス + n のセグメントのものである。
+fn playlist_ivs(playlist: &str) -> (u64, Vec<String>) {
+    let mut media_sequence = 0;
+    let mut ivs = Vec::new();
+    for line in playlist.lines() {
+        if let Some(value) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+            media_sequence = value.parse().expect("メディアシーケンスを読めません");
+        } else if let Some(value) = line.strip_prefix("#EXT-X-KEY:METHOD=AES-128,URI=\"") {
+            let (_, iv) = value.rsplit_once(",IV=0x").expect("IV がありません");
+            ivs.push(iv.to_owned());
+        }
+    }
+    (media_sequence, ivs)
+}
+
+#[test]
+fn publishes_encrypted_segments_for_all_renditions() {
+    let dir = TestDir::new("renditions");
+    let srt_port = free_port();
+    let controller = Controller::start(dir.path(), "test-token");
+    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+[[input.rendition]]
+quality = "small"
+resolution = "320x180"
+bandwidth = 1400000
+video_bitrate = 500000
+"#,
+            input_config("1A", srt_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let _sender = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
+
+    let stored = wait_for(
+        || {
+            controller.sequences("1A", "main").len() >= 2
+                && controller.sequences("1A", "small").len() >= 2
+        },
+        Duration::from_secs(30),
+    );
+    assert!(stored, "セグメントが保存されません: {}", publisher.log());
+    // 送信中のセットが終わるのを待つ
+    thread::sleep(Duration::from_millis(500));
+
+    let main = controller.sequences("1A", "main");
+    let small = controller.sequences("1A", "small");
+    assert_eq!(
+        main, small,
+        "同じ識別子で送ったセグメントの番号が quality をまたいで揃っていません"
+    );
+
+    let key = publisher.key();
+    // 鍵 URI を指定しない場合は IV を伝える手段がないため、全ゼロ固定になる
+    let iv_zero = "0".repeat(32);
+    for (quality, resolution) in [("main", "640,360"), ("small", "320,180")] {
+        let sequence = main[0];
+        let stored = fs::read(controller.segment_path("1A", quality, sequence))
+            .expect("セグメントを読めません");
+        assert_ne!(
+            stored.first(),
+            Some(&0x47),
+            "保存されたファイルが暗号化されていません"
+        );
+        let plain = decrypt_segment(&key, &iv_zero, &stored);
+        assert_mpegts(&plain);
+        let streams = probe_streams(dir.path(), &plain);
+        assert!(
+            streams.contains("h264") && streams.contains(resolution) && streams.contains("aac"),
+            "復号したセグメントの内容が違います: {streams}"
+        );
+    }
+
+    // worker がセグメントを取得して公開範囲ができるまで待つ
+    let master_url = format!("{}/channels/1A/master.m3u8", controller.base_url);
+    let mut master = String::new();
+    let published = wait_for(
+        || match http_get(&master_url) {
+            Some(body) => {
+                master = body;
+                true
+            }
+            None => false,
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        published,
+        "master playlist を取得できません: {}",
+        publisher.log()
+    );
+    assert!(
+        master.contains("main.m3u8"),
+        "master playlist の内容: {master}"
+    );
+    assert!(
+        master.contains("small.m3u8"),
+        "master playlist の内容: {master}"
+    );
+    let media_url = format!("{}/channels/1A/main.m3u8", controller.base_url);
+    let media = wait_for(
+        || http_get(&media_url).is_some_and(|body| body.contains("EXTINF:1.000")),
+        Duration::from_secs(20),
+    );
+    assert!(
+        media,
+        "media playlist を取得できません: {}",
+        publisher.log()
+    );
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+    assert!(
+        publisher.log().contains("stopped"),
+        "停止のログが出ていません: {}",
+        publisher.log()
+    );
+}
+
+/// 鍵 URI とセグメントごとの乱数 IV はプレイリストまで通り、その IV で復号できる
+#[test]
+fn publishes_key_uri_and_iv() {
+    let dir = TestDir::new("key-uri");
+    let srt_port = free_port();
+    let controller = Controller::start(dir.path(), "test-token");
+    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let key_uri = "https://live.example.test/key/1A";
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1A"
+srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+key_uri = "{key_uri}"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 12000000
+"#
+        ),
+    );
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let _sender = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
+
+    let media_url = format!("{}/channels/1A/main.m3u8", controller.base_url);
+    let expected = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\",IV=0x");
+    let listed = wait_for(
+        || http_get(&media_url).is_some_and(|body| body.contains(&expected)),
+        Duration::from_secs(30),
+    );
+    assert!(
+        listed,
+        "鍵 URI と IV がプレイリストに出ません: {}",
+        publisher.log()
+    );
+
+    let playlist = http_get(&media_url).expect("プレイリストを取得できません");
+    let (first_sequence, ivs) = playlist_ivs(&playlist);
+    assert!(ivs.len() >= 2, "鍵のタグが足りません: {playlist}");
+    assert_ne!(ivs[0], ivs[1], "IV が使い回されています: {playlist}");
+
+    // プレイリストが示す IV で、保存されたセグメントを復号できる
+    let stored = fs::read(controller.segment_path("1A", "main", first_sequence))
+        .expect("セグメントを読めません");
+    assert_mpegts(&decrypt_segment(&publisher.key(), &ivs[0], &stored));
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+#[test]
+fn stops_only_the_channel_with_non_aac_audio() {
+    let dir = TestDir::new("non-aac");
+    let first_port = free_port();
+    let second_port = free_port();
+    let controller = Controller::start(dir.path(), "test-token");
+    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+"#,
+            input_config("1A", first_port, true) + &input_config("1B", second_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let _first = Sender::start(first_port, "640x360", 30, 30, "aac", 60);
+    let _second = Sender::start(second_port, "640x360", 30, 30, "mp2", 60);
+
+    let stopped = publisher.wait_for_log(
+        "channel=1B stopped: audio codec must be aac",
+        Duration::from_secs(30),
+    );
+    assert!(
+        stopped,
+        "aac 以外の音声で 1B が止まりません: {}",
+        publisher.log()
+    );
+    assert!(
+        controller.sequences("1B", "main").is_empty(),
+        "aac 以外の音声のセグメントが保存されています"
+    );
+
+    // 1A は止まらずに配信を続ける
+    let before = controller.sequences("1A", "main").len();
+    let kept = wait_for(
+        || controller.sequences("1A", "main").len() > before,
+        Duration::from_secs(20),
+    );
+    assert!(kept, "1A の配信が止まりました: {}", publisher.log());
+
+    let status = publisher.stop();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "channel が失敗したときの終了コード: {status}"
+    );
+}
+
+#[test]
+fn drops_expired_segments_when_the_controller_is_unreachable() {
+    let dir = TestDir::new("backlog");
+    let srt_port = free_port();
+    let unreachable = format!("http://127.0.0.1:{}", free_port());
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 2
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+"#,
+            input_config("1A", srt_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(&config, &unreachable, None, dir.path());
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let _sender = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
+
+    let dropped = publisher.wait_for_log("dropping expired segment", Duration::from_secs(30));
+    assert!(
+        dropped,
+        "controller に届かないときに古いセグメントを捨てません: {}",
+        publisher.log()
+    );
+    assert!(publisher.is_running(), "publisher が終了しました");
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+#[test]
+fn warns_when_copied_segment_durations_do_not_match() {
+    let dir = TestDir::new("copy-duration");
+    let srt_port = free_port();
+    let controller = Controller::start(dir.path(), "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+"#,
+            input_config("1A", srt_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    // 2.5 秒間隔のキーフレームでは 1 秒のセグメントに切れない
+    let _sender = Sender::start(srt_port, "640x360", 30, 75, "aac", 60);
+
+    let warned = publisher.wait_for_log(
+        "warning: copied segment index=0 quality=main",
+        Duration::from_secs(30),
+    );
+    assert!(
+        warned,
+        "コピーするセグメントの長さのずれを警告しません: {}",
+        publisher.log()
+    );
+    let stored = wait_for(
+        || !controller.sequences("1A", "main").is_empty(),
+        Duration::from_secs(20),
+    );
+    assert!(
+        stored,
+        "警告のあとも配信を続けていません: {}",
+        publisher.log()
+    );
+    assert!(publisher.is_running(), "publisher が終了しました");
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+#[test]
+fn restarts_ffmpeg_after_the_sender_disconnects() {
+    let dir = TestDir::new("restart");
+    let srt_port = free_port();
+    let controller = Controller::start(dir.path(), "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+"#,
+            input_config("1A", srt_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    // 4 秒で送信を終わらせ、ffmpeg を終了させる
+    let _first = Sender::start(srt_port, "640x360", 30, 30, "aac", 4);
+    let stored = wait_for(
+        || !controller.sequences("1A", "main").is_empty(),
+        Duration::from_secs(30),
+    );
+    assert!(
+        stored,
+        "最初の送信でセグメントが保存されません: {}",
+        publisher.log()
+    );
+
+    let restarted = publisher.wait_for_log("starting ffmpeg run=2", Duration::from_secs(30));
+    assert!(restarted, "ffmpeg が再起動しません: {}", publisher.log());
+    let offset_line = publisher
+        .log()
+        .lines()
+        .find(|line| line.contains("starting ffmpeg run=2"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !offset_line.ends_with("offset_ms=0"),
+        "再起動の時刻が続いていません: {offset_line}"
+    );
+
+    let before = controller.sequences("1A", "main").len();
+    let _second = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
+    let resumed = wait_for(
+        || controller.sequences("1A", "main").len() > before,
+        Duration::from_secs(30),
+    );
+    assert!(
+        resumed,
+        "送信を再開しても配信が続きません: {}",
+        publisher.log()
+    );
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
