@@ -1,47 +1,27 @@
-//! worker のローカルキャッシュの走査と索引を扱う。
+//! worker のローカルキャッシュの索引とセグメントファイルを扱う。
 //!
-//! 呼び出し側は索引を参照または変更する間だけ mutex を保持し、セグメントファイルの読み書きの間は保持しない。
-//! sync の応答がセグメントファイルの保存待ちで止まるのを防ぐ。
+//! セグメントファイルはメモリ上に保存する。呼び出し側は索引を参照または変更する間だけ mutex を保持する。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use edamame_domain::{
-    EdamameError, SegmentId, SegmentKey, parse_sequence_filename, render_filename,
-    validate_identifier, validate_quality,
-};
+use edamame_domain::{EdamameError, SegmentId, SegmentKey, validate_identifier, validate_quality};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// `(channel_id, quality)` ごとにセグメント番号を保持するキャッシュ索引
+/// `(channel_id, quality)` ごとに直近のセグメントファイルを保持するキャッシュ
 #[derive(Debug)]
 pub struct Cache {
-    dir: PathBuf,
     limit: usize,
-    entries: BTreeMap<(String, String), BTreeSet<u64>>,
+    entries: BTreeMap<(String, String), BTreeMap<u64, Vec<u8>>>,
 }
 
 impl Cache {
-    /// `dir` を走査してキャッシュ索引を作り、キャッシュ上限を超えた分のファイルを削除する
-    pub async fn scan(dir: PathBuf, limit: u64) -> Result<Self, EdamameError> {
+    /// 空のキャッシュを作る
+    pub fn new(limit: u64) -> Result<Self, EdamameError> {
         let limit = usize::try_from(limit)
             .map_err(|_| EdamameError::BadRequest("cache limit is too large".to_owned()))?;
-        let mut cache = Self {
-            dir,
+        Ok(Self {
             limit,
             entries: BTreeMap::new(),
-        };
-        cache.scan_dir().await?;
-        for path in cache.remove_over_limit() {
-            if let Err(error) = tokio::fs::remove_file(&path).await {
-                eprintln!(
-                    "failed to remove cached segment over the limit {}: {error}",
-                    path.display()
-                );
-            }
-        }
-        Ok(cache)
+        })
     }
 
     /// 指定したセグメントが索引に含まれるかを返す
@@ -49,85 +29,74 @@ impl Cache {
     pub fn contains(&self, channel_id: &str, quality: &str, sequence: u64) -> bool {
         self.entries
             .get(&(channel_id.to_owned(), quality.to_owned()))
-            .is_some_and(|sequences| sequences.contains(&sequence))
+            .is_some_and(|segments| segments.contains_key(&sequence))
     }
 
-    /// `channel_id` と `quality` を検証し、セグメントファイルのパスを返す
-    /// ファイルの存在は確認しない
-    pub fn path_for(
-        &self,
-        channel_id: &str,
-        quality: &str,
-        sequence: u64,
-    ) -> Result<PathBuf, EdamameError> {
-        validate_identifier("channel_id", channel_id)?;
-        validate_quality(quality)?;
-        Ok(self.path(channel_id, quality, sequence))
+    /// キャッシュしているセグメントファイルを返す
+    #[must_use]
+    pub fn get(&self, channel_id: &str, quality: &str, sequence: u64) -> Option<Vec<u8>> {
+        self.entries
+            .get(&(channel_id.to_owned(), quality.to_owned()))
+            .and_then(|segments| segments.get(&sequence))
+            .cloned()
     }
 
-    /// 索引に追加し、キャッシュ上限を超えた分のファイルのパスを返す
-    /// ファイルの削除は呼び出し側で行う
-    pub fn insert(
+    /// セグメントファイルを保存し、キャッシュ上限を超えた分を削除して削除した一覧を返す
+    pub fn put(
         &mut self,
         channel_id: &str,
         quality: &str,
         sequence: u64,
-    ) -> Result<Vec<PathBuf>, EdamameError> {
+        bytes: Vec<u8>,
+    ) -> Result<Vec<SegmentKey>, EdamameError> {
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
-        self.entries
-            .entry((channel_id.to_owned(), quality.to_owned()))
-            .or_default()
-            .insert(sequence);
-        Ok(self.remove_over_limit())
+        let pair = (channel_id.to_owned(), quality.to_owned());
+        let segments = self.entries.entry(pair).or_default();
+        segments.insert(sequence, bytes);
+        let mut removed = Vec::new();
+        while segments.len() > self.limit {
+            let Some((&oldest, _)) = segments.iter().next() else {
+                break;
+            };
+            segments.remove(&oldest);
+            removed.push(SegmentKey {
+                channel_id: channel_id.to_owned(),
+                quality: quality.to_owned(),
+                sequence: oldest,
+            });
+        }
+        Ok(removed)
     }
 
     /// 索引からセグメントを取り除く
-    /// ファイルの削除が必要な場合は呼び出し側で行う
     pub fn remove(&mut self, channel_id: &str, quality: &str, sequence: u64) {
-        let key = (channel_id.to_owned(), quality.to_owned());
-        if let Some(sequences) = self.entries.get_mut(&key) {
-            sequences.remove(&sequence);
-            if sequences.is_empty() {
-                self.entries.remove(&key);
+        let pair = (channel_id.to_owned(), quality.to_owned());
+        if let Some(segments) = self.entries.get_mut(&pair) {
+            segments.remove(&sequence);
+            if segments.is_empty() {
+                self.entries.remove(&pair);
             }
         }
     }
 
-    /// 索引から `(channel_id, quality)` のセグメントをすべて取り除き、ファイルのパスを返す
-    /// ファイルの削除は呼び出し側で行う
-    pub fn clear(&mut self, channel_id: &str, quality: &str) -> Vec<PathBuf> {
-        let Some(sequences) = self
-            .entries
-            .remove(&(channel_id.to_owned(), quality.to_owned()))
-        else {
-            return Vec::new();
-        };
-        sequences
-            .iter()
-            .map(|sequence| self.path(channel_id, quality, *sequence))
-            .collect()
+    /// 索引から `(channel_id, quality)` のセグメントをすべて取り除く
+    pub fn clear(&mut self, channel_id: &str, quality: &str) {
+        self.entries
+            .remove(&(channel_id.to_owned(), quality.to_owned()));
     }
 
-    /// 索引にあるセグメントをすべて取り除き、ファイルのパスを返す
-    /// ファイルの削除は呼び出し側で行う
-    pub fn clear_all(&mut self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for ((channel_id, quality), sequences) in &self.entries {
-            for sequence in sequences {
-                paths.push(self.path(channel_id, quality, *sequence));
-            }
-        }
+    /// 索引にあるセグメントをすべて取り除く
+    pub fn clear_all(&mut self) {
         self.entries.clear();
-        paths
     }
 
     /// sync に送るキャッシュ一覧を返す
     #[must_use]
     pub fn keys(&self) -> Vec<SegmentKey> {
         let mut keys = Vec::new();
-        for ((channel_id, quality), sequences) in &self.entries {
-            for sequence in sequences {
+        for ((channel_id, quality), segments) in &self.entries {
+            for sequence in segments.keys() {
                 keys.push(SegmentKey {
                     channel_id: channel_id.clone(),
                     quality: quality.clone(),
@@ -142,8 +111,8 @@ impl Cache {
     #[must_use]
     pub fn cached_ids(&self) -> BTreeSet<SegmentId> {
         let mut ids = BTreeSet::new();
-        for ((channel_id, quality), sequences) in &self.entries {
-            for sequence in sequences {
+        for ((channel_id, quality), segments) in &self.entries {
+            for sequence in segments.keys() {
                 ids.insert(SegmentId {
                     channel_id: channel_id.clone(),
                     quality: quality.clone(),
@@ -153,242 +122,83 @@ impl Cache {
         }
         ids
     }
-
-    async fn scan_dir(&mut self) -> Result<(), EdamameError> {
-        let mut channels = tokio::fs::read_dir(&self.dir)
-            .await
-            .map_err(|error| EdamameError::Internal(format!("read cache dir failed: {error}")))?;
-        while let Some(channel_entry) = channels
-            .next_entry()
-            .await
-            .map_err(|error| EdamameError::Internal(format!("read cache dir failed: {error}")))?
-        {
-            if !channel_entry
-                .file_type()
-                .await
-                .map_err(|error| EdamameError::Internal(format!("read file type failed: {error}")))?
-                .is_dir()
-            {
-                continue;
-            }
-            let Some(channel_id) = channel_entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if validate_identifier("channel_id", &channel_id).is_err() {
-                continue;
-            }
-            let mut qualities =
-                tokio::fs::read_dir(channel_entry.path())
-                    .await
-                    .map_err(|error| {
-                        EdamameError::Internal(format!("read quality dir failed: {error}"))
-                    })?;
-            while let Some(quality_entry) = qualities.next_entry().await.map_err(|error| {
-                EdamameError::Internal(format!("read quality dir failed: {error}"))
-            })? {
-                if !quality_entry
-                    .file_type()
-                    .await
-                    .map_err(|error| {
-                        EdamameError::Internal(format!("read file type failed: {error}"))
-                    })?
-                    .is_dir()
-                {
-                    continue;
-                }
-                let Some(quality) = quality_entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if validate_quality(&quality).is_err() {
-                    continue;
-                }
-                let mut files =
-                    tokio::fs::read_dir(quality_entry.path())
-                        .await
-                        .map_err(|error| {
-                            EdamameError::Internal(format!("read cache file dir failed: {error}"))
-                        })?;
-                while let Some(file_entry) = files.next_entry().await.map_err(|error| {
-                    EdamameError::Internal(format!("read cache file dir failed: {error}"))
-                })? {
-                    if !file_entry
-                        .file_type()
-                        .await
-                        .map_err(|error| {
-                            EdamameError::Internal(format!("read file type failed: {error}"))
-                        })?
-                        .is_file()
-                    {
-                        continue;
-                    }
-                    let Some(filename) = file_entry.file_name().to_str().map(str::to_owned) else {
-                        continue;
-                    };
-                    let Ok(sequence) = parse_sequence_filename(&filename) else {
-                        continue;
-                    };
-                    self.entries
-                        .entry((channel_id.clone(), quality.clone()))
-                        .or_default()
-                        .insert(sequence);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// キャッシュ上限を超えた分のセグメントを索引から外し、ファイルのパスを返す
-    /// ファイルの削除は呼び出し側で行う
-    fn remove_over_limit(&mut self) -> Vec<PathBuf> {
-        let dir = self.dir.clone();
-        let limit = self.limit;
-        let mut over_limit = Vec::new();
-        for ((channel_id, quality), sequences) in &mut self.entries {
-            while sequences.len() > limit {
-                let Some(sequence) = sequences.pop_first() else {
-                    break;
-                };
-                over_limit.push(
-                    dir.join(channel_id)
-                        .join(quality)
-                        .join(render_filename(sequence)),
-                );
-            }
-        }
-        over_limit
-    }
-
-    fn path(&self, channel_id: &str, quality: &str, sequence: u64) -> PathBuf {
-        self.dir
-            .join(channel_id)
-            .join(quality)
-            .join(render_filename(sequence))
-    }
-}
-
-/// 一時ファイルに書いてから rename する
-pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EdamameError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| EdamameError::Internal("cache path has no parent".to_owned()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|error| EdamameError::Internal(format!("create cache dir failed: {error}")))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("segment");
-    let temp_path = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(error) = tokio::fs::write(&temp_path, bytes).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(EdamameError::Internal(format!(
-            "write cached segment failed: {error}"
-        )));
-    }
-    if let Err(error) = tokio::fs::rename(&temp_path, path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(EdamameError::Internal(format!(
-            "commit cached segment failed: {error}"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "edamame-worker-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        path
+    fn cache(limit: u64) -> Cache {
+        Cache::new(limit).unwrap()
     }
 
-    async fn store(
-        cache: &mut Cache,
-        channel_id: &str,
-        quality: &str,
-        sequence: u64,
-        bytes: &[u8],
-    ) {
-        let path = cache.path_for(channel_id, quality, sequence).unwrap();
-        write_atomic(&path, bytes).await.unwrap();
-        for path in cache.insert(channel_id, quality, sequence).unwrap() {
-            let _ = tokio::fs::remove_file(path).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn scans_valid_files_and_ignores_others() {
-        let dir = temp_dir("scan");
-        std::fs::create_dir_all(dir.join("live/720p")).unwrap();
-        std::fs::write(dir.join("live/720p/101.ts"), b"101").unwrap();
-        std::fs::write(dir.join("live/720p/102.ts"), b"102").unwrap();
-        std::fs::write(dir.join("live/720p/notes.txt"), b"notes").unwrap();
-        std::fs::write(dir.join("live/720p/001.ts"), b"old").unwrap();
-        let cache = Cache::scan(dir.clone(), 12).await.unwrap();
+    #[test]
+    fn stores_and_reads_segments() {
+        let mut cache = cache(12);
+        cache
+            .put("live", "720p", 101, b"segment-101".to_vec())
+            .unwrap();
         assert!(cache.contains("live", "720p", 101));
-        assert!(cache.contains("live", "720p", 102));
-        assert!(dir.join("live/720p/notes.txt").exists());
-        assert!(dir.join("live/720p/001.ts").exists());
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(cache.get("live", "720p", 101).unwrap(), b"segment-101");
+        assert!(!cache.contains("live", "720p", 102));
+        assert!(cache.get("live", "720p", 102).is_none());
     }
 
-    #[tokio::test]
-    async fn removes_oldest_files_beyond_limit() {
-        let dir = temp_dir("over-limit");
-        let mut cache = Cache::scan(dir.clone(), 2).await.unwrap();
+    #[test]
+    fn removes_oldest_segments_beyond_limit() {
+        let mut cache = cache(2);
         for sequence in [101, 102, 103] {
-            store(
-                &mut cache,
-                "live",
-                "720p",
-                sequence,
-                format!("{sequence}").as_bytes(),
-            )
-            .await;
+            cache
+                .put("live", "720p", sequence, format!("{sequence}").into_bytes())
+                .unwrap();
         }
         assert!(!cache.contains("live", "720p", 101));
         assert!(cache.contains("live", "720p", 102));
         assert!(cache.contains("live", "720p", 103));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
-    async fn remove_deletes_index_entry() {
-        let dir = temp_dir("remove");
-        let mut cache = Cache::scan(dir.clone(), 2).await.unwrap();
-        cache.insert("live", "720p", 101).unwrap();
+    #[test]
+    fn reports_segment_removed_by_its_own_insert() {
+        let mut cache = cache(2);
+        cache.put("live", "720p", 102, b"102".to_vec()).unwrap();
+        cache.put("live", "720p", 103, b"103".to_vec()).unwrap();
+        // 上限まで埋まった状態で古い番号を入れると、入れたセグメント自身が削除される
+        let removed = cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].sequence, 101);
+        assert!(!cache.contains("live", "720p", 101));
+    }
+
+    #[test]
+    fn remove_deletes_index_entry() {
+        let mut cache = cache(2);
+        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
         assert!(cache.contains("live", "720p", 101));
         cache.remove("live", "720p", 101);
         assert!(!cache.contains("live", "720p", 101));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[tokio::test]
-    async fn clear_removes_group_entries() {
-        let dir = temp_dir("clear");
-        let mut cache = Cache::scan(dir.clone(), 12).await.unwrap();
-        cache.insert("live", "720p", 101).unwrap();
-        cache.insert("live", "720p", 102).unwrap();
-        cache.insert("live", "1080p", 101).unwrap();
-        let cleared = cache.clear("live", "720p");
-        assert_eq!(cleared.len(), 2);
+    #[test]
+    fn clear_removes_group_entries() {
+        let mut cache = cache(12);
+        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
+        cache.put("live", "720p", 102, b"102".to_vec()).unwrap();
+        cache.put("live", "1080p", 101, b"101".to_vec()).unwrap();
+        cache.clear("live", "720p");
         assert!(!cache.contains("live", "720p", 101));
         assert!(!cache.contains("live", "720p", 102));
         assert!(cache.contains("live", "1080p", 101));
-        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn keys_and_cached_ids_list_all_segments() {
+        let mut cache = cache(12);
+        cache.put("live", "720p", 101, b"101".to_vec()).unwrap();
+        cache.put("live", "1080p", 101, b"101".to_vec()).unwrap();
+        assert_eq!(cache.keys().len(), 2);
+        assert_eq!(cache.cached_ids().len(), 2);
+        cache.clear_all();
+        assert!(cache.keys().is_empty());
+        assert!(cache.cached_ids().is_empty());
     }
 }

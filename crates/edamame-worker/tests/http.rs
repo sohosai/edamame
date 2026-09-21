@@ -1,35 +1,22 @@
 //! worker の HTTP 配信を実サーバーで確認する
 
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router};
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "edamame-worker-http-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
-}
-
-fn write_segment(dir: &Path, channel_id: &str, quality: &str, sequence: u64, bytes: &[u8]) {
-    let path = dir.join(channel_id).join(quality);
-    std::fs::create_dir_all(&path).unwrap();
-    std::fs::write(path.join(format!("{sequence}.ts")), bytes).unwrap();
+/// テストで使うセグメントを入れたキャッシュを作る
+fn cache_with(segments: &[(&str, &str, u64, &[u8])]) -> Cache {
+    let mut cache = Cache::new(12).unwrap();
+    for (channel_id, quality, sequence, bytes) in segments {
+        cache
+            .put(channel_id, quality, *sequence, bytes.to_vec())
+            .unwrap();
+    }
+    cache
 }
 
 #[tokio::test]
 async fn serves_segments_under_public_url_path_prefix() {
-    let dir = temp_dir("prefix");
-    write_segment(&dir, "live", "720p", 101, b"segment-101");
-    let cache = Cache::scan(dir.clone(), 12).await.unwrap();
+    let cache = cache_with(&[("live", "720p", 101, b"segment-101")]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = WorkerState::new(
@@ -58,14 +45,11 @@ async fn serves_segments_under_public_url_path_prefix() {
         .await
         .unwrap();
     assert_eq!(root.status().as_u16(), 404);
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
-async fn missing_file_removes_index_entry() {
-    let dir = temp_dir("missing");
-    write_segment(&dir, "live", "720p", 101, b"segment-101");
-    let cache = Cache::scan(dir.clone(), 12).await.unwrap();
+async fn missing_segment_returns_404() {
+    let cache = cache_with(&[("live", "720p", 101, b"segment-101")]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = WorkerState::new(
@@ -76,62 +60,23 @@ async fn missing_file_removes_index_entry() {
         cache,
     )
     .unwrap();
-    let app = router(state.clone(), &CorsOrigins::Disabled);
+    let app = router(state, &CorsOrigins::Disabled);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    std::fs::remove_file(dir.join("live/720p/101.ts")).unwrap();
     let response = reqwest::Client::new()
-        .get(format!("http://{addr}/segments/live/720p/101.ts"))
+        .get(format!("http://{addr}/segments/live/720p/102.ts"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status().as_u16(), 404);
-    let cache = state.cache.lock().await;
-    assert!(!cache.contains("live", "720p", 101));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn unreadable_file_removes_index_entry() {
-    let dir = temp_dir("unreadable");
-    write_segment(&dir, "live", "720p", 101, b"segment-101");
-    let cache = Cache::scan(dir.clone(), 12).await.unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let state = WorkerState::new(
-        "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
-        format!("http://{addr}"),
-        1,
-        cache,
-    )
-    .unwrap();
-    let app = router(state.clone(), &CorsOrigins::Disabled);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    // ファイルの欠落以外の読み取りエラーを起こすため、ディレクトリに置き換える
-    std::fs::remove_file(dir.join("live/720p/101.ts")).unwrap();
-    std::fs::create_dir(dir.join("live/720p/101.ts")).unwrap();
-    let response = reqwest::Client::new()
-        .get(format!("http://{addr}/segments/live/720p/101.ts"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status().as_u16(), 500);
-    let cache = state.cache.lock().await;
-    assert!(!cache.contains("live", "720p", 101));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// パスの接頭辞にある axum 7 の記法に似た文字も、URL の一部として扱う
 #[tokio::test]
 async fn serves_segments_under_path_prefix_with_route_characters() {
     for path in ["/foo/:tenant", "/foo/*", "/foo{bar}"] {
-        let dir = temp_dir("route-characters");
-        write_segment(&dir, "live", "720p", 101, b"segment-101");
-        let cache = Cache::scan(dir.clone(), 12).await.unwrap();
+        let cache = cache_with(&[("live", "720p", 101, b"segment-101")]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = WorkerState::new(
@@ -157,6 +102,5 @@ async fn serves_segments_under_path_prefix_with_route_characters() {
             .unwrap();
         assert_eq!(response.status().as_u16(), 200, "path prefix: {path}");
         assert_eq!(response.bytes().await.unwrap().as_ref(), b"segment-101");
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -79,7 +79,7 @@ controller の起動例を示す。
 ```bash
 edamame-controller \
   --bind 0.0.0.0:9000 \
-  --storage-dir /var/lib/edamame/controller \
+  --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \

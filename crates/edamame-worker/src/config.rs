@@ -1,7 +1,6 @@
 //! worker の CLI 設定
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use clap::Parser;
 use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token, validate_identifier};
@@ -25,10 +24,6 @@ pub struct WorkerConfig {
     /// controller の接続先。http の絶対 URL のみ許可する
     #[arg(long, env = "EDAMAME_CONTROLLER_URL")]
     pub controller_url: String,
-
-    /// セグメントファイルをキャッシュするディレクトリ
-    #[arg(long, env = "EDAMAME_CACHE_DIR")]
-    pub cache_dir: PathBuf,
 
     /// (channel_id, quality) ごとのキャッシュ上限
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
@@ -88,7 +83,6 @@ mod tests {
             bind: "127.0.0.1:9001".parse().unwrap(),
             public_url: "http://127.0.0.1:9001".to_owned(),
             controller_url: "http://127.0.0.1:9000".to_owned(),
-            cache_dir: PathBuf::from(".edamame/worker-a"),
             cache_limit: 12,
             weight: 1,
             auth_token: None,
@@ -177,12 +171,11 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 8);
         assert_eq!(names["worker_id"], "EDAMAME_WORKER_ID");
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
         assert_eq!(names["controller_url"], "EDAMAME_CONTROLLER_URL");
-        assert_eq!(names["cache_dir"], "EDAMAME_CACHE_DIR");
         assert_eq!(names["cache_limit"], "EDAMAME_CACHE_LIMIT");
         assert_eq!(names["weight"], "EDAMAME_WEIGHT");
         assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");

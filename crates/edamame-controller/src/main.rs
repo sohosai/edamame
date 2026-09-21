@@ -27,8 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --cors-origin is not specified; cross-origin browser access is disabled"
         );
     }
-    tokio::fs::create_dir_all(&config.storage_dir).await?;
-    let store = CanonicalStore::new(config.storage_dir.clone());
+    let store = CanonicalStore::new(config.storage_capacity);
     let state = ControllerState::new(
         store,
         config.playlist_segments,

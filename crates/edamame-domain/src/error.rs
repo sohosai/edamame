@@ -11,6 +11,8 @@ pub enum EdamameError {
     NotFound(String),
     /// 既存のデータと競合する (409)
     Conflict(String),
+    /// 送られたデータが大きすぎる (413)
+    PayloadTooLarge(String),
     /// プレイリストを生成できない (422)
     Unprocessable(String),
     /// 配信できる worker がない (503)
@@ -27,6 +29,7 @@ impl EdamameError {
             Self::BadRequest(_) => 400,
             Self::NotFound(_) => 404,
             Self::Conflict(_) => 409,
+            Self::PayloadTooLarge(_) => 413,
             Self::Unprocessable(_) => 422,
             Self::Unavailable(_) => 503,
             Self::Internal(_) => 500,
@@ -40,6 +43,7 @@ impl EdamameError {
             Self::BadRequest(message)
             | Self::NotFound(message)
             | Self::Conflict(message)
+            | Self::PayloadTooLarge(message)
             | Self::Unprocessable(message)
             | Self::Unavailable(message)
             | Self::Internal(message) => message,

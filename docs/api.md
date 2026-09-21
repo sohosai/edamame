@@ -71,7 +71,6 @@ controller は新しい識別子に channel ごとの連番を割り当てる。
 連番は起動するたびに 0 から始める。
 同じ channel では、同じ識別子には quality が違っても同じ番号を割り当てる。
 同じ識別子の再 PUT には、割り当て済みの番号を返す。
-新しい識別子に割り当てた番号のセグメントファイルがすでにある場合（前の起動のファイルが残っている場合など）は、そのファイルを上書きする。
 
 ステータス：
 
@@ -79,8 +78,9 @@ controller は新しい識別子に channel ごとの連番を割り当てる。
 - `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
 - `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
 - `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution`、`key_uri`、`iv` の形式が不正、`iv` を `key_uri` なしで指定した、または `duration_ms` が 500 未満
-- `409 Conflict`：同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
-- `500 Internal Server Error`：セグメント番号の上限に達した、またはディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
+- `409 Conflict`：保存されている同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
+- `413 Payload Too Large`：セグメントファイルが `--storage-capacity` より大きい
+- `500 Internal Server Error`：セグメント番号の上限に達した
 
 同じセグメントファイルの再 PUT では、`duration_ms` がすでに決まっている値と違う場合も 409 とする。
 `resolution` は省略できる。
@@ -93,9 +93,9 @@ controller は新しい識別子に channel ごとの連番を割り当てる。
 基準値は `duration_ms` を秒に直し、小数点以下を切り上げた整数（最低 1）とする。
 2 つ目以降の PUT で違う `duration_ms` を指定した場合は 409 とする。
 
-controller を再起動すると識別子とセグメント番号の対応は失われ、セグメント番号は 0 から始まる。
+controller を再起動すると保存済みのセグメントファイルと識別子とセグメント番号の対応は失われ、セグメント番号は 0 から始まる。
 再起動後に同じ識別子を PUT すると、新しい番号を割り当てて保存する。
-前の起動で保存したセグメントファイルは削除せず、新しいセグメントと番号が重なった時点で上書きする。
+容量超過で削除された識別子も、別の quality に同じ識別子が保存されていなければ、再 PUT には新しい番号を割り当てる。
 
 ### channel の外部配信を登録する
 
@@ -145,8 +145,8 @@ GET /segments/{channel_id}/{quality}/{filename}
 ```
 
 worker が正規セグメントファイルを取得するときに使う。
-controller は `storage_dir` のファイルを返す。
-メタデータがないセグメントファイルでも、ファイルが存在すれば 200 を返す。
+controller はメモリに保存しているセグメントファイルを返す。
+容量を超えて削除されたセグメントファイルと、controller の再起動で失われたセグメントファイルは 404 になる。
 
 ステータス：
 
@@ -275,9 +275,10 @@ POST /workers/{worker_id}/sync
 worker は登録時に受け取った `sync_interval_ms` の間隔でこのエンドポイントを呼ぶ。
 リクエストのキャッシュ一覧（`cached_segments`）には、その時点でキャッシュしているセグメントファイルをすべて入れる。
 取得中の一覧（`fetching_segments`）には、その時点で取得しているセグメントを入れる。
-controller は取得中のセグメントの暗号化の指定も、公開に使う可能性がある間は保持する。
+controller は同じセグメント番号に別のバイト列で保存し直したとき、この一覧とキャッシュ一覧を使って、古い内容を保持する worker に再取得を指示する。
 controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
 `fetch_segments` には、キャッシュ対象のうちキャッシュ一覧に含まれないセグメント（未キャッシュのセグメント）を入れる。
+同じセグメント番号に別のバイト列で保存し直したセグメントも `fetch_segments` に入る。worker は取得し直してキャッシュを上書きする。
 ここでキャッシュ対象とは、全 channel と全 quality の直近のセグメントの範囲に存在するセグメントの集合である。
 `fetch_segments` の各項目は `channel_id`、`quality`、`sequence` を持ち、worker は `{sequence}.ts` を取得する。
 controller は最初の未公開セグメントファイルを PUT した時刻から、`--publish-wait-ms` で指定した時間を公開待ちとする。

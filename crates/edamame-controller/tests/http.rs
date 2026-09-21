@@ -7,9 +7,10 @@ use std::time::Duration;
 use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
 use support::{
-    TempDir, spawn_controller, spawn_controller_with_auth, spawn_controller_with_cors,
-    spawn_controller_with_external_percent, spawn_controller_with_publish_wait, spawn_worker,
-    spawn_worker_with_auth, spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
+    DEFAULT_STORAGE_CAPACITY_BYTES, TempDir, spawn_controller, spawn_controller_with_auth,
+    spawn_controller_with_cors, spawn_controller_with_external_percent,
+    spawn_controller_with_publish_wait, spawn_worker, spawn_worker_with_auth,
+    spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
     wait_for_playlist_contains, wait_for_segment,
 };
 
@@ -239,11 +240,11 @@ async fn sync_worker(
     worker_id: &str,
     cached_segments: Vec<Value>,
 ) -> reqwest::Response {
-    sync_worker_with(client, base_url, worker_id, cached_segments, Vec::new()).await
+    sync_worker_with_fetching(client, base_url, worker_id, cached_segments, Vec::new()).await
 }
 
 /// 取得中のセグメントも付けて sync する
-async fn sync_worker_with(
+async fn sync_worker_with_fetching(
     client: &reqwest::Client,
     base_url: &str,
     worker_id: &str,
@@ -263,8 +264,9 @@ async fn sync_worker_with(
 
 #[tokio::test]
 async fn segment_put_get_contract() {
-    let tmp = TempDir::new("segment-contract");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("segment-contract");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
 
@@ -350,9 +352,9 @@ async fn segment_put_get_contract() {
 /// 同じセグメントファイルへの同時 PUT は、先に保存したバイト列を上書きしない
 #[tokio::test]
 async fn concurrent_put_keeps_first_bytes() {
-    let tmp = TempDir::new("concurrent-put");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("concurrent-put");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let url = format!(
         "{}/segments/live/720p/segment-a?duration_ms=6000&bandwidth=3000000&resolution=1280x720",
@@ -370,7 +372,12 @@ async fn concurrent_put_keeps_first_bytes() {
     statuses.sort_unstable();
     assert_eq!(statuses, [201, 409]);
     // 保存されたバイト列が、201 を返した側のバイト列であることを確認する
-    let stored = tokio::fs::read(storage.join("live/720p/0.ts"))
+    let stored = client
+        .get(format!("{}/segments/live/720p/0.ts", controller.base_url))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
         .await
         .unwrap();
     let expected = if first_status == 201 {
@@ -378,15 +385,15 @@ async fn concurrent_put_keeps_first_bytes() {
     } else {
         &second_body
     };
-    assert_eq!(&stored, expected);
+    assert_eq!(stored.as_ref(), expected.as_slice());
 }
 
-/// 属性が競合する同時 PUT は、メタデータを確立できなかった側のファイルを残さない
+/// 属性が競合する同時 PUT は、メタデータを確立できなかった側のセグメントを残さない
 #[tokio::test]
-async fn concurrent_attribute_conflict_leaves_no_file() {
-    let tmp = TempDir::new("concurrent-attributes");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+async fn concurrent_attribute_conflict_leaves_no_other_segment() {
+    let _tmp = TempDir::new("concurrent-attributes");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let first_url =
@@ -402,22 +409,29 @@ async fn concurrent_attribute_conflict_leaves_no_file() {
     let mut statuses = [first_status, second_status];
     statuses.sort_unstable();
     assert_eq!(statuses, [201, 409]);
-    // 409 になった側のファイルを残すと、正しいバイト列のセグメントファイルを登録できなくなる
-    assert!(storage.join("live/720p/0.ts").exists());
-    assert!(!storage.join("live/720p/1.ts").exists());
+    // 409 になった側のセグメントを残すと、正しいバイト列のセグメントファイルを登録できなくなる
+    let winning = client
+        .get(format!("{base}/segments/live/720p/0.ts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(winning.status().as_u16(), 200);
+    let missing = client
+        .get(format!("{base}/segments/live/720p/1.ts"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status().as_u16(), 404);
 }
 
-/// 保存に失敗した PUT は、channel の属性とセグメント番号を確定しない
+/// 保存容量を超える PUT は保存せず、channel の属性とセグメント番号を確定しない
 #[tokio::test]
-async fn failed_write_does_not_establish_metadata() {
-    let tmp = TempDir::new("failed-write");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+async fn oversized_put_does_not_establish_metadata() {
+    let _tmp = TempDir::new("oversized-put");
+    // 保存容量を 8 byte にして、18 byte のセグメントを拒否させる
+    let controller = spawn_controller(any_addr(), 8, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
-    // quality のディレクトリの位置にファイルを置き、セグメントファイルの保存を失敗させる
-    std::fs::create_dir_all(storage.join("live")).unwrap();
-    std::fs::write(storage.join("live/720p"), b"block").unwrap();
     let failed = client
         .put(format!(
             "{base}/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000"
@@ -426,15 +440,14 @@ async fn failed_write_does_not_establish_metadata() {
         .send()
         .await
         .unwrap();
-    assert_eq!(failed.status().as_u16(), 500);
+    assert_eq!(failed.status().as_u16(), 413);
 
     // 失敗した PUT は属性も番号も確定しないため、違う duration_ms の再 PUT が 0 番として成功する
-    std::fs::remove_file(storage.join("live/720p")).unwrap();
     let retried = client
         .put(format!(
             "{base}/segments/live/720p/segment-1?duration_ms=7000&bandwidth=3000000"
         ))
-        .body("segment-720p-segment-1")
+        .body("small")
         .send()
         .await
         .unwrap();
@@ -445,8 +458,9 @@ async fn failed_write_does_not_establish_metadata() {
 
 #[tokio::test]
 async fn segment_validation_and_conflicts() {
-    let tmp = TempDir::new("segment-conflicts");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("segment-conflicts");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     assert_eq!(publish_segment(&client, base, "720p", "seg-0").await, 0);
@@ -504,9 +518,9 @@ async fn segment_validation_and_conflicts() {
 
 #[tokio::test]
 async fn invalid_identifiers_are_rejected() {
-    let tmp = TempDir::new("traversal");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage, 6, 1000, 10000).await;
+    let _tmp = TempDir::new("traversal");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let encoded_space = client
@@ -527,7 +541,8 @@ async fn invalid_identifiers_are_rejected() {
         .await
         .unwrap();
     assert_eq!(encoded_backslash.status().as_u16(), 400);
-    assert!(!tmp.path.join("root").exists());
+    // 識別子の検証に失敗した PUT はセグメントを保存しない
+    assert_eq!(controller.state.store.used_bytes(), 0);
     // 識別子に使えるのは [A-Za-z0-9_-] だけとする
     let dot = client
         .put(format!(
@@ -589,8 +604,9 @@ async fn selected_worker(client: &reqwest::Client, base_url: &str) -> &'static s
 /// 重みの比に従ってプレイリストの worker を選ぶ
 #[tokio::test]
 async fn playlist_selects_workers_by_weight() {
-    let tmp = TempDir::new("weight");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("weight");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -612,8 +628,9 @@ async fn playlist_selects_workers_by_weight() {
 /// 重みを変えたら前の周期を引き継がず、新しい比で選び直す
 #[tokio::test]
 async fn weight_change_resets_selection_cycle() {
-    let tmp = TempDir::new("weight-change");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("weight-change");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -644,8 +661,9 @@ async fn weight_change_resets_selection_cycle() {
 /// 重みが不正な登録は 400 にする
 #[tokio::test]
 async fn worker_registration_rejects_invalid_weight() {
-    let tmp = TempDir::new("weight-invalid");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("weight-invalid");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let zero = register_worker(&client, base, "worker-a", "http://worker.test", 0).await;
@@ -665,17 +683,10 @@ async fn worker_registration_rejects_invalid_weight() {
 /// worker は設定した重みを登録で報告する
 #[tokio::test]
 async fn worker_registers_configured_weight() {
-    let tmp = TempDir::new("worker-weight");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
-    let _worker = spawn_worker_with_weight(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-        4,
-    )
-    .await;
+    let _tmp = TempDir::new("worker-weight");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
+    let _worker = spawn_worker_with_weight("worker-a", &controller.base_url, 12, true, 4).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         {
@@ -695,8 +706,9 @@ async fn worker_registers_configured_weight() {
 
 #[tokio::test]
 async fn playlist_contract_with_ready_worker() {
-    let tmp = TempDir::new("playlist");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("playlist");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -748,8 +760,9 @@ async fn playlist_contract_with_ready_worker() {
 
 #[tokio::test]
 async fn playlist_gap_from_missing_quality_segment_is_filled() {
-    let tmp = TempDir::new("gap");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("gap");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..3).await;
@@ -800,8 +813,9 @@ async fn playlist_gap_from_missing_quality_segment_is_filled() {
 /// 同じ識別子を複数 quality に PUT すると同じ番号になり、マスタープレイリストを生成できる
 #[tokio::test]
 async fn master_playlist_aligns_qualities_by_identifier() {
-    let tmp = TempDir::new("master-align");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("master-align");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     // quality ごとに PUT する順序を入れ替えても、同じ識別子には同じ番号を割り当てる
@@ -862,8 +876,9 @@ async fn master_playlist_aligns_qualities_by_identifier() {
 /// 公開予定時刻を過ぎたら、sync で報告された新しいセグメントをすぐ反映する
 #[tokio::test]
 async fn media_playlist_reflects_new_segment() {
-    let tmp = TempDir::new("no-stale");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("no-stale");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -896,8 +911,9 @@ async fn media_playlist_reflects_new_segment() {
 /// セグメント PUT で指定した暗号鍵の URI はメディアプレイリストに反映され、省略して再 PUT すると取り除かれる
 #[tokio::test]
 async fn key_uri_is_reflected_in_media_playlist() {
-    let tmp = TempDir::new("key-uri");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("key-uri");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let key = "https://keys.test/live/a";
@@ -942,8 +958,9 @@ async fn key_uri_is_reflected_in_media_playlist() {
 /// 鍵 URI は絶対 http URL だけを受け付ける
 #[tokio::test]
 async fn key_uri_validation_rejects_invalid_urls() {
-    let tmp = TempDir::new("key-uri-invalid");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("key-uri-invalid");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     for (index, key_uri) in [
@@ -985,8 +1002,9 @@ async fn key_uri_validation_rejects_invalid_urls() {
 /// IV は暗号鍵の URI と組でメディアプレイリストに出る
 #[tokio::test]
 async fn iv_is_reflected_in_media_playlist() {
-    let tmp = TempDir::new("iv");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("iv");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let key = "https://keys.test/live/a";
@@ -1036,11 +1054,12 @@ async fn iv_is_reflected_in_media_playlist() {
     )));
 }
 
-/// 取得の指示は、取得が終わらないまま次の sync が来ても残す
+/// 公開範囲が古い範囲へ戻っても、保存されているセグメントの暗号化の指定を残す
 #[tokio::test]
-async fn keeps_encryption_of_segments_told_to_fetch() {
-    let tmp = TempDir::new("fetching-encryption");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+async fn keeps_encryption_of_stored_segments() {
+    let _tmp = TempDir::new("stored-encryption");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let key = "https://keys.test/live/a";
@@ -1056,27 +1075,8 @@ async fn keeps_encryption_of_segments_told_to_fetch() {
         .unwrap();
     assert_eq!(sync_body["fetch_segments"].as_array().unwrap().len(), 6);
 
-    // 取得が終わらないまま、取得中の一覧を付けて再度 sync する
-    publish_encrypted_series(&client, base, "720p", key, iv, 6..12).await;
-    let sync_body: Value = sync_worker_with(
-        &client,
-        base,
-        "worker-a",
-        cached("720p", []),
-        cached("720p", first.clone()),
-    )
-    .await
-    .json()
-    .await
-    .unwrap();
-    assert_eq!(
-        sync_body["fetch_segments"].as_array().unwrap().len(),
-        6,
-        "取得一覧は今回の不足分だけにする: {sync_body}"
-    );
-
-    // 取得中の一覧が残ったまま、メタデータに残る範囲から外れるまで追加する
-    publish_encrypted_series(&client, base, "720p", key, iv, 12..18).await;
+    // メタデータの window から外れるまで追加する
+    publish_encrypted_series(&client, base, "720p", key, iv, 6..18).await;
 
     // 最初の 6 セグメントだけを報告すると、公開範囲はその古い範囲へ戻る
     sync_worker(&client, base, "worker-a", cached("720p", first)).await;
@@ -1091,15 +1091,16 @@ async fn keeps_encryption_of_segments_told_to_fetch() {
     assert_eq!(
         body.matches("#EXT-X-KEY").count(),
         6,
-        "取得を指示したセグメントの暗号化の指定が失われている: {body}"
+        "window から外れたセグメントの暗号化の指定が失われている: {body}"
     );
 }
 
 /// IV は暗号鍵の URI があるときだけ受け付ける
 #[tokio::test]
 async fn iv_requires_key_uri() {
-    let tmp = TempDir::new("iv-without-key");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("iv-without-key");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let response = client
@@ -1123,8 +1124,9 @@ async fn iv_requires_key_uri() {
 /// IV は 16 byte を表す 32 文字の hex だけを受け付ける
 #[tokio::test]
 async fn iv_validation_rejects_invalid_values() {
-    let tmp = TempDir::new("iv-invalid");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("iv-invalid");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let key = "https://keys.test/live/a";
@@ -1157,10 +1159,10 @@ async fn iv_validation_rejects_invalid_values() {
 /// 公開待ちの間は前の範囲を返し、待ち時間が過ぎたら追いついた worker に合わせて公開範囲を進める
 #[tokio::test]
 async fn publish_wait_keeps_previous_playlist_until_worker_catches_up() {
-    let tmp = TempDir::new("publish-wait");
+    let _tmp = TempDir::new("publish-wait");
     let controller = spawn_controller_with_publish_wait(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         1000,
         10000,
@@ -1239,10 +1241,10 @@ async fn publish_wait_keeps_previous_playlist_until_worker_catches_up() {
 /// 期限切れの公開待ちの後に PUT されたセグメントは、新しい公開待ちになる
 #[tokio::test]
 async fn starts_new_publish_wait_after_expired_batch() {
-    let tmp = TempDir::new("expired-wait");
+    let _tmp = TempDir::new("expired-wait");
     let controller = spawn_controller_with_publish_wait(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         1000,
         10000,
@@ -1287,10 +1289,10 @@ async fn starts_new_publish_wait_after_expired_batch() {
 /// prune 済みのセグメントを同じバイト列で再 PUT しても、新しい公開待ちは始めない
 #[tokio::test]
 async fn reput_pruned_segment_does_not_start_wait() {
-    let tmp = TempDir::new("reput-pruned");
+    let _tmp = TempDir::new("reput-pruned");
     let controller = spawn_controller_with_publish_wait(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         1000,
         10000,
@@ -1341,8 +1343,9 @@ async fn reput_pruned_segment_does_not_start_wait() {
 /// 新しい quality は worker が公開範囲を取り込むまでマスタープレイリストに追加しない
 #[tokio::test]
 async fn master_playlist_excludes_quality_until_published() {
-    let tmp = TempDir::new("master-wait");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("master-wait");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -1408,8 +1411,9 @@ async fn master_playlist_excludes_quality_until_published() {
 /// 公開範囲を持たない worker は使わず、後から追いついた worker は配信先に復帰する
 #[tokio::test]
 async fn uses_only_worker_that_has_published_range() {
-    let tmp = TempDir::new("worker-published");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("worker-published");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -1442,8 +1446,9 @@ async fn uses_only_worker_that_has_published_range() {
 /// quality ごとに別の worker が公開範囲を配信できる
 #[tokio::test]
 async fn keeps_serving_when_qualities_advance_at_different_times() {
-    let tmp = TempDir::new("quality-workers");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("quality-workers");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let initial_720p = publish_series(&client, base, "720p", 0..6).await;
@@ -1491,10 +1496,10 @@ async fn keeps_serving_when_qualities_advance_at_different_times() {
 /// 古い公開範囲を追い出したら、sync で既公開範囲へフォールバックする
 #[tokio::test]
 async fn publishes_when_worker_evicted_previous_range() {
-    let tmp = TempDir::new("evicted-published");
+    let _tmp = TempDir::new("evicted-published");
     let controller = spawn_controller_with_publish_wait(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         1000,
         10000,
@@ -1560,10 +1565,10 @@ async fn publishes_when_worker_evicted_previous_range() {
 /// 最新側に欠落があっても、待ち時間後の sync で最新の連続範囲へ進める
 #[tokio::test]
 async fn publishes_connectable_range_when_latest_has_a_gap() {
-    let tmp = TempDir::new("connectable-gap");
+    let _tmp = TempDir::new("connectable-gap");
     let controller = spawn_controller_with_publish_wait(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         1000,
         10000,
@@ -1621,8 +1626,9 @@ async fn publishes_connectable_range_when_latest_has_a_gap() {
 /// 公開先頭より古い範囲しか配信できない場合、media sequence は後退する
 #[tokio::test]
 async fn allows_media_sequence_to_move_backwards() {
-    let tmp = TempDir::new("media-sequence");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("media-sequence");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
@@ -1653,8 +1659,9 @@ async fn allows_media_sequence_to_move_backwards() {
 /// 直近のセグメントの範囲より古いセグメントを取得できなかった worker でも、保持している最新範囲で配信を再開できる
 #[tokio::test]
 async fn recovers_when_worker_is_farther_behind_than_the_window() {
-    let tmp = TempDir::new("recovery");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("recovery");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
@@ -1686,8 +1693,9 @@ async fn recovers_when_worker_is_farther_behind_than_the_window() {
 /// quality ごとに異なる範囲を、それぞれ別の worker から配信できる
 #[tokio::test]
 async fn qualities_publish_different_ranges_with_different_workers() {
-    let tmp = TempDir::new("per-quality-ranges");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("per-quality-ranges");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     // 720p は 0..8、480p は同じ識別子で 0..5 まで PUT する
@@ -1725,10 +1733,10 @@ async fn qualities_publish_different_ranges_with_different_workers() {
 }
 
 #[tokio::test]
-async fn file_deleted_in_range_returns_422() {
-    let tmp = TempDir::new("deleted");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+async fn removed_segment_in_range_returns_422() {
+    let _tmp = TempDir::new("removed");
+    // セグメントは 18 byte なので、容量 144 では直近の 8 つだけを保存する
+    let controller = spawn_controller(any_addr(), 144, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -1744,7 +1752,16 @@ async fn file_deleted_in_range_returns_422() {
             .as_u16(),
         200
     );
-    std::fs::remove_file(storage.join("live/720p/2.ts")).unwrap();
+    // さらに PUT して古い番号を容量からあふれさせ、公開範囲に削除済みの番号を残す
+    publish_series(&client, base, "720p", 6..11).await;
+    assert!(
+        !controller
+            .state
+            .store
+            .sequences("live", "720p")
+            .contains(&0),
+        "容量を超えたセグメントが保存されている"
+    );
     assert_eq!(
         client
             .get(format!("{base}/channels/live/720p.m3u8"))
@@ -1757,19 +1774,355 @@ async fn file_deleted_in_range_returns_422() {
     );
 }
 
-/// 配信先 worker がいなくても、公開範囲のファイル欠落は 422 を優先する
+/// 容量超過で削除された quality に同じ識別子を再 PUT したときは、worker に再取得を指示する
 #[tokio::test]
-async fn file_deleted_without_worker_returns_422() {
-    let tmp = TempDir::new("deleted-no-worker");
-    let storage = tmp.path.join("storage");
-    let controller = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+async fn reput_after_removal_tells_worker_to_refetch() {
+    let _tmp = TempDir::new("reput-refetch");
+    // セグメントは 18 byte なので、容量 40 では 2 つだけを保存する
+    let controller = spawn_controller(any_addr(), 40, 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    // 同じ識別子を 720p と 480p に保存する
+    let first = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"0123456789abcdefgh",
+        },
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 201);
+    let second = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "480p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 1_000_000,
+            resolution: "854x480",
+            body: b"abcdefghijklmnopqr",
+        },
+    )
+    .await;
+    assert_eq!(second.status().as_u16(), 201);
+    // 720p の次のセグメントで 720p の seg-0 を容量からあふれさせる
+    let third = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-1",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"ABCDEFGHIJKLMNOPQR",
+        },
+    )
+    .await;
+    assert_eq!(third.status().as_u16(), 201);
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    // 削除前のセグメントをキャッシュしている worker を報告する
+    let sync_body: Value = sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", [0, 1])
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        sync_body["fetch_segments"].as_array().unwrap().is_empty(),
+        "想定と違う取得一覧: {sync_body}"
+    );
+
+    // 削除された 720p の seg-0 に違うバイト列を再 PUT する
+    let response = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"new",
+        },
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    let stored = client
+        .get(format!("{base}/segments/live/720p/0.ts"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(stored.as_ref(), b"new");
+
+    // 同じ番号の再保存は、キャッシュを報告していても再取得を指示する
+    let sync_body: Value = sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", [0, 1])
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        sync_body["fetch_segments"],
+        json!([{ "channel_id": "live", "quality": "720p", "sequence": 0 }])
+    );
+}
+
+/// 取得中の worker が古いバイト列を報告しても、再 PUT した番号は再取得を指示する
+#[tokio::test]
+async fn reput_while_worker_fetches_tells_worker_to_refetch() {
+    let _tmp = TempDir::new("reput-fetching");
+    let controller = spawn_controller(any_addr(), 40, 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    // 同じ識別子を 720p と 480p に保存する
+    let first = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"0123456789abcdefgh",
+        },
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 201);
+    let second = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "480p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 1_000_000,
+            resolution: "854x480",
+            body: b"abcdefghijklmnopqr",
+        },
+    )
+    .await;
+    assert_eq!(second.status().as_u16(), 201);
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    // 空のキャッシュを報告し、720p/0 の取得を指示される
+    let sync_body: Value = sync_worker(&client, base, "worker-a", cached("720p", []))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        sync_body["fetch_segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["quality"] == "720p" && item["sequence"] == 0),
+        "想定と違う取得一覧: {sync_body}"
+    );
+    // 720p の次のセグメントで、取得中の 720p の seg-0 を容量からあふれさせる
+    let third = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-1",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"ABCDEFGHIJKLMNOPQR",
+        },
+    )
+    .await;
+    assert_eq!(third.status().as_u16(), 201);
+    // 取得中の 720p/0 を報告する。取得は終わっていない
+    sync_worker_with_fetching(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", []),
+        cached("720p", [0]),
+    )
+    .await;
+    // 取得が終わる前に、削除された 720p の seg-0 に違うバイト列を再 PUT する
+    let response = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"new",
+        },
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    // 取得が終わって古い 720p/0 を報告しても、再取得を指示する
+    let sync_body: Value = sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", [0, 1])
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        sync_body["fetch_segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["quality"] == "720p" && item["sequence"] == 0),
+        "取得中の古いセグメントの再取得が指示されていない: {sync_body}"
+    );
+}
+
+/// 公開範囲に残る古い番号を再 PUT したときは、キャッシュ対象から外れていても再取得を指示する
+#[tokio::test]
+async fn reput_in_published_range_tells_worker_to_refetch() {
+    let _tmp = TempDir::new("reput-published");
+    // seg-0 から seg-9 は 18 byte、seg-10 は 19 byte。容量 216 では seg-10 で 720p の seg-0 が容量からあふれる
+    let controller = spawn_controller(any_addr(), 216, 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    // seg-0 を 720p と 480p に保存する
+    publish_segment(&client, base, "720p", "seg-0").await;
+    publish_segment(&client, base, "480p", "seg-0").await;
+    for index in 1..6 {
+        publish_segment(&client, base, "720p", &format!("seg-{index}")).await;
+    }
+    // worker に 720p の 0 から 5 をキャッシュさせ、公開範囲を 0 から 5 にする
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", 0..6)
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await;
+    // seg-6 から seg-10 まで PUT し、720p の seg-0 を容量からあふれさせる
+    for index in 6..11 {
+        publish_segment(&client, base, "720p", &format!("seg-{index}")).await;
+    }
+    // 削除された 720p の seg-0 に違うバイト列を再 PUT する
+    let response = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-0",
+            duration_ms: 6000,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"new",
+        },
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+    // 公開範囲は 0 から 5 のままなので、キャッシュ対象の 5 から 10 に含まれなくても 0 の再取得を指示する
+    let sync_body: Value = sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", 0..6)
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        sync_body["fetch_segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["quality"] == "720p" && item["sequence"] == 0),
+        "公開範囲の古いセグメントの再取得が指示されていない: {sync_body}"
+    );
+    // worker-b が新しい範囲を報告すると、公開範囲は 5 から 10 に進む
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
+    sync_worker(
+        &client,
+        base,
+        "worker-b",
+        cached("720p", 5..11)
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await;
+    // worker-b を再登録してキャッシュを無効にすると、公開範囲は worker-a の 0 から 5 に戻る
+    register_worker(&client, base, "worker-b", "http://worker-b.test", 1).await;
+    let sync_body: Value = sync_worker(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", 0..6)
+            .into_iter()
+            .chain(cached("480p", [0]))
+            .collect(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert!(
+        sync_body["fetch_segments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["quality"] == "720p" && item["sequence"] == 0),
+        "公開範囲が戻ったときの再取得が指示されていない: {sync_body}"
+    );
+}
+
+/// 配信先 worker がいなくても、公開範囲の削除済みセグメントは 422 を優先する
+#[tokio::test]
+async fn removed_segment_without_worker_returns_422() {
+    let _tmp = TempDir::new("removed-no-worker");
+    // セグメントは 18 byte なので、容量 144 では直近の 8 つだけを保存する
+    let controller = spawn_controller(any_addr(), 144, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
     register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
 
-    std::fs::remove_file(storage.join("live/720p/2.ts")).unwrap();
+    // さらに PUT して古い番号を容量からあふれさせる
+    publish_series(&client, base, "720p", 6..11).await;
     // 再登録でキャッシュを無効にし、公開範囲を保持する worker をなくす
     register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
     assert_eq!(
@@ -1786,8 +2139,9 @@ async fn file_deleted_without_worker_returns_422() {
 
 #[tokio::test]
 async fn worker_registration_and_sync_contract() {
-    let tmp = TempDir::new("worker-contract");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("worker-contract");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
@@ -1812,8 +2166,9 @@ async fn worker_registration_and_sync_contract() {
 /// JSON の形式が不正な入力は、ハンドラに届く前に 400 にする
 #[tokio::test]
 async fn invalid_json_returns_400() {
-    let tmp = TempDir::new("invalid-json");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("invalid-json");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     // public_url の型が違う登録は 400 にする
     let bad_type = client
@@ -1876,8 +2231,9 @@ async fn invalid_json_returns_400() {
 /// JSON ボディの上限を超える登録は 400 にする
 #[tokio::test]
 async fn oversized_json_body_returns_400() {
-    let tmp = TempDir::new("json-limit");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("json-limit");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     // 4 MiB を超える public_url を作る
     let body = format!(
@@ -1897,8 +2253,9 @@ async fn oversized_json_body_returns_400() {
 
 #[tokio::test]
 async fn worker_timeout_and_recovery() {
-    let tmp = TempDir::new("worker-timeout");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 100).await;
+    let _tmp = TempDir::new("worker-timeout");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 100).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
@@ -1930,8 +2287,9 @@ async fn worker_timeout_and_recovery() {
 
 #[tokio::test]
 async fn registration_update_does_not_extend_timeout() {
-    let tmp = TempDir::new("registration-timeout");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 100).await;
+    let _tmp = TempDir::new("registration-timeout");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 100).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     publish_series(&client, base, "720p", 0..6).await;
@@ -1954,8 +2312,9 @@ async fn registration_update_does_not_extend_timeout() {
 
 #[tokio::test]
 async fn large_segment_body_is_accepted() {
-    let tmp = TempDir::new("large-body");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("large-body");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let body = vec![7_u8; 3 * 1024 * 1024];
     let response = publish(
@@ -1974,12 +2333,11 @@ async fn large_segment_body_is_accepted() {
     assert_eq!(response.status().as_u16(), 201);
 }
 
-/// 再起動すると番号が 0 に戻り、同じ番号のファイルは新しいセグメントで上書きされる
+/// 再起動すると保存済みのセグメントと番号が失われ、同じ識別子は 0 から採番し直す
 #[tokio::test]
 async fn controller_restart_restarts_numbering() {
-    let tmp = TempDir::new("restart-numbering");
-    let storage = tmp.path.join("storage");
-    let first = spawn_controller(any_addr(), storage.clone(), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("restart-numbering");
+    let first = spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let first_addr = first.addr;
     let client = reqwest::Client::new();
     assert_eq!(
@@ -2004,8 +2362,15 @@ async fn controller_restart_restarts_numbering() {
     );
     first.shutdown().await;
 
-    let second = spawn_controller(first_addr, storage.clone(), 6, 1000, 10000).await;
-    // 新しい実行では 0 から採番し、前の起動のファイルを上書きする
+    let second = spawn_controller(first_addr, DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
+    // 前の実行のセグメントは残らない
+    let previous = client
+        .get(format!("{}/segments/live/720p/0.ts", second.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(previous.status().as_u16(), 404);
+    // 新しい実行では 0 から採番する
     let body = "restarted-segment";
     let response = publish(
         &client,
@@ -2023,7 +2388,7 @@ async fn controller_restart_restarts_numbering() {
     assert_eq!(response.status().as_u16(), 201);
     let response_body: Value = response.json().await.unwrap();
     assert_eq!(response_body["sequence"], 0);
-    // 別の quality への同じ識別子の初回 PUT も、前の実行のファイルを上書きする
+    // 別の quality への同じ識別子の初回 PUT も、新しい実行では 0 になる
     let other_quality = publish(
         &client,
         PublishInput {
@@ -2040,19 +2405,30 @@ async fn controller_restart_restarts_numbering() {
     assert_eq!(other_quality.status().as_u16(), 201);
     let other_quality_body: Value = other_quality.json().await.unwrap();
     assert_eq!(other_quality_body["sequence"], 0);
-    let stored = tokio::fs::read(storage.join("live/720p/0.ts"))
+    let stored = client
+        .get(format!("{}/segments/live/720p/0.ts", second.base_url))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
         .await
         .unwrap();
-    assert_eq!(stored, body.as_bytes());
-    // 新しい実行がまだ到達していない番号のファイルは残る
-    assert!(storage.join("live/720p/1.ts").exists());
+    assert_eq!(stored.as_ref(), body.as_bytes());
+    // 新しい実行がまだ PUT していない番号はない
+    let missing = client
+        .get(format!("{}/segments/live/720p/1.ts", second.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status().as_u16(), 404);
 }
 
 /// 登録を更新すると報告済みのキャッシュを無効にし、配信先に使わなくなる
 #[tokio::test]
 async fn registration_resets_cached_segments() {
-    let tmp = TempDir::new("registration-reset");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("registration-reset");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -2099,16 +2475,10 @@ async fn registration_resets_cached_segments() {
 
 #[tokio::test]
 async fn end_to_end_publish_sync_playlist_serve() {
-    let tmp = TempDir::new("e2e");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let _tmp = TempDir::new("e2e");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
+    let worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_series(&client, &controller.base_url, "720p", 0..6).await;
     let media = wait_for_playlist_contains(
@@ -2133,19 +2503,18 @@ async fn end_to_end_publish_sync_playlist_serve() {
 /// 連続してセグメントを PUT しても、公開待ちの間にプレイリストが 503 にならない
 #[tokio::test]
 async fn continuous_publish_keeps_playlist_available() {
-    let tmp = TempDir::new("continuous-publish");
-    let controller =
-        spawn_controller_with_publish_wait(any_addr(), tmp.path.join("storage"), 6, 50, 1000, 200)
-            .await;
-    // 前の公開範囲と新しい範囲を同時に保持できるよう、playlist_segments より 1 つ多くする
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        7,
-        true,
+    let _tmp = TempDir::new("continuous-publish");
+    let controller = spawn_controller_with_publish_wait(
+        any_addr(),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
+        6,
+        50,
+        1000,
+        200,
     )
     .await;
+    // 前の公開範囲と新しい範囲を同時に保持できるよう、playlist_segments より 1 つ多くする
+    let worker = spawn_worker("worker-a", &controller.base_url, 7, true).await;
     let client = reqwest::Client::new();
     let url = format!("{}/channels/live/720p.m3u8", controller.base_url);
     publish_series(&client, &controller.base_url, "720p", 0..6).await;
@@ -2182,19 +2551,11 @@ async fn continuous_publish_keeps_playlist_available() {
 
 #[tokio::test]
 async fn controller_restart_recovery() {
-    let tmp = TempDir::new("controller-restart");
-    let storage = tmp.path.join("storage");
-    let first = spawn_controller(any_addr(), storage.clone(), 6, 50, 1000).await;
+    let _tmp = TempDir::new("controller-restart");
+    let first = spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     let first_addr = first.addr;
     let first_base_url = first.base_url.clone();
-    let worker = spawn_worker(
-        "worker-a",
-        &first_base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-a", &first_base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_series(&client, &first_base_url, "720p", 0..6).await;
     let first_media = wait_for_playlist(
@@ -2211,7 +2572,7 @@ async fn controller_restart_recovery() {
     .await;
 
     first.shutdown().await;
-    let second = spawn_controller(first_addr, storage, 6, 50, 1000).await;
+    let second = spawn_controller(first_addr, DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     // 再起動後は同じ番号に別のセグメントを PUT する
     let restarted = publish_series(&client, &second.base_url, "720p", 10..16).await;
     assert_eq!(restarted, vec![0, 1, 2, 3, 4, 5]);
@@ -2234,26 +2595,19 @@ async fn controller_restart_recovery() {
 /// ブラウザからは許可した origin の GET だけを CORS で許可する
 #[tokio::test]
 async fn cors_headers_follow_configured_origins() {
-    let tmp = TempDir::new("cors");
+    let _tmp = TempDir::new("cors");
     let allowed_origin = "http://page.test";
     let controller = spawn_controller_with_cors(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
         CorsOrigins::parse(&[allowed_origin.to_owned()]).unwrap(),
     )
     .await;
-    let worker = spawn_worker_with_cors(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-        CorsOrigins::Any,
-    )
-    .await;
+    let worker =
+        spawn_worker_with_cors("worker-a", &controller.base_url, 12, true, CorsOrigins::Any).await;
     let client = reqwest::Client::new();
     let sequences = publish_series(&client, &controller.base_url, "720p", 0..6).await;
     assert_eq!(sequences, vec![0, 1, 2, 3, 4, 5]);
@@ -2334,24 +2688,30 @@ async fn cors_headers_follow_configured_origins() {
 /// worker は登録時にキャッシュを捨てて、controller のセグメントファイルを取り直す
 #[tokio::test]
 async fn worker_discards_cache_on_registration() {
-    let tmp = TempDir::new("worker-cache");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
-    let cache_dir = tmp.path.join("cache");
-    tokio::fs::create_dir_all(cache_dir.join("live/720p"))
-        .await
-        .unwrap();
-    // 前の実行のセグメントファイルをキャッシュに置いておく
-    for sequence in 0..6 {
-        tokio::fs::write(
-            cache_dir.join(format!("live/720p/{sequence}.ts")),
-            format!("old-segment-{sequence}"),
-        )
-        .await
-        .unwrap();
-    }
+    let _tmp = TempDir::new("worker-cache");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     let client = reqwest::Client::new();
     publish_series(&client, &controller.base_url, "720p", 0..6).await;
-    let worker = spawn_worker("worker-a", &controller.base_url, cache_dir, 6, true).await;
+    // sync を止めた状態で起動し、前の実行のキャッシュに見せかけた古い内容を入れる
+    let worker = spawn_worker("worker-a", &controller.base_url, 6, false).await;
+    {
+        let mut cache = worker.state.cache.lock().await;
+        for sequence in 0..6 {
+            cache
+                .put(
+                    "live",
+                    "720p",
+                    sequence,
+                    format!("old-segment-{sequence}").into_bytes(),
+                )
+                .unwrap();
+        }
+    }
+    let sync_state = worker.state.clone();
+    tokio::spawn(async move {
+        edamame_worker::run_sync_loop(sync_state, None).await;
+    });
     let media = wait_for_playlist(
         &client,
         &format!("{}/channels/live/720p.m3u8", controller.base_url),
@@ -2370,10 +2730,10 @@ async fn worker_discards_cache_on_registration() {
 /// controller は認証トークンを設定したときだけ PUT に Authorization ヘッダーを要求する
 #[tokio::test]
 async fn put_requires_bearer_token_when_auth_token_is_set() {
-    let tmp = TempDir::new("put-auth");
+    let _tmp = TempDir::new("put-auth");
     let controller = spawn_controller_with_auth(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         100,
         10_000,
@@ -2458,10 +2818,10 @@ async fn put_requires_bearer_token_when_auth_token_is_set() {
 /// worker は認証トークンを設定すると登録 PUT に Authorization ヘッダーを付ける
 #[tokio::test]
 async fn worker_registers_with_bearer_token_and_syncs() {
-    let tmp = TempDir::new("worker-auth");
+    let _tmp = TempDir::new("worker-auth");
     let controller = spawn_controller_with_auth(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         10_000,
@@ -2469,15 +2829,8 @@ async fn worker_registers_with_bearer_token_and_syncs() {
     )
     .await;
     let client = reqwest::Client::new();
-    let worker = spawn_worker_with_auth(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-        "example-token",
-    )
-    .await;
+    let worker =
+        spawn_worker_with_auth("worker-a", &controller.base_url, 12, true, "example-token").await;
     let response = publish_with_token(
         &client,
         PublishInput {
@@ -2534,12 +2887,10 @@ async fn get_master_without_redirect(url: &str) -> reqwest::Response {
 }
 
 /// 外部配信として動く別の controller を起動し、その master m3u8 の URL を返す
-async fn spawn_external_origin(
-    dir: &TempDir,
-) -> (support::ControllerHandle, support::WorkerHandle, String) {
+async fn spawn_external_origin() -> (support::ControllerHandle, support::WorkerHandle, String) {
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        dir.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2547,14 +2898,7 @@ async fn spawn_external_origin(
         1,
     )
     .await;
-    let worker = spawn_worker(
-        "worker-external",
-        &controller.base_url,
-        dir.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-external", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let master_url = format!("{}/channels/live/master.m3u8", controller.base_url);
@@ -2565,12 +2909,11 @@ async fn spawn_external_origin(
 /// 外部配信へ振り分ける割合が 100% のときは、マスタープレイリストのリクエストを外部配信の master m3u8 へ転送する
 #[tokio::test]
 async fn redirects_master_to_external_playlist() {
-    let external_dir = TempDir::new("external-origin");
-    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
-    let tmp = TempDir::new("redirect-external");
+    let (_external, _external_worker, external_master) = spawn_external_origin().await;
+    let _tmp = TempDir::new("redirect-external");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2578,14 +2921,7 @@ async fn redirects_master_to_external_playlist() {
         100,
     )
     .await;
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let declared = declare_external_m3u8(
@@ -2627,12 +2963,11 @@ async fn redirects_master_to_external_playlist() {
 /// 外部配信へ振り分ける割合が 0% で自前の配信が使えるときは、自前のマスタープレイリストを返す
 #[tokio::test]
 async fn keeps_local_master_when_external_percent_is_zero() {
-    let external_dir = TempDir::new("external-origin");
-    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
-    let tmp = TempDir::new("local-master");
+    let (_external, _external_worker, external_master) = spawn_external_origin().await;
+    let _tmp = TempDir::new("local-master");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2640,14 +2975,7 @@ async fn keeps_local_master_when_external_percent_is_zero() {
         0,
     )
     .await;
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let declared = declare_external_m3u8(
@@ -2704,8 +3032,9 @@ async fn keeps_local_master_when_external_percent_is_zero() {
 /// https の public_url を登録すると、メディアプレイリストにその URL が出る
 #[tokio::test]
 async fn registers_worker_with_https_public_url() {
-    let tmp = TempDir::new("https-public-url");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let _tmp = TempDir::new("https-public-url");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 1000, 10000).await;
     let client = reqwest::Client::new();
     let base = &controller.base_url;
     let sequences = publish_series(&client, base, "720p", 0..6).await;
@@ -2730,12 +3059,11 @@ async fn registers_worker_with_https_public_url() {
 /// 配信できる quality が 1 つもないときは、最低の割合が 0 でも外部配信へ振り分ける
 #[tokio::test]
 async fn falls_back_to_external_when_no_quality_can_be_served() {
-    let external_dir = TempDir::new("external-origin");
-    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
-    let tmp = TempDir::new("fallback-external");
+    let (_external, _external_worker, external_master) = spawn_external_origin().await;
+    let _tmp = TempDir::new("fallback-external");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2771,10 +3099,10 @@ async fn falls_back_to_external_when_no_quality_can_be_served() {
 /// controller は外部 playlist の到達確認をしないため、宣言があればそのまま転送する
 #[tokio::test]
 async fn routes_to_external_without_checking_reachability() {
-    let tmp = TempDir::new("external-unchecked");
+    let _tmp = TempDir::new("external-unchecked");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2807,10 +3135,10 @@ async fn routes_to_external_without_checking_reachability() {
 /// `external_m3u8=none` で宣言を取り消すと自前の master を返す
 #[tokio::test]
 async fn clears_external_playlist_declaration() {
-    let tmp = TempDir::new("external-clear");
+    let _tmp = TempDir::new("external-clear");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2818,14 +3146,7 @@ async fn clears_external_playlist_declaration() {
         100,
     )
     .await;
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let external = "https://px.example.test/abc/def.m3u8";
@@ -2855,12 +3176,11 @@ async fn clears_external_playlist_declaration() {
 /// 同じ client の判定はリクエストをまたいでも変わらない
 #[tokio::test]
 async fn keeps_the_same_route_for_the_same_client() {
-    let external_dir = TempDir::new("external-origin");
-    let (_external, _external_worker, external_master) = spawn_external_origin(&external_dir).await;
-    let tmp = TempDir::new("sticky-route");
+    let (_external, _external_worker, external_master) = spawn_external_origin().await;
+    let _tmp = TempDir::new("sticky-route");
     let controller = spawn_controller_with_external_percent(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -2868,14 +3188,7 @@ async fn keeps_the_same_route_for_the_same_client() {
         50,
     )
     .await;
-    let worker = spawn_worker(
-        "worker-a",
-        &controller.base_url,
-        tmp.path.join("cache"),
-        12,
-        true,
-    )
-    .await;
+    let worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let declared = declare_external_m3u8(
@@ -2903,8 +3216,9 @@ async fn keeps_the_same_route_for_the_same_client() {
 /// 外部配信の URL が不正な PUT は 400 を返す
 #[tokio::test]
 async fn rejects_invalid_external_m3u8() {
-    let tmp = TempDir::new("external-invalid");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let _tmp = TempDir::new("external-invalid");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     for value in [
@@ -2923,11 +3237,8 @@ async fn rejects_invalid_external_m3u8() {
 async fn serves_playlist_without_connect_info() {
     use tower::ServiceExt;
 
-    let tmp = TempDir::new("no-connect-info");
-    tokio::fs::create_dir_all(tmp.path.join("storage"))
-        .await
-        .unwrap();
-    let store = edamame_controller::CanonicalStore::new(tmp.path.join("storage"));
+    let _tmp = TempDir::new("no-connect-info");
+    let store = edamame_controller::CanonicalStore::new(DEFAULT_STORAGE_CAPACITY_BYTES);
     let state = edamame_controller::ControllerState::new(store, 6, 50, 1000, 0, 1);
     let app = edamame_controller::router(state, &CorsOrigins::Disabled, None);
     let request = axum::http::Request::builder()
@@ -2942,8 +3253,9 @@ async fn serves_playlist_without_connect_info() {
 /// channel が無いときの外部配信の登録は 404 を返す
 #[tokio::test]
 async fn requires_channel_to_register_external_m3u8() {
-    let tmp = TempDir::new("external-no-channel");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let _tmp = TempDir::new("external-no-channel");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     let client = reqwest::Client::new();
     let response = declare_external_m3u8(
         &client,
@@ -2958,10 +3270,10 @@ async fn requires_channel_to_register_external_m3u8() {
 /// 認証を有効にすると外部配信の登録にもトークンが要る
 #[tokio::test]
 async fn registering_external_m3u8_requires_bearer_token() {
-    let tmp = TempDir::new("external-auth");
+    let _tmp = TempDir::new("external-auth");
     let controller = spawn_controller_with_auth(
         any_addr(),
-        tmp.path.join("storage"),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
         6,
         50,
         1000,
@@ -3008,8 +3320,9 @@ async fn registering_external_m3u8_requires_bearer_token() {
 /// `external` に 0 と 1 以外を指定すると 400 を返す
 #[tokio::test]
 async fn rejects_invalid_external_query() {
-    let tmp = TempDir::new("external-switch-invalid");
-    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 50, 1000).await;
+    let _tmp = TempDir::new("external-switch-invalid");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
     let client = reqwest::Client::new();
     publish_segment(&client, &controller.base_url, "720p", "seg-0").await;
     let response = client

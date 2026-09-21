@@ -36,7 +36,7 @@ impl SegmentId {
 }
 
 /// sync の JSON でセグメントを識別するために使う
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SegmentKey {
     pub channel_id: String,
     pub quality: String,

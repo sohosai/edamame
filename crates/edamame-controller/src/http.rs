@@ -217,10 +217,7 @@ async fn get_segment(
     validate_identifier("channel_id", &channel_id)?;
     validate_quality(&quality)?;
     let sequence = parse_sequence_filename(&filename)?;
-    let bytes = state
-        .store
-        .read_segment(&channel_id, &quality, sequence)
-        .await?;
+    let bytes = state.store.get(&channel_id, &quality, sequence)?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
 }
 

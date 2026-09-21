@@ -1,34 +1,18 @@
 //! バイナリを起動し、環境変数からの設定を確認する
 
-use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "edamame-worker-config-env-{tag}-{}-{nanos}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
-}
-
 #[tokio::test]
 async fn reads_configuration_from_environment() {
-    let dir = temp_dir("env");
     let mut child = Command::new(env!("CARGO_BIN_EXE_edamame-worker"))
         .env("EDAMAME_WORKER_ID", "worker-env")
         .env("EDAMAME_BIND", "127.0.0.1:0")
         .env("EDAMAME_PUBLIC_URL", "http://127.0.0.1:0")
         .env("EDAMAME_CONTROLLER_URL", "http://127.0.0.1:1")
-        .env("EDAMAME_CACHE_DIR", dir.join("cache"))
         // CLI の値が優先されることを確かめるため、EDAMAME_CACHE_LIMIT に不正な値を設定する
         .env("EDAMAME_CACHE_LIMIT", "0")
         .env_remove("EDAMAME_CORS_ORIGIN")
@@ -59,19 +43,16 @@ async fn reads_configuration_from_environment() {
     );
 
     child.kill().await.unwrap();
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// 空文字列は未指定とは異なり、CORS の設定値として検証される
 #[tokio::test]
 async fn rejects_empty_environment_variable() {
-    let dir = temp_dir("env-empty");
     let child = Command::new(env!("CARGO_BIN_EXE_edamame-worker"))
         .env("EDAMAME_WORKER_ID", "worker-env")
         .env("EDAMAME_BIND", "127.0.0.1:0")
         .env("EDAMAME_PUBLIC_URL", "http://127.0.0.1:0")
         .env("EDAMAME_CONTROLLER_URL", "http://127.0.0.1:1")
-        .env("EDAMAME_CACHE_DIR", dir.join("cache"))
         .env("EDAMAME_CACHE_LIMIT", "12")
         .env("EDAMAME_CORS_ORIGIN", "")
         .stdout(Stdio::piped())
@@ -90,5 +71,4 @@ async fn rejects_empty_environment_variable() {
         stderr.contains("cors origin is invalid"),
         "想定と違うエラー: {stderr}"
     );
-    let _ = std::fs::remove_dir_all(dir);
 }

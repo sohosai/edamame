@@ -21,8 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let public_url = normalize_public_url(&config.public_url)?;
     // worker は TLS を使わないため、controller へは http で接続する
     let controller_url = normalize_http_url(&config.controller_url)?;
-    tokio::fs::create_dir_all(&config.cache_dir).await?;
-    let cache = Cache::scan(config.cache_dir.clone(), config.cache_limit).await?;
+    let cache = Cache::new(config.cache_limit)?;
     let state = WorkerState::new(
         config.worker_id.clone(),
         controller_url,

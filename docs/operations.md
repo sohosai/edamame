@@ -25,7 +25,7 @@ client には、controller に到達できる URL を設定する。
 | option | 環境変数 | 必須 | 説明 |
 | --- | --- | --- | --- |
 | `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレスであり、client や worker が接続する URL ではない |
-| `--storage-dir` | `EDAMAME_STORAGE_DIR` | 必須 | 正規セグメントファイルを保存するディレクトリ |
+| `--storage-capacity` | `EDAMAME_STORAGE_CAPACITY` | 必須 | 正規セグメントファイルをメモリ上に保存する容量（`256MiB` のような 2 進接頭辞付きの値、または byte 数。1 以上） |
 | `--playlist-segments` | `EDAMAME_PLAYLIST_SEGMENTS` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
 | `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
 | `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
@@ -42,7 +42,6 @@ client には、controller に到達できる URL を設定する。
 | `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレス |
 | `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http` または `https` で始まる絶対 URL（TLS 終端の reverse proxy を置く場合は `https`） |
 | `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | worker から controller に接続するための、`http` の絶対 URL |
-| `--cache-dir` | `EDAMAME_CACHE_DIR` | 必須 | セグメントファイルのキャッシュ先ディレクトリ |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
 | `--weight` | `EDAMAME_WEIGHT` | 任意 | worker の重み（1 以上の整数、省略時は 1） |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | controller の `--auth-token` と同じトークン（省略すると登録の PUT に `Authorization` ヘッダーを付けない） |
@@ -61,7 +60,7 @@ controller を起動する。
 ```bash
 edamame-controller \
   --bind 127.0.0.1:9000 \
-  --storage-dir .edamame/controller \
+  --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
@@ -78,7 +77,6 @@ edamame-worker \
   --bind 127.0.0.1:9001 \
   --public-url http://127.0.0.1:9001 \
   --controller-url http://127.0.0.1:9000 \
-  --cache-dir .edamame/worker-a \
   --cache-limit 12 \
   --auth-token example-token \
   --cors-origin '*'
@@ -182,25 +180,31 @@ controller は worker の負荷情報（CPU 使用率、同時接続数、配信
 
 ## 容量
 
-controller は実行中にセグメントファイルを削除しない。
-`storage_dir` の容量は運用者が監視し、必要に応じて古いセグメントファイルを削除する。
-セグメントファイルを削除してもセグメント番号には影響しない。
-番号は controller のメモリ上のカウンタで決まる。
-残したセグメントファイルは、次の実行で同じ番号のセグメントを PUT したときに上書きされる。
+controller はセグメントファイルをメモリ上に保存する。
+保存しているバイト数の合計が `--storage-capacity` を超えたときは、書き込んだ順に古いセグメントファイルから削除する。
+容量はセグメントファイルのバイト数の合計であり、セグメント識別子や暗号化の指定などのメタデータの分は含まない。
+メタデータは実行中に PUT したセグメント数に比例して増える。
 
-worker のキャッシュ上限は `(channel_id, quality)` ごとの上限であり、`cache_dir` 全体の容量上限ではない。
-worker は形式に合わないファイルを削除しないため、`cache_dir` の総容量は運用者が監視する。
+容量は、公開範囲と、公開待ちと sync 間隔の間に worker が取得する範囲を保持できる大きさにする。
+容量が足りないと公開範囲のセグメントファイルが削除され、その quality のメディアプレイリストは 422 を返す。
+セグメントファイル 1 つが容量より大きい場合、その PUT には 413 を返し、保存しない。
 
-controller はセグメント識別子とセグメント番号の対応もメモリに保持する。
-セグメントファイルよりはずっと小さいが、実行中に PUT したセグメント数に比例して増える。
+目安の計算式は、保持したいセグメント数 × 1 セットの最大サイズ × channel 数とする。
+保持したいセグメント数は、`--playlist-segments` に公開待ちと sync 間隔の分を足した数より大きくする。
+
+publisher の設定例（6 秒セグメント、1080p 12 Mbps、720p 6.5 Mbps、480p 1.4 Mbps）では、3 quality 合計で 1 セットあたり約 14 MiB になる。
+`--playlist-segments 6` に公開待ちと sync 間隔の分を足した 8 セグメントを下回らないよう、余裕を見て 10 セグメント分を 3 channel で保持すると仮定すると、約 14 MiB × 10 × 3 ≒ 430 MiB になる。
+この構成では `--storage-capacity 512MiB` を目安にする。
+セグメント長、ビットレート、channel 数、quality 数が大きい場合はその分を増やす。
+
+worker のキャッシュ上限は `(channel_id, quality)` ごとのセグメント数の上限であり、worker 全体の容量上限ではない。
+worker はセグメントファイルをメモリ上にキャッシュし、上限を超えた古いものから削除する。
 
 ## 再起動
 
-controller を再起動すると、channel、quality、セグメントのメタデータ、セグメント識別子とセグメント番号の対応、worker の登録は失われる。
+controller を再起動すると、メモリにあるセグメントファイル、channel、quality、セグメントのメタデータ、セグメント識別子とセグメント番号の対応、worker の登録はすべて失われる。
 セグメント番号は 0 から始まり、新しい識別子に順に割り当てる。
-`storage_dir` のセグメントファイルは削除しない。
-前の実行で保存したファイルは残り、新しいセグメントと番号が重なった時点で上書きされる。
-`GET /segments/...` は、同じ番号のファイルがまだ上書きされていなければ前の実行のファイルを返す。
+`GET /segments/...` は再起動後に PUT されるまで 404 を返す。
 プレイリストは再起動後に PUT されたセグメントファイルから作り直すため、publisher がセグメントファイルを PUT するまで 404 になる。
 worker は sync で 404 を受け取ると再登録し、登録に成功した時点でキャッシュを捨てて取り直す。
 取得と sync を再開すれば配信先に戻る。
@@ -209,12 +213,9 @@ client はプレイリストを取り直し、メディアシーケンスが 0 �
 メタデータは最初に成功した PUT の属性から作り直す。
 同じ識別子を再 PUT すると新しい番号で保存される。
 
-worker を再起動すると、`cache_dir` を走査してキャッシュしているセグメントファイルの索引を作り直す。
-走査では `{channel_id}/{quality}/{sequence}.ts` の形式に合うファイルだけを使う。
-形式に合わないファイルは索引に入れず、削除もしない。
-索引を作った後、キャッシュ上限を超えたセグメントファイルを削除し、controller に登録する。
-登録に成功すると、その時点のキャッシュの索引とファイルを捨てて controller から取り直す。
-controller が停止中の間だけ、走査した内容を配信する。
+worker を再起動すると、メモリ上のキャッシュは失われる。
+worker は controller に登録し、取得を指示されたセグメントファイルを取り直す。
+controller が停止中の間は、client は worker が保持しているセグメントファイルだけを取得できる。
 
 worker はセグメントファイルを保存するたびに、`(channel_id, quality)` ごとにキャッシュ上限まで新しい順に残す。
 上限を超えた古いセグメントファイルは削除する。
@@ -231,13 +232,12 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | controller が停止した | client はプレイリストを取得できない。worker はキャッシュしているセグメントファイルの配信を続けるが、sync は失敗し続ける。controller が復帰すると、worker は再登録してキャッシュを捨てる |
 | worker が停止した | controller は `--sync-timeout-ms` の経過後にその worker を配信先の候補から外す。その quality の公開範囲を保持する他の worker があればそれを使い、なければ次の sync で公開範囲が更新されるまで 503 になる |
 | セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得する。公開範囲を保持していなければ配信先に使われない |
-| セグメントファイルが欠落した | controller はその quality のプレイリストを生成せず 422 を返し、キャッシュ済みセグメントファイルの配信は続く |
-| セグメントファイルを後から削除した | 番号には影響しない。次の実行で同じ番号のセグメントを PUT したときに上書きされる |
-| controller の `storage_dir` への書き込みに失敗した | controller は 500 を返す。書き込み途中のセグメントファイルは取得できず、controller は保存済みとして扱わない |
-| worker の `cache_dir` への書き込みに失敗した | worker はログを出し、そのセグメントファイルをキャッシュ済みとして扱わず、次の sync で再取得する |
+| 公開範囲のセグメントファイルが容量超過で削除された | controller はその quality のプレイリストを生成せず 422 を返し、worker がキャッシュしているセグメントファイルの配信は続く |
+| 保存容量より大きいセグメントを PUT した | controller は 413 を返し、セグメントファイルを保存せず、channel の属性もセグメント番号も確定しない |
+| 容量超過で削除された quality に同じ識別子を再 PUT した | 別の quality に識別子が残っていれば同じセグメント番号に保存し直す。古いバイト列をキャッシュしているか、取得中の worker には次の sync で再取得を指示する |
 | worker のトークンが controller と一致しない | controller は登録の PUT に 401 を返し、worker はログを出して 1 秒後に再試行する |
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
-| controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のファイルと同じ番号になった場合は上書きする |
+| controller の再起動後に同じ識別子を再 PUT した | 新しい番号を割り当てて保存する。前の実行のセグメントファイルは残っていない |
 | client が古いプレイリストを持つ | プレイリストに書かれた worker が停止している場合、セグメントファイルの取得は失敗する。controller は `--sync-timeout-ms` の経過後にその worker を候補から外すまで同じ worker を選ぶことがある（候補が複数台ある場合は、重みに従って他の worker も選ばれる） |
 | 暗号鍵の配信元が停止した | client は鍵を取得できず、その鍵を使うセグメントを復号できない。controller と worker は鍵を保持しないため、鍵を取得できるかどうかは publisher の配信元に依存する |
 | 公開範囲に暗号鍵の URI の異なるセグメントが混ざった | メディアプレイリストはセグメントごとに `#EXT-X-KEY` を出し分ける。client はセグメントごとに適切な鍵を取得する |
@@ -247,7 +247,7 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 ## セキュリティと信頼境界
 
 - controller は `--auth-token` を指定すると PUT に Bearer トークンを要求し、指定しなければ警告を出して PUT を認証しない
-- publisher が送るセグメント識別子は文字種を限定し、controller は識別子をファイル名に使わず `storage_dir` の外にファイルを作らない
+- publisher が送るセグメント識別子は文字種を限定し、controller と worker は識別子をメモリ上の索引にだけ使う
 - worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
 - `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く
 - controller は登録された外部配信の URL を取得しない。client が外部配信から直接取得する

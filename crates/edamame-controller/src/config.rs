@@ -1,12 +1,37 @@
 //! controller の CLI 設定
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use clap::Parser;
 use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token};
 
 pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
+
+/// 容量の指定を byte 数に変換する。`KiB`、`MiB`、`GiB`、`TiB` の接尾辞を付けられる
+fn parse_capacity_bytes(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    let (number, multiplier) = if let Some(number) = lower.strip_suffix("kib") {
+        (number, 1024_u64)
+    } else if let Some(number) = lower.strip_suffix("mib") {
+        (number, 1024 * 1024)
+    } else if let Some(number) = lower.strip_suffix("gib") {
+        (number, 1024 * 1024 * 1024)
+    } else if let Some(number) = lower.strip_suffix("tib") {
+        (number, 1024 * 1024 * 1024 * 1024)
+    } else if lower.bytes().all(|byte| byte.is_ascii_digit()) {
+        (lower.as_str(), 1)
+    } else {
+        return Err("capacity must be bytes or a value with KiB, MiB, GiB, or TiB".to_owned());
+    };
+    let number = number
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "capacity must be a number".to_owned())?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "capacity is too large".to_owned())
+}
 
 /// `edamame-controller` の設定
 #[derive(Debug, Clone, Parser)]
@@ -16,9 +41,13 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
-    /// 正規セグメントファイルの保存先
-    #[arg(long, env = "EDAMAME_STORAGE_DIR")]
-    pub storage_dir: PathBuf,
+    /// 正規セグメントファイルをメモリ上に保存する容量。`256MiB` のような 2 進接頭辞付きの値か、byte 数を指定する
+    #[arg(
+        long,
+        env = "EDAMAME_STORAGE_CAPACITY",
+        value_parser = parse_capacity_bytes
+    )]
+    pub storage_capacity: u64,
 
     /// メディアプレイリストに含めるセグメント数
     #[arg(long, env = "EDAMAME_PLAYLIST_SEGMENTS")]
@@ -52,6 +81,11 @@ pub struct ControllerConfig {
 
 impl ControllerConfig {
     pub fn validate(&self) -> Result<(), EdamameError> {
+        if self.storage_capacity == 0 {
+            return Err(EdamameError::BadRequest(
+                "storage capacity must be positive".to_owned(),
+            ));
+        }
         if self.playlist_segments < 6 {
             return Err(EdamameError::BadRequest(
                 "playlist segments must be at least 6".to_owned(),
@@ -101,7 +135,7 @@ mod tests {
     fn config() -> ControllerConfig {
         ControllerConfig {
             bind: "127.0.0.1:9000".parse().unwrap(),
-            storage_dir: PathBuf::from(".edamame/controller"),
+            storage_capacity: 16 * 1024 * 1024,
             playlist_segments: 6,
             sync_interval_ms: 1000,
             sync_timeout_ms: 10000,
@@ -115,6 +149,32 @@ mod tests {
     #[test]
     fn accepts_valid_values() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_zero_storage_capacity() {
+        let mut config = config();
+        config.storage_capacity = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_storage_capacity_with_binary_prefixes() {
+        assert_eq!(parse_capacity_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_capacity_bytes("1KiB").unwrap(), 1024);
+        assert_eq!(parse_capacity_bytes("256MiB").unwrap(), 268_435_456);
+        assert_eq!(parse_capacity_bytes("1GiB").unwrap(), 1_073_741_824);
+        assert_eq!(parse_capacity_bytes("1TiB").unwrap(), 1_099_511_627_776);
+        // 大文字と小文字のどちらでも受け付ける
+        assert_eq!(parse_capacity_bytes("512mib").unwrap(), 536_870_912);
+    }
+
+    #[test]
+    fn rejects_invalid_storage_capacity() {
+        assert!(parse_capacity_bytes("").is_err());
+        assert!(parse_capacity_bytes("256MB").is_err());
+        assert!(parse_capacity_bytes("MiB").is_err());
+        assert!(parse_capacity_bytes("-1MiB").is_err());
     }
 
     #[test]
@@ -219,7 +279,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(names.len(), 9);
         assert_eq!(names["bind"], "EDAMAME_BIND");
-        assert_eq!(names["storage_dir"], "EDAMAME_STORAGE_DIR");
+        assert_eq!(names["storage_capacity"], "EDAMAME_STORAGE_CAPACITY");
         assert_eq!(names["playlist_segments"], "EDAMAME_PLAYLIST_SEGMENTS");
         assert_eq!(names["sync_interval_ms"], "EDAMAME_SYNC_INTERVAL_MS");
         assert_eq!(names["sync_timeout_ms"], "EDAMAME_SYNC_TIMEOUT_MS");

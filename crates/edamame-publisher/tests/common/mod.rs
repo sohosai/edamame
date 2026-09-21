@@ -98,51 +98,31 @@ pub fn wait_for(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool 
 /// controller を起動する
 pub struct Controller {
     pub base_url: String,
-    pub storage_dir: PathBuf,
+    pub state: Arc<ControllerState>,
 }
 
 impl Controller {
     /// テストプロセス内で controller を起動する
-    pub fn start(dir: &Path, auth_token: &str) -> Self {
-        let storage_dir = dir.join("controller");
-        fs::create_dir_all(&storage_dir).expect("保存先を作成できません");
-        let store = CanonicalStore::new(storage_dir.clone());
+    pub fn start(auth_token: &str) -> Self {
         // 公開待ちは 0、sync の間隔は 1 秒にしてテスト時間を短くする
         // 外部配信へ振り分ける割合は controller のテストと同じ 1 % にし、外部配信は設定しない
+        let store = CanonicalStore::new(16 * 1024 * 1024);
         let state = ControllerState::new(store, 6, 1000, 10000, 0, 1);
-        let base_url = serve(controller_router(state, &cors(), Some(auth_token)));
-        Self {
-            base_url,
-            storage_dir,
-        }
+        let base_url = serve(controller_router(state.clone(), &cors(), Some(auth_token)));
+        Self { base_url, state }
     }
 
     /// `(channel_id, quality)` の保存済みセグメント番号を返す
     pub fn sequences(&self, channel_id: &str, quality: &str) -> Vec<u64> {
-        let dir = self.storage_dir.join(channel_id).join(quality);
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut sequences = entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_suffix(".ts"))
-                    .and_then(|name| name.parse::<u64>().ok())
-            })
-            .collect::<Vec<_>>();
-        sequences.sort_unstable();
-        sequences
+        self.state.store.sequences(channel_id, quality)
     }
 
-    /// セグメントファイルのパスを返す
-    pub fn segment_path(&self, channel_id: &str, quality: &str, sequence: u64) -> PathBuf {
-        self.storage_dir
-            .join(channel_id)
-            .join(quality)
-            .join(format!("{sequence}.ts"))
+    /// 保存済みのセグメントファイルを HTTP で取得する
+    pub fn segment(&self, channel_id: &str, quality: &str, sequence: u64) -> Option<Vec<u8>> {
+        http_get_bytes(&format!(
+            "{}/segments/{channel_id}/{quality}/{sequence}.ts",
+            self.base_url
+        ))
     }
 }
 
@@ -151,10 +131,8 @@ pub struct Worker;
 
 impl Worker {
     /// テストプロセス内で worker と sync を起動する
-    pub fn start(dir: &Path, controller_url: &str, auth_token: &str) -> Self {
+    pub fn start(controller_url: &str, auth_token: &str) -> Self {
         let port = free_port();
-        let cache_dir = dir.join("worker");
-        fs::create_dir_all(&cache_dir).expect("キャッシュ先を作成できません");
         let public_url = format!("http://127.0.0.1:{port}");
         let controller_url = controller_url.to_owned();
         let auth_token = auth_token.to_owned();
@@ -165,9 +143,7 @@ impl Worker {
                 .build()
                 .expect("runtime を作れません");
             runtime.block_on(async move {
-                let cache = Cache::scan(cache_dir, 12)
-                    .await
-                    .expect("キャッシュを読めません");
+                let cache = Cache::new(12).expect("キャッシュを作れません");
                 let state = WorkerState::new(
                     "worker-test".to_owned(),
                     controller_url,
@@ -379,6 +355,15 @@ pub fn http_get(url: &str) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// HTTP でバイト列を取得する。失敗した場合は None を返す
+pub fn http_get_bytes(url: &str) -> Option<Vec<u8>> {
+    let output = Command::new("curl")
+        .args(["-s", "-f", "--max-time", "5", url])
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 /// hex 文字列をバイト列にする

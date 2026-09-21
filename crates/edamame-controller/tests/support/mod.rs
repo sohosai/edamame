@@ -17,6 +17,9 @@ use tokio::sync::oneshot;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// テストで使う既定の保存容量。セグメントの内容より十分に大きくする
+pub const DEFAULT_STORAGE_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
+
 /// テスト終了時に削除される一時ディレクトリ
 pub struct TempDir {
     pub path: PathBuf,
@@ -65,14 +68,14 @@ impl ControllerHandle {
 /// controller を実際の HTTP サーバーとして起動する
 pub async fn spawn_controller(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     playlist_segments: u64,
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
 ) -> ControllerHandle {
     spawn_controller_with_options(
         addr,
-        storage_dir,
+        storage_capacity_bytes,
         ControllerOptions {
             playlist_segments,
             sync_interval_ms,
@@ -89,7 +92,7 @@ pub async fn spawn_controller(
 /// 公開待ちを指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_publish_wait(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     playlist_segments: u64,
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
@@ -97,7 +100,7 @@ pub async fn spawn_controller_with_publish_wait(
 ) -> ControllerHandle {
     spawn_controller_with_options(
         addr,
-        storage_dir,
+        storage_capacity_bytes,
         ControllerOptions {
             playlist_segments,
             sync_interval_ms,
@@ -114,7 +117,7 @@ pub async fn spawn_controller_with_publish_wait(
 /// CORS の設定を指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_cors(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     playlist_segments: u64,
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
@@ -122,7 +125,7 @@ pub async fn spawn_controller_with_cors(
 ) -> ControllerHandle {
     spawn_controller_with_options(
         addr,
-        storage_dir,
+        storage_capacity_bytes,
         ControllerOptions {
             playlist_segments,
             sync_interval_ms,
@@ -139,7 +142,7 @@ pub async fn spawn_controller_with_cors(
 /// 認証トークンを指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_auth(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     playlist_segments: u64,
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
@@ -147,7 +150,7 @@ pub async fn spawn_controller_with_auth(
 ) -> ControllerHandle {
     spawn_controller_with_options(
         addr,
-        storage_dir,
+        storage_capacity_bytes,
         ControllerOptions {
             playlist_segments,
             sync_interval_ms,
@@ -164,7 +167,7 @@ pub async fn spawn_controller_with_auth(
 /// 外部配信へ振り分ける最低の割合と公開待ちを指定して controller を起動する
 pub async fn spawn_controller_with_external_percent(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     playlist_segments: u64,
     sync_interval_ms: u64,
     sync_timeout_ms: u64,
@@ -173,7 +176,7 @@ pub async fn spawn_controller_with_external_percent(
 ) -> ControllerHandle {
     spawn_controller_with_options(
         addr,
-        storage_dir,
+        storage_capacity_bytes,
         ControllerOptions {
             playlist_segments,
             sync_interval_ms,
@@ -201,11 +204,10 @@ struct ControllerOptions<'a> {
 /// controller の全設定を指定して HTTP サーバーを起動する
 async fn spawn_controller_with_options(
     addr: SocketAddr,
-    storage_dir: PathBuf,
+    storage_capacity_bytes: u64,
     options: ControllerOptions<'_>,
 ) -> ControllerHandle {
-    tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-    let store = CanonicalStore::new(storage_dir);
+    let store = CanonicalStore::new(storage_capacity_bytes);
     let state = ControllerState::new(
         store,
         options.playlist_segments,
@@ -248,14 +250,12 @@ pub struct WorkerHandle {
 pub async fn spawn_worker(
     worker_id: &str,
     controller_url: &str,
-    cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
 ) -> WorkerHandle {
     spawn_worker_with_options(
         worker_id,
         controller_url,
-        cache_dir,
         cache_limit,
         start_sync,
         WorkerOptions::default(),
@@ -267,7 +267,6 @@ pub async fn spawn_worker(
 pub async fn spawn_worker_with_cors(
     worker_id: &str,
     controller_url: &str,
-    cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
     cors: CorsOrigins,
@@ -275,7 +274,6 @@ pub async fn spawn_worker_with_cors(
     spawn_worker_with_options(
         worker_id,
         controller_url,
-        cache_dir,
         cache_limit,
         start_sync,
         WorkerOptions {
@@ -290,7 +288,6 @@ pub async fn spawn_worker_with_cors(
 pub async fn spawn_worker_with_auth(
     worker_id: &str,
     controller_url: &str,
-    cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
     auth_token: &str,
@@ -298,7 +295,6 @@ pub async fn spawn_worker_with_auth(
     spawn_worker_with_options(
         worker_id,
         controller_url,
-        cache_dir,
         cache_limit,
         start_sync,
         WorkerOptions {
@@ -313,7 +309,6 @@ pub async fn spawn_worker_with_auth(
 pub async fn spawn_worker_with_weight(
     worker_id: &str,
     controller_url: &str,
-    cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
     weight: u32,
@@ -321,7 +316,6 @@ pub async fn spawn_worker_with_weight(
     spawn_worker_with_options(
         worker_id,
         controller_url,
-        cache_dir,
         cache_limit,
         start_sync,
         WorkerOptions {
@@ -352,7 +346,6 @@ impl Default for WorkerOptions {
 async fn spawn_worker_with_options(
     worker_id: &str,
     controller_url: &str,
-    cache_dir: PathBuf,
     cache_limit: u64,
     start_sync: bool,
     options: WorkerOptions,
@@ -362,8 +355,7 @@ async fn spawn_worker_with_options(
         auth_token,
         weight,
     } = options;
-    tokio::fs::create_dir_all(&cache_dir).await.unwrap();
-    let cache = Cache::scan(cache_dir, cache_limit).await.unwrap();
+    let cache = Cache::new(cache_limit).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let public_url = format!("http://{addr}");

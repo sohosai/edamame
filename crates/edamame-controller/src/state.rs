@@ -25,8 +25,6 @@ pub struct ControllerState {
     /// 外部配信へ流す最低の割合（%）
     pub external_min_percent: u8,
     pub inner: Mutex<Inner>,
-    /// 同時 PUT が競合しないよう、属性の確認から番号の割り当て、メタデータの更新までを直列化するロック
-    write_lock: Mutex<()>,
 }
 
 /// メモリ上の channel と worker
@@ -34,6 +32,10 @@ pub struct ControllerState {
 pub struct Inner {
     pub channels: BTreeMap<String, ChannelState>,
     pub workers: BTreeMap<String, WorkerState>,
+    /// 同じセグメント番号に別のバイト列で保存し直したセグメント
+    /// worker が古いバイト列をキャッシュしている可能性があるため、sync で再取得を指示する。
+    /// セグメントファイルが保存されている間は記録を残し、公開範囲が古い範囲へ戻ったときにも指示する
+    pub replaced: BTreeSet<SegmentId>,
 }
 
 /// channel のメタデータ
@@ -74,6 +76,9 @@ pub struct QualityState {
     /// セグメント番号ごとの暗号化の指定
     /// 登録がないセグメントは暗号化されていない
     pub encryption: BTreeMap<u64, SegmentEncryption>,
+    /// 保存されているセグメント番号から識別子を引く索引
+    /// セグメントファイルを削除したときに、識別子の対応も一緒に外すために使う
+    pub segment_identifiers: BTreeMap<u64, String>,
     /// 配信先の選択で使う worker ごとの現在値
     pub current_weights: BTreeMap<String, i64>,
     /// 公開済みのセグメント番号
@@ -96,10 +101,10 @@ pub struct WorkerState {
     pub last_sync_ms: u64,
     pub cached: BTreeSet<SegmentId>,
     /// worker が取得中と報告したセグメント
-    /// 取得が終わっていなくても暗号化の指定を残すために使う
+    /// 同じ番号に保存し直したときに、古いバイト列がキャッシュされるのを防ぐために使う
     pub fetching: BTreeSet<SegmentId>,
     /// 直前の sync 応答で取得を指示したセグメント
-    /// 暗号化の指定を残すために使い、sync ごとにその時点の未キャッシュの集合に置き換える
+    /// 取得が終わって報告されるまでの間に、同じ番号に保存し直したことを検出するために使う
     pub instructed: BTreeSet<SegmentId>,
 }
 
@@ -143,7 +148,6 @@ impl ControllerState {
             publish_wait_ms,
             external_min_percent,
             inner: Mutex::new(Inner::default()),
-            write_lock: Mutex::new(()),
         })
     }
 
@@ -210,20 +214,17 @@ impl ControllerState {
             None => None,
         };
 
-        // 同時 PUT の属性の確認と番号の割り当てには write_lock を使う
-        // ファイル I/O が共有状態の参照を妨げないよう、inner の mutex は保持しない
-        let _write_guard = self.write_lock.lock().await;
-        // 保存に成功したときだけメタデータを確定するため、ここでは割り当てる番号を決めるだけにする
-        let (sequence, known_identifier, stored_in_quality, next_sequence) = {
-            let inner = self.inner.lock().await;
-            validate_segment_metadata(
-                &inner,
-                channel_id,
-                quality,
-                duration_ms,
-                bandwidth,
-                resolution.as_deref(),
-            )?;
+        // 保存とメタデータの更新を inner の mutex で直列化し、容量を超えて削除したセグメントを同じ時点で反映する
+        let mut inner = self.inner.lock().await;
+        validate_segment_metadata(
+            &inner,
+            channel_id,
+            quality,
+            duration_ms,
+            bandwidth,
+            resolution.as_deref(),
+        )?;
+        let (sequence, known_identifier, stored_in_quality, next_sequence) =
             match inner.channels.get(channel_id) {
                 Some(channel) => match channel.identifiers.get(identifier) {
                     Some(state) => (
@@ -231,74 +232,62 @@ impl ControllerState {
                         true,
                         // 同じ quality に保存済みの場合だけ、バイト列を比較する
                         state.qualities.contains(quality),
-                        channel.next_sequence,
+                        None,
                     ),
                     None => (
                         channel.next_sequence,
                         false,
                         false,
-                        channel.next_sequence.checked_add(1).ok_or_else(|| {
+                        Some(channel.next_sequence.checked_add(1).ok_or_else(|| {
                             EdamameError::Internal("segment sequence is exhausted".to_owned())
-                        })?,
+                        })?),
                     ),
                 },
                 // controller の起動ごとに 0 から採番する
-                None => (0, false, false, 1),
-            }
-        };
+                None => (0, false, false, Some(1)),
+            };
 
         let outcome = if stored_in_quality {
-            // 同じ識別子の再 PUT は、保存済みのバイト列と同じ場合だけ受け付ける
-            if self
+            // quality の登録が残るのは、セグメントファイルが保存されている間だけ
+            let existing = self
                 .store
-                .segment_exists(channel_id, quality, sequence)
-                .await?
-            {
-                let existing = self
-                    .store
-                    .read_segment(channel_id, quality, sequence)
-                    .await?;
-                if existing != bytes {
-                    return Err(EdamameError::Conflict(
-                        "segment bytes differ from the canonical file".to_owned(),
-                    ));
-                }
-                IngestOutcome::AlreadyExists { sequence }
-            } else {
-                self.store
-                    .write_segment(channel_id, quality, sequence, bytes)
-                    .await?;
-                IngestOutcome::Created { sequence }
+                .get(channel_id, quality, sequence)
+                .map_err(|_| EdamameError::Internal("stored segment is missing".to_owned()))?;
+            // 同じ識別子の再 PUT は、保存済みのバイト列と同じ場合だけ受け付ける
+            if existing != bytes {
+                return Err(EdamameError::Conflict(
+                    "segment bytes differ from the canonical file".to_owned(),
+                ));
             }
+            IngestOutcome::AlreadyExists { sequence }
         } else {
-            // この quality に初めて保存する。前の実行のファイルと同じ番号になっても上書きする
-            self.store
-                .write_segment(channel_id, quality, sequence, bytes)
-                .await?;
+            let removed = self.store.put(channel_id, quality, sequence, bytes)?;
+            purge_removed_segments(&mut inner, &removed);
+            // 識別子が別の quality に残っていて番号を使い回す場合、worker が古いバイト列をキャッシュしているか、取得中かもしれない
+            if known_identifier {
+                let id = SegmentId {
+                    channel_id: channel_id.to_owned(),
+                    quality: quality.to_owned(),
+                    sequence,
+                };
+                let may_hold_old_bytes = inner.workers.values().any(|worker| {
+                    worker.cached.contains(&id)
+                        || worker.fetching.contains(&id)
+                        || worker.instructed.contains(&id)
+                });
+                if may_hold_old_bytes {
+                    inner.replaced.insert(id);
+                }
+            }
             IngestOutcome::Created { sequence }
         };
 
         // controller の保存が終わる前に公開待ちを始めると、worker が取得に使える時間が短くなる
         let committed_at_ms = now_ms();
-        let mut inner = self.inner.lock().await;
-        // 公開範囲が古い範囲へ戻る場合に備え、worker が持つセグメントや取得を指示したセグメントの暗号化の指定を残す
-        let worker_segments: BTreeSet<u64> = inner
-            .workers
-            .values()
-            .flat_map(|worker| {
-                worker
-                    .cached
-                    .iter()
-                    .chain(worker.fetching.iter())
-                    .chain(worker.instructed.iter())
-            })
-            .filter(|id| id.channel_id == channel_id && id.quality == quality)
-            .map(|id| id.sequence)
-            .collect();
         let channel = inner
             .channels
             .entry(channel_id.to_owned())
-            .or_insert_with(|| ChannelState::new(duration_ms, next_sequence));
+            .or_insert_with(|| ChannelState::new(duration_ms, 1));
         let identifier_state = channel
             .identifiers
             .entry(identifier.to_owned())
@@ -307,7 +296,7 @@ impl ControllerState {
                 qualities: BTreeSet::new(),
             });
         identifier_state.qualities.insert(quality.to_owned());
-        if !known_identifier {
+        if let Some(next_sequence) = next_sequence {
             channel.next_sequence = next_sequence;
         }
         let quality_state = channel
@@ -317,6 +306,7 @@ impl ControllerState {
                 bandwidth,
                 resolution: resolution.clone(),
                 encryption: BTreeMap::new(),
+                segment_identifiers: BTreeMap::new(),
                 current_weights: BTreeMap::new(),
                 published: BTreeSet::new(),
                 publish_due_ms: None,
@@ -345,12 +335,10 @@ impl ControllerState {
             self.publish_wait_ms,
             known_identifier && stored_in_quality,
         );
+        quality_state
+            .segment_identifiers
+            .insert(sequence, identifier.to_owned());
         prune_segments(&mut quality_state.segments, self.playlist_segments);
-        prune_encryption(
-            &mut quality_state.encryption,
-            &quality_state.segments,
-            &worker_segments,
-        );
         Ok(outcome)
     }
 
@@ -373,7 +361,7 @@ impl ControllerState {
         let created = if let Some(worker) = inner.workers.get_mut(worker_id) {
             worker.public_url = public_url;
             worker.weight = i64::from(weight);
-            // 再登録時は、controller が保持する報告済みのキャッシュを無効にする
+            // 再登録時は、controller が保持する報告済みのキャッシュと取得の指示を無効にする
             worker.cached = BTreeSet::new();
             worker.fetching = BTreeSet::new();
             worker.instructed = BTreeSet::new();
@@ -426,7 +414,9 @@ impl ControllerState {
         }
         // 公開範囲は GET では変えず、worker の sync 報告を受けた時だけ更新する
         {
-            let Inner { channels, workers } = &mut *inner;
+            let Inner {
+                channels, workers, ..
+            } = &mut *inner;
             advance_published(
                 channels,
                 workers,
@@ -436,15 +426,23 @@ impl ControllerState {
             );
         }
         let target = cache_target(&inner.channels, self.playlist_segments);
+        // 同じ番号で保存し直したセグメントは、キャッシュの報告に関わらず取得を指示する。
+        // 公開範囲はキャッシュ対象より古い番号を含むことがあり、後で古い範囲へ戻ることもある
+        let keep: BTreeSet<SegmentId> = inner
+            .replaced
+            .iter()
+            .filter(|id| is_in_playback_range(&inner, &target, id))
+            .cloned()
+            .collect();
         let worker = inner
             .workers
             .get_mut(worker_id)
             // 上の get_mut で存在を確認済みのため、ここでは見つからないことがない
             .expect("worker was checked above");
-        let missing: BTreeSet<SegmentId> = target.difference(&worker.cached).cloned().collect();
+        let mut missing: BTreeSet<SegmentId> = target.difference(&worker.cached).cloned().collect();
+        missing.extend(keep);
         let fetch_segments = missing.iter().map(SegmentKey::from).collect();
-        // 暗号化の指定を残す対象として、今回の取得指示を保存する
-        // 前回の一覧は、今回計算した未キャッシュの集合に置き換える
+        // 取得中でまだ報告していないセグメントを、再保存のときに検出できるようにする
         worker.instructed = missing;
         Ok(SyncResponse { fetch_segments })
     }
@@ -459,7 +457,9 @@ impl ControllerState {
         validate_quality(quality)?;
         let (segment_duration_ms, published, encryption, worker_url) = {
             let mut inner = self.inner.lock().await;
-            let Inner { channels, workers } = &mut *inner;
+            let Inner {
+                channels, workers, ..
+            } = &mut *inner;
             let channel = channels
                 .get_mut(channel_id)
                 .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
@@ -492,11 +492,7 @@ impl ControllerState {
         let playlist =
             plan_media_playlist(&published, segment_duration_ms, self.playlist_segments)?;
         for sequence in &playlist.sequences {
-            if !self
-                .store
-                .segment_exists(channel_id, quality, *sequence)
-                .await?
-            {
+            if !self.store.contains(channel_id, quality, *sequence) {
                 return Err(EdamameError::Unprocessable(
                     "segment file is missing".to_owned(),
                 ));
@@ -529,7 +525,9 @@ impl ControllerState {
         // ファイル確認と外部への確認の間は mutex を保持せず、公開範囲と配信可否を先に集める
         let (segment_duration_ms, published, external_m3u8, external_percent) = {
             let inner = self.inner.lock().await;
-            let Inner { channels, workers } = &*inner;
+            let Inner {
+                channels, workers, ..
+            } = &*inner;
             let channel = channels
                 .get(channel_id)
                 .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
@@ -606,11 +604,7 @@ impl ControllerState {
         }
         for (quality, (_, _, segments, _)) in &published {
             for sequence in segments {
-                if !self
-                    .store
-                    .segment_exists(channel_id, quality, *sequence)
-                    .await?
-                {
+                if !self.store.contains(channel_id, quality, *sequence) {
                     return Err(EdamameError::Unprocessable(
                         "segment file is missing".to_owned(),
                     ));
@@ -987,17 +981,52 @@ fn prune_segments(segments: &mut BTreeSet<u64>, playlist_segments: u64) {
     }
 }
 
-/// 公開に使う可能性があるセグメントの暗号化の指定だけを残す
-///
-/// worker が持つセグメントと、取得を指示したセグメントを含めるのは、
-/// 遅れた worker の古い公開範囲へ戻る場合に備えるためである。
-fn prune_encryption(
-    encryption: &mut BTreeMap<u64, SegmentEncryption>,
-    segments: &BTreeSet<u64>,
-    worker_segments: &BTreeSet<u64>,
-) {
-    encryption
-        .retain(|sequence, _| segments.contains(sequence) || worker_segments.contains(sequence));
+/// 削除したセグメントのメタデータを、保存されているセグメントだけに揃える
+fn purge_removed_segments(inner: &mut Inner, removed: &[SegmentKey]) {
+    for key in removed {
+        // 保存がなくなったセグメントに再取得の指示は要らない
+        inner.replaced.remove(&SegmentId {
+            channel_id: key.channel_id.clone(),
+            quality: key.quality.clone(),
+            sequence: key.sequence,
+        });
+        let Some(channel) = inner.channels.get_mut(&key.channel_id) else {
+            continue;
+        };
+        // 保存がなくなったセグメントの暗号化、公開待ち、識別子の対応を残さない
+        let identifier = {
+            let Some(quality) = channel.qualities.get_mut(&key.quality) else {
+                continue;
+            };
+            quality.segments.remove(&key.sequence);
+            quality.encryption.remove(&key.sequence);
+            quality.pending.remove(&key.sequence);
+            quality.segment_identifiers.remove(&key.sequence)
+        };
+        // 別の quality に同じ識別子が残っている間は、識別子と番号の対応を残す
+        let Some(identifier) = identifier else {
+            continue;
+        };
+        if let Some(state) = channel.identifiers.get_mut(&identifier) {
+            state.qualities.remove(&key.quality);
+            if state.qualities.is_empty() {
+                channel.identifiers.remove(&identifier);
+            }
+        }
+    }
+}
+
+/// セグメントが worker のキャッシュ対象か、公開範囲に含まれるかを返す
+/// 公開範囲は遅れた worker に合わせてキャッシュ対象より古い番号を含むことがある
+fn is_in_playback_range(inner: &Inner, target: &BTreeSet<SegmentId>, id: &SegmentId) -> bool {
+    if target.contains(id) {
+        return true;
+    }
+    inner
+        .channels
+        .get(&id.channel_id)
+        .and_then(|channel| channel.qualities.get(&id.quality))
+        .is_some_and(|quality| quality.published.contains(&id.sequence))
 }
 
 /// worker のキャッシュ対象となる直近のセグメントの範囲を返す
@@ -1027,14 +1056,6 @@ fn cache_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 暗号鍵の URI だけを指定する
-    fn segment_encryption(key_uri: &str) -> SegmentEncryption {
-        SegmentEncryption {
-            key_uri: key_uri.to_owned(),
-            iv: None,
-        }
-    }
 
     fn channel_with_quality(
         segments: &[u64],
@@ -1071,6 +1092,7 @@ mod tests {
                 bandwidth: 3_000_000,
                 resolution: None,
                 encryption: BTreeMap::new(),
+                segment_identifiers: BTreeMap::new(),
                 current_weights: BTreeMap::new(),
                 published: published.iter().copied().collect(),
                 publish_due_ms,
@@ -1133,79 +1155,118 @@ mod tests {
             .unwrap();
     }
 
-    /// sync で送るセグメントの一覧を作る
-    fn segment_keys(sequences: impl IntoIterator<Item = u64>) -> Vec<SegmentKey> {
-        sequences
-            .into_iter()
-            .map(|sequence| SegmentKey {
-                channel_id: "live".to_owned(),
-                quality: "720p".to_owned(),
-                sequence,
-            })
-            .collect()
-    }
-
-    /// worker が取得を指示されているセグメント番号
-    async fn fetching_sequences(state: &ControllerState) -> Vec<u64> {
-        let inner = state.inner.lock().await;
-        inner.workers["worker-a"]
-            .fetching
-            .iter()
-            .map(|id| id.sequence)
-            .collect()
-    }
-
-    /// 取得に失敗したセグメントは、再取得の指示が残る間は暗号化の指定を残す
+    /// 保存されているセグメントの暗号化の指定は、メタデータの window から外れても残す
     #[tokio::test]
-    async fn keeps_encryption_of_segments_to_refetch() {
-        let dir = std::env::temp_dir().join(format!("edamame-refetch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let state = ControllerState::new(CanonicalStore::new(dir.clone()), 6, 1_000, 10_000, 0, 1);
+    async fn keeps_encryption_of_stored_segments_outside_window() {
+        let state = ControllerState::new(CanonicalStore::new(1_000), 6, 1_000, 10_000, 0, 1);
+        for sequence in 0..18 {
+            ingest_encrypted_segment(&state, sequence).await;
+        }
+        let inner = state.inner.lock().await;
+        let quality = &inner.channels["live"].qualities["720p"];
+        assert!(quality.segments.contains(&17));
+        assert!(!quality.segments.contains(&0));
+        assert!(
+            quality.encryption.contains_key(&0),
+            "保存されているセグメントの暗号化の指定が失われている"
+        );
+    }
+
+    /// 保存容量を超えたセグメントのメタデータを残さない
+    #[tokio::test]
+    async fn purge_metadata_of_removed_segments() {
+        // セグメントは 7 byte なので、容量 14 では直近の 2 つだけを保存する
+        let state = ControllerState::new(CanonicalStore::new(14), 6, 1_000, 10_000, 0, 1);
         for sequence in 0..6 {
             ingest_encrypted_segment(&state, sequence).await;
         }
-        state
-            .register_worker("worker-a", "http://worker.test", 1, 0)
-            .await
-            .unwrap();
-        // 最初のセグメントだけ取得に失敗し、残りを取得した状態で報告する（0 は取得中）
-        state
-            .sync_worker("worker-a", segment_keys(1..6), segment_keys(0..1), 0)
-            .await
-            .unwrap();
-        assert_eq!(fetching_sequences(&state).await, vec![0]);
-        // 再取得の途中で新しいセグメントが届き、0 の取得が続いたまま再度 sync しても 0 は残る
-        ingest_encrypted_segment(&state, 6).await;
-        state
-            .sync_worker("worker-a", segment_keys(1..6), segment_keys(0..1), 0)
-            .await
-            .unwrap();
-        assert!(
-            fetching_sequences(&state).await.contains(&0),
-            "再取得中のセグメントが取得の対象から外れている"
-        );
-        // 再取得の指示が残ったまま、メタデータに残る範囲から外れるまでセグメントを追加する
-        for sequence in 7..18 {
-            ingest_encrypted_segment(&state, sequence).await;
-        }
-        // 再取得できた 0 から 5 を報告しても、0 の暗号化の指定が残っている
-        state
-            .sync_worker("worker-a", segment_keys(0..6), Vec::new(), 0)
-            .await
-            .unwrap();
-        let sequences: Vec<u64> = {
+        assert_eq!(state.store.sequences("live", "720p"), vec![4, 5]);
+        {
             let inner = state.inner.lock().await;
-            inner.channels["live"].qualities["720p"]
-                .encryption
-                .keys()
-                .copied()
-                .collect()
-        };
-        assert!(
-            sequences.contains(&0),
-            "再取得したセグメントの暗号化の指定が失われている: {sequences:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+            let quality = &inner.channels["live"].qualities["720p"];
+            assert_eq!(
+                quality.encryption.keys().copied().collect::<Vec<_>>(),
+                vec![4, 5]
+            );
+            assert!(!quality.segment_identifiers.contains_key(&0));
+            assert!(!inner.channels["live"].identifiers.contains_key("seg-0"));
+        }
+        // 削除された識別子の再 PUT は、新しい番号を割り当てて保存する
+        let outcome = state
+            .ingest_segment(SegmentIngest {
+                channel_id: "live",
+                quality: "720p",
+                identifier: "seg-0",
+                duration_ms: 6000,
+                bandwidth: 3_000_000,
+                resolution: None,
+                key_uri: Some("https://keys.test/a"),
+                iv: Some("00000000000000000000000000000000"),
+                bytes: b"segment",
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, IngestOutcome::Created { sequence: 6 });
+    }
+
+    /// 別の quality に同じ識別子が残っている間は、同じ番号で再保存する
+    #[tokio::test]
+    async fn keeps_sequence_while_identifier_stays_in_another_quality() {
+        let state = ControllerState::new(CanonicalStore::new(14), 6, 1_000, 10_000, 0, 1);
+        for quality in ["720p", "480p"] {
+            state
+                .ingest_segment(SegmentIngest {
+                    channel_id: "live",
+                    quality,
+                    identifier: "seg-0",
+                    duration_ms: 6000,
+                    bandwidth: 3_000_000,
+                    resolution: None,
+                    key_uri: None,
+                    iv: None,
+                    bytes: b"segment",
+                })
+                .await
+                .unwrap();
+        }
+        // 720p の次のセグメントで、720p の seg-0 が容量を超えて削除される
+        state
+            .ingest_segment(SegmentIngest {
+                channel_id: "live",
+                quality: "720p",
+                identifier: "seg-1",
+                duration_ms: 6000,
+                bandwidth: 3_000_000,
+                resolution: None,
+                key_uri: None,
+                iv: None,
+                bytes: b"segment",
+            })
+            .await
+            .unwrap();
+        {
+            let inner = state.inner.lock().await;
+            let state = &inner.channels["live"].identifiers["seg-0"];
+            assert_eq!(state.sequence, 0);
+            assert!(state.qualities.contains("480p"));
+            assert!(!state.qualities.contains("720p"));
+        }
+        // 480p に識別子が残っているため、720p への再 PUT は同じ番号 0 に保存する
+        let outcome = state
+            .ingest_segment(SegmentIngest {
+                channel_id: "live",
+                quality: "720p",
+                identifier: "seg-0",
+                duration_ms: 6000,
+                bandwidth: 3_000_000,
+                resolution: None,
+                key_uri: None,
+                iv: None,
+                bytes: b"segment",
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, IngestOutcome::Created { sequence: 0 });
     }
 
     #[test]
@@ -1464,14 +1525,7 @@ mod tests {
 
     #[tokio::test]
     async fn resets_current_weights_on_registration() {
-        let state = ControllerState::new(
-            CanonicalStore::new(std::path::PathBuf::from("/tmp/edamame-test")),
-            6,
-            1_000,
-            10_000,
-            0,
-            1,
-        );
+        let state = ControllerState::new(CanonicalStore::new(1_024), 6, 1_000, 10_000, 0, 1);
         state
             .register_worker("worker-a", "http://a.test", 4, 0)
             .await
@@ -1515,27 +1569,6 @@ mod tests {
         segments.insert(110);
         prune_segments(&mut segments, 6);
         assert_eq!(segments, BTreeSet::from([105, 106, 110]));
-    }
-
-    #[test]
-    fn keeps_encryption_for_playlist_and_worker_cache() {
-        let key = segment_encryption("https://keys.test/a");
-        let mut encryption = BTreeMap::from([
-            (99, key.clone()),
-            (100, key.clone()),
-            (101, key.clone()),
-            (102, key.clone()),
-        ]);
-        // メタデータに残る範囲と、worker が公開に使える範囲の指定だけを残す
-        prune_encryption(
-            &mut encryption,
-            &BTreeSet::from([101, 102]),
-            &BTreeSet::from([100]),
-        );
-        assert_eq!(
-            encryption,
-            BTreeMap::from([(100, key.clone()), (101, key.clone()), (102, key)])
-        );
     }
 
     #[test]

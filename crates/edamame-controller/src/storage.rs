@@ -1,107 +1,204 @@
 //! controller の正規セグメントストレージ
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
-use edamame_domain::{EdamameError, render_filename};
+use edamame_domain::{EdamameError, SegmentKey};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// `storage_dir` をルートとする正規ストア
-#[derive(Debug, Clone)]
+/// セグメントファイルをメモリ上に保存する正規ストア
+///
+/// 保存しているバイト数の合計が容量を超えたときは、書き込んだ順に古いセグメントから削除する
 pub struct CanonicalStore {
-    root: PathBuf,
+    capacity: u64,
+    inner: Mutex<StoreInner>,
+}
+
+struct StoreInner {
+    segments: BTreeMap<SegmentKey, StoredSegment>,
+    /// 削除する順番を決めるための、書き込み順の索引
+    order: BTreeMap<u64, SegmentKey>,
+    used_bytes: u64,
+    next_order: u64,
+}
+
+struct StoredSegment {
+    bytes: Vec<u8>,
+    order: u64,
 }
 
 impl CanonicalStore {
-    /// ルートを作る
+    /// 空のストアを作る
     #[must_use]
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(capacity: u64) -> Self {
+        Self {
+            capacity,
+            inner: Mutex::new(StoreInner {
+                segments: BTreeMap::new(),
+                order: BTreeMap::new(),
+                used_bytes: 0,
+                next_order: 0,
+            }),
+        }
     }
 
-    /// セグメントファイルのパスを返す
+    /// セグメントファイルが保存されているかを返す
     #[must_use]
-    pub fn segment_path(&self, channel_id: &str, quality: &str, sequence: u64) -> PathBuf {
-        self.root
-            .join(channel_id)
-            .join(quality)
-            .join(render_filename(sequence))
-    }
-
-    /// セグメントファイルの存在を確認する
-    pub async fn segment_exists(
-        &self,
-        channel_id: &str,
-        quality: &str,
-        sequence: u64,
-    ) -> Result<bool, EdamameError> {
-        let path = self.segment_path(channel_id, quality, sequence);
-        tokio::fs::try_exists(&path)
-            .await
-            .map_err(|error| EdamameError::Internal(format!("check segment failed: {error}")))
+    pub fn contains(&self, channel_id: &str, quality: &str, sequence: u64) -> bool {
+        let inner = self.inner.lock().expect("store lock is not poisoned");
+        inner
+            .segments
+            .contains_key(&segment_key(channel_id, quality, sequence))
     }
 
     /// セグメントファイルを読み込む
-    pub async fn read_segment(
+    pub fn get(
         &self,
         channel_id: &str,
         quality: &str,
         sequence: u64,
     ) -> Result<Vec<u8>, EdamameError> {
-        let path = self.segment_path(channel_id, quality, sequence);
-        match tokio::fs::read(&path).await {
-            Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(EdamameError::NotFound("segment not found".to_owned()))
-            }
-            Err(error) => Err(EdamameError::Internal(format!(
-                "read segment failed: {error}"
-            ))),
+        let inner = self.inner.lock().expect("store lock is not poisoned");
+        match inner
+            .segments
+            .get(&segment_key(channel_id, quality, sequence))
+        {
+            Some(segment) => Ok(segment.bytes.clone()),
+            None => Err(EdamameError::NotFound("segment not found".to_owned())),
         }
     }
 
-    /// セグメントファイルをアトミックに保存する
-    pub async fn write_segment(
+    /// セグメントファイルを保存し、容量を超えた分を削除して削除した一覧を返す
+    pub fn put(
         &self,
         channel_id: &str,
         quality: &str,
         sequence: u64,
         bytes: &[u8],
-    ) -> Result<(), EdamameError> {
-        let path = self.segment_path(channel_id, quality, sequence);
-        write_atomic(&path, bytes).await
+    ) -> Result<Vec<SegmentKey>, EdamameError> {
+        let byte_count = bytes.len() as u64;
+        if byte_count > self.capacity {
+            return Err(EdamameError::PayloadTooLarge(
+                "segment is larger than the storage capacity".to_owned(),
+            ));
+        }
+        let key = segment_key(channel_id, quality, sequence);
+        let mut inner = self.inner.lock().expect("store lock is not poisoned");
+        // 同じセグメントファイルを上書きするときは、古いバイト数と書き込み順を取り除く
+        if let Some(previous) = inner.segments.remove(&key) {
+            inner.used_bytes -= previous.bytes.len() as u64;
+            inner.order.remove(&previous.order);
+        }
+        let order = inner.next_order;
+        inner.next_order += 1;
+        inner.used_bytes += byte_count;
+        inner.segments.insert(
+            key.clone(),
+            StoredSegment {
+                bytes: bytes.to_vec(),
+                order,
+            },
+        );
+        inner.order.insert(order, key);
+
+        let mut removed = Vec::new();
+        while inner.used_bytes > self.capacity {
+            let Some((&oldest_order, _)) = inner.order.iter().next() else {
+                break;
+            };
+            let Some(oldest) = inner.order.remove(&oldest_order) else {
+                break;
+            };
+            if let Some(segment) = inner.segments.remove(&oldest) {
+                inner.used_bytes -= segment.bytes.len() as u64;
+                removed.push(oldest);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// `(channel_id, quality)` に保存されているセグメント番号を昇順で返す
+    #[must_use]
+    pub fn sequences(&self, channel_id: &str, quality: &str) -> Vec<u64> {
+        let inner = self.inner.lock().expect("store lock is not poisoned");
+        inner
+            .segments
+            .keys()
+            .filter(|key| key.channel_id == channel_id && key.quality == quality)
+            .map(|key| key.sequence)
+            .collect()
+    }
+
+    /// 保存に使っているバイト数を返す
+    #[must_use]
+    pub fn used_bytes(&self) -> u64 {
+        let inner = self.inner.lock().expect("store lock is not poisoned");
+        inner.used_bytes
     }
 }
 
-/// 一時ファイルに書いてから rename することで、読み手に中途半端なファイルを見せない
-pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), EdamameError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| EdamameError::Internal("segment path has no parent".to_owned()))?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|error| EdamameError::Internal(format!("create storage dir failed: {error}")))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("segment");
-    let temp_path = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(error) = tokio::fs::write(&temp_path, bytes).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(EdamameError::Internal(format!(
-            "write segment failed: {error}"
-        )));
+fn segment_key(channel_id: &str, quality: &str, sequence: u64) -> SegmentKey {
+    SegmentKey {
+        channel_id: channel_id.to_owned(),
+        quality: quality.to_owned(),
+        sequence,
     }
-    if let Err(error) = tokio::fs::rename(&temp_path, path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(EdamameError::Internal(format!(
-            "commit segment failed: {error}"
-        )));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stores_and_reads_segments() {
+        let store = CanonicalStore::new(1024);
+        assert!(!store.contains("live", "720p", 0));
+        let removed = store.put("live", "720p", 0, b"segment-0").unwrap();
+        assert!(removed.is_empty());
+        assert!(store.contains("live", "720p", 0));
+        assert_eq!(store.get("live", "720p", 0).unwrap(), b"segment-0");
+        assert_eq!(store.used_bytes(), 9);
+        assert!(store.get("live", "720p", 1).is_err());
     }
-    Ok(())
+
+    #[test]
+    fn removes_oldest_segments_beyond_capacity() {
+        let store = CanonicalStore::new(16);
+        store.put("live", "720p", 0, b"00000000").unwrap();
+        store.put("live", "720p", 1, b"11111111").unwrap();
+        let removed = store.put("live", "720p", 2, b"22222222").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].sequence, 0);
+        assert!(!store.contains("live", "720p", 0));
+        assert!(store.contains("live", "720p", 1));
+        assert!(store.contains("live", "720p", 2));
+        assert_eq!(store.used_bytes(), 16);
+    }
+
+    #[test]
+    fn rejects_segments_larger_than_capacity() {
+        let store = CanonicalStore::new(4);
+        let error = store.put("live", "720p", 0, b"12345").unwrap_err();
+        assert_eq!(error.status_code(), 413);
+        assert!(!store.contains("live", "720p", 0));
+        assert_eq!(store.used_bytes(), 0);
+    }
+
+    #[test]
+    fn overwrite_does_not_count_bytes_twice() {
+        let store = CanonicalStore::new(16);
+        store.put("live", "720p", 0, b"00000000").unwrap();
+        store.put("live", "720p", 0, b"1111").unwrap();
+        assert_eq!(store.used_bytes(), 4);
+    }
+
+    #[test]
+    fn lists_stored_sequences_by_quality() {
+        let store = CanonicalStore::new(1024);
+        store.put("live", "720p", 1, b"a").unwrap();
+        store.put("live", "720p", 0, b"b").unwrap();
+        store.put("live", "480p", 5, b"c").unwrap();
+        assert_eq!(store.sequences("live", "720p"), vec![0, 1]);
+        assert_eq!(store.sequences("live", "480p"), vec![5]);
+        assert!(store.sequences("live", "1080p").is_empty());
+    }
 }

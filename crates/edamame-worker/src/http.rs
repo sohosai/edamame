@@ -114,27 +114,14 @@ async fn get_segment(
     validate_identifier("channel_id", &channel_id)?;
     validate_quality(&quality)?;
     let sequence = parse_sequence_filename(&filename)?;
-    let path = {
+    let bytes = {
         let cache = state.cache.lock().await;
-        if !cache.contains(&channel_id, &quality, sequence) {
-            return Err(EdamameError::NotFound("segment is not cached".to_owned()).into());
-        }
-        cache.path_for(&channel_id, &quality, sequence)?
+        cache.get(&channel_id, &quality, sequence)
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
+    match bytes {
+        Some(bytes) => {
             Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
         }
-        Err(error) => {
-            // 読めないセグメントファイルを索引に残すと、controller が次の sync で取得対象に戻さない。
-            // 再取得できるよう、索引から外す。
-            let mut cache = state.cache.lock().await;
-            cache.remove(&channel_id, &quality, sequence);
-            if error.kind() == std::io::ErrorKind::NotFound {
-                Err(EdamameError::NotFound("segment is not cached".to_owned()).into())
-            } else {
-                Err(EdamameError::Internal(format!("read cached segment failed: {error}")).into())
-            }
-        }
+        None => Err(EdamameError::NotFound("segment is not cached".to_owned()).into()),
     }
 }

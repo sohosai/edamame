@@ -28,7 +28,7 @@ pub struct RegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub cached_segments: Vec<SegmentKey>,
-    /// worker が取得中のセグメントを表す
+    /// worker が取得中のセグメント。controller が同じ番号に保存し直したセグメントの再取得を判断するために使う
     pub fetching_segments: Vec<SegmentKey>,
 }
 

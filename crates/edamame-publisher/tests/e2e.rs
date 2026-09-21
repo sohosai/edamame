@@ -100,8 +100,8 @@ fn playlist_ivs(playlist: &str) -> (u64, Vec<String>) {
 fn publishes_encrypted_segments_for_all_renditions() {
     let dir = TestDir::new("renditions");
     let srt_port = free_port();
-    let controller = Controller::start(dir.path(), "test-token");
-    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
     let config = write_config(
         dir.path(),
         &format!(
@@ -159,7 +159,8 @@ video_bitrate = 500000
     let iv_zero = "0".repeat(32);
     for (quality, resolution) in [("main", "640,360"), ("small", "320,180")] {
         let sequence = main[0];
-        let stored = fs::read(controller.segment_path("1A", quality, sequence))
+        let stored = controller
+            .segment("1A", quality, sequence)
             .expect("セグメントを読めません");
         assert_ne!(
             stored.first(),
@@ -226,8 +227,8 @@ video_bitrate = 500000
 fn publishes_key_uri_and_iv() {
     let dir = TestDir::new("key-uri");
     let srt_port = free_port();
-    let controller = Controller::start(dir.path(), "test-token");
-    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
     let key_uri = "https://live.example.test/key/1A";
     let config = write_config(
         dir.path(),
@@ -284,7 +285,8 @@ bandwidth = 12000000
     assert_ne!(ivs[0], ivs[1], "IV が使い回されています: {playlist}");
 
     // プレイリストが示す IV で、保存されたセグメントを復号できる
-    let stored = fs::read(controller.segment_path("1A", "main", first_sequence))
+    let stored = controller
+        .segment("1A", "main", first_sequence)
         .expect("セグメントを読めません");
     assert_mpegts(&decrypt_segment(&publisher.key(), &ivs[0], &stored));
 
@@ -297,8 +299,8 @@ fn stops_only_the_channel_with_non_aac_audio() {
     let dir = TestDir::new("non-aac");
     let first_port = free_port();
     let second_port = free_port();
-    let controller = Controller::start(dir.path(), "test-token");
-    let _worker = Worker::start(dir.path(), &controller.base_url, "test-token");
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
     let config = write_config(
         dir.path(),
         &format!(
@@ -404,7 +406,7 @@ preset = "ultrafast"
 fn warns_when_copied_segment_durations_do_not_match() {
     let dir = TestDir::new("copy-duration");
     let srt_port = free_port();
-    let controller = Controller::start(dir.path(), "test-token");
+    let controller = Controller::start("test-token");
     let config = write_config(
         dir.path(),
         &format!(
@@ -463,7 +465,7 @@ preset = "ultrafast"
 fn restarts_ffmpeg_after_the_sender_disconnects() {
     let dir = TestDir::new("restart");
     let srt_port = free_port();
-    let controller = Controller::start(dir.path(), "test-token");
+    let controller = Controller::start("test-token");
     let config = write_config(
         dir.path(),
         &format!(

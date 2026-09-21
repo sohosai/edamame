@@ -21,7 +21,7 @@ controller を起動する。
 ```bash
 cargo run -p edamame-controller -- \
   --bind 127.0.0.1:9000 \
-  --storage-dir .edamame/controller \
+  --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
   --sync-timeout-ms 10000 \
@@ -38,7 +38,6 @@ cargo run -p edamame-worker -- \
   --bind 127.0.0.1:9001 \
   --public-url http://127.0.0.1:9001 \
   --controller-url http://127.0.0.1:9000 \
-  --cache-dir .edamame/worker-a \
   --cache-limit 12 \
   --auth-token example-token \
   --cors-origin '*'
@@ -76,7 +75,7 @@ services:
     image: ghcr.io/sohosai/edamame-controller:latest
     environment:
       EDAMAME_BIND: 0.0.0.0:9000
-      EDAMAME_STORAGE_DIR: /data
+      EDAMAME_STORAGE_CAPACITY: "512MiB"
       EDAMAME_PLAYLIST_SEGMENTS: 6
       EDAMAME_SYNC_INTERVAL_MS: 1000
       EDAMAME_SYNC_TIMEOUT_MS: 10000
@@ -85,8 +84,6 @@ services:
       EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9000:9000"
-    volumes:
-      - controller-storage:/data
 
   worker:
     image: ghcr.io/sohosai/edamame-worker:latest
@@ -97,18 +94,11 @@ services:
       EDAMAME_BIND: 0.0.0.0:9001
       EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
       EDAMAME_CONTROLLER_URL: http://controller:9000
-      EDAMAME_CACHE_DIR: /cache
       EDAMAME_CACHE_LIMIT: 12
       EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
     ports:
       - "9001:9001"
-    volumes:
-      - worker-cache:/cache
-
-volumes:
-  controller-storage:
-  worker-cache:
 ```
 
 publisher のイメージは ffmpeg を含むため別のターゲットで作る。GPU は NVIDIA Container Toolkit で渡す。
@@ -157,11 +147,11 @@ cargo test --workspace
 
 ## 制約
 
-- controller のメタデータとセグメント番号はメモリ上だけにあり、再起動すると失われる。再起動後のセグメント番号は 0 から始まる。
-- publisher は再起動後もセグメントファイルを PUT し続ける。前の実行のファイルと番号が重なった場合は上書きされる。
+- controller のセグメントファイル、メタデータ、セグメント番号はメモリ上だけにあり、再起動すると失われる。保存容量は `--storage-capacity` で指定し、超えた分は古いセグメントファイルから削除する。
+- publisher は再起動後もセグメントファイルを PUT し続ける。controller の再起動後のセグメント番号は 0 から始まる。
 - 同じセグメントには quality をまたいで同じセグメント識別子を付ける。
 - セグメントファイルをプレイリストに反映するまでには、`--publish-wait-ms` と worker の sync と取得の分だけ遅れる。
 - quality ごとに公開範囲は独立して決まり、メディアプレイリストは前進・後退・飛び得る。
 - worker の `--cache-limit` は controller の `--playlist-segments` より 1 以上大きくすることを推奨する。小さい場合、前の公開範囲を保持できず、controller が次の sync で保持されている最新の連続範囲へ切り替える。
-- worker は登録に成功した時点でキャッシュを捨てて取り直す。起動時は `--cache-dir` を走査し、登録できるまでその内容を配信する。
+- worker のキャッシュはメモリ上だけにあり、再起動すると失われる。worker は登録に成功した時点でキャッシュを捨てて取り直す。
 - PUT の認証は controller と worker の `--auth-token` で行い、GET と sync の POST には認証がない。TLS はないため private network で使う。

@@ -1,21 +1,17 @@
 //! controller を起動し、環境変数から設定を読み込めることを確認する
 
-mod support;
-
 use std::process::Stdio;
 use std::time::Duration;
 
-use support::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// 環境変数だけで起動でき、CLI の値は環境変数より優先される
 #[tokio::test]
 async fn reads_configuration_from_environment() {
-    let tmp = TempDir::new("config-env");
     let mut child = Command::new(env!("CARGO_BIN_EXE_edamame-controller"))
         .env("EDAMAME_BIND", "127.0.0.1:0")
-        .env("EDAMAME_STORAGE_DIR", tmp.path.join("storage"))
+        .env("EDAMAME_STORAGE_CAPACITY", "256MiB")
         .env("EDAMAME_SYNC_INTERVAL_MS", "100")
         .env("EDAMAME_SYNC_TIMEOUT_MS", "1000")
         .env("EDAMAME_PUBLISH_WAIT_MS", "2000")
@@ -56,10 +52,9 @@ async fn reads_configuration_from_environment() {
 /// EDAMAME_CORS_ORIGIN に空文字列を指定すると、不正な値として起動に失敗する
 #[tokio::test]
 async fn rejects_empty_environment_variable() {
-    let tmp = TempDir::new("config-env-empty");
     let child = Command::new(env!("CARGO_BIN_EXE_edamame-controller"))
         .env("EDAMAME_BIND", "127.0.0.1:0")
-        .env("EDAMAME_STORAGE_DIR", tmp.path.join("storage"))
+        .env("EDAMAME_STORAGE_CAPACITY", "256MiB")
         .env("EDAMAME_PLAYLIST_SEGMENTS", "6")
         .env("EDAMAME_SYNC_INTERVAL_MS", "100")
         .env("EDAMAME_SYNC_TIMEOUT_MS", "1000")
