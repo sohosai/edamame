@@ -136,6 +136,16 @@ pub fn validate_resolution(value: &str) -> Result<(), EdamameError> {
     Ok(())
 }
 
+/// IV を 16 byte の hex（小文字）にそろえる
+pub fn normalize_iv(value: &str) -> Result<String, EdamameError> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(EdamameError::BadRequest(
+            "iv must be 32 hex characters".to_owned(),
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +177,21 @@ mod tests {
         assert!(validate_resolution("1280").is_err());
         assert!(validate_resolution("x720").is_err());
         assert!(validate_resolution("1280x720x1").is_err());
+    }
+
+    #[test]
+    fn normalizes_iv() {
+        assert_eq!(
+            normalize_iv("00000000000000000000000000000000").unwrap(),
+            "00000000000000000000000000000000"
+        );
+        // 大文字は小文字にそろえる
+        assert_eq!(
+            normalize_iv("0000000000000000000000000000000A").unwrap(),
+            "0000000000000000000000000000000a"
+        );
+        assert!(normalize_iv("0000").is_err());
+        assert!(normalize_iv("0000000000000000000000000000000z").is_err());
+        assert!(normalize_iv("").is_err());
     }
 }

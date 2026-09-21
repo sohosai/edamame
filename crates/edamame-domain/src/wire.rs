@@ -28,6 +28,8 @@ pub struct RegisterResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub cached_segments: Vec<SegmentKey>,
+    /// 取得中のセグメントであり、暗号化の指定を保持する範囲に含める
+    pub fetching_segments: Vec<SegmentKey>,
 }
 
 /// worker の sync レスポンス

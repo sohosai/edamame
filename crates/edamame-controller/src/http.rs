@@ -170,6 +170,7 @@ struct SegmentQuery {
     bandwidth: u64,
     resolution: Option<String>,
     key_uri: Option<String>,
+    iv: Option<String>,
 }
 
 /// プレイリスト取得の query
@@ -194,6 +195,7 @@ async fn put_segment(
             bandwidth: query.bandwidth,
             resolution: query.resolution,
             key_uri: query.key_uri.as_deref(),
+            iv: query.iv.as_deref(),
             bytes: &body,
         })
         .await?;
@@ -348,7 +350,12 @@ async fn post_sync(
     ValidatedJson(request): ValidatedJson<SyncRequest>,
 ) -> Result<Json<SyncResponse>, HttpError> {
     let response = state
-        .sync_worker(&worker_id, request.cached_segments, now_ms())
+        .sync_worker(
+            &worker_id,
+            request.cached_segments,
+            request.fetching_segments,
+            now_ms(),
+        )
         .await?;
     Ok(Json(response))
 }

@@ -25,14 +25,16 @@
 ### セグメントファイルを登録する
 
 ```
-PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}
+PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}&iv={iv}
 ```
 
 publisher が正規セグメントファイルを登録する。
 `identifier` はセグメントごとに publisher が付ける識別子であり、同じセグメントには quality をまたいで同じ値を使う。
-`duration_ms` と `bandwidth` は必須で、`resolution` と `key_uri` は任意とする。
+`duration_ms` と `bandwidth` は必須で、`resolution` と `key_uri` と `iv` は任意とする。
 `duration_ms` は 500 以上の整数、`bandwidth` は正の整数、`resolution` は `{width}x{height}` の形式にする。
-`key_uri` は他の属性と違い競合にせず、同じ識別子の再 PUT では最後に受け取った値でそのセグメントの鍵 URI を置き換える。省略した場合は暗号化なしに戻す。
+`iv` は 16 byte を表す 32 文字の hex とし、大文字小文字は問わない。小文字にそろえて保存する。
+`iv` は `key_uri` と組で使い、`key_uri` を指定しない PUT に `iv` だけを付けても受け付けない。
+`key_uri` と `iv` は他の属性と違い競合にせず、同じ識別子の再 PUT では最後に受け取った組でそのセグメントの指定を置き換える。省略した場合は暗号化なしに戻す。
 controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。
 
 例：
@@ -44,13 +46,13 @@ curl -i -X PUT \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
 
-暗号化するセグメントは鍵 URI を付けて PUT する。
+暗号化するセグメントは鍵 URI と IV を付けて PUT する。
 
 ```bash
 curl -i -X PUT \
   -H 'Authorization: Bearer example-token' \
   --data-binary @segment-1.ts \
-  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720&key_uri=https%3A%2F%2Fkeys.example.test%2Flive%2Fkey-1'
+  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720&key_uri=https%3A%2F%2Fkeys.example.test%2Flive%2Fkey-1&iv=9f2c4a1d6b8e0f3a5c7d1e2b4a6c8d0e'
 ```
 
 レスポンス：
@@ -71,7 +73,7 @@ controller は起動するたびに channel ごとの連番を 0 から新しい
 - `201 Created`：新しいセグメントファイルを保存した
 - `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
 - `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
-- `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution`、`key_uri` の形式が不正、または `duration_ms` が 500 未満
+- `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution`、`key_uri`、`iv` の形式が不正、`iv` を `key_uri` なしで指定した、または `duration_ms` が 500 未満
 - `409 Conflict`：同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
 - `500 Internal Server Error`：セグメント番号の上限に達した、またはディスク容量不足、権限不足、読み取り専用ファイルシステム、I/O エラーなどで保存に失敗した
 
@@ -240,6 +242,9 @@ POST /workers/{worker_id}/sync
 {
   "cached_segments": [
     { "channel_id": "live", "quality": "720p", "sequence": 101 }
+  ],
+  "fetching_segments": [
+    { "channel_id": "live", "quality": "720p", "sequence": 102 }
   ]
 }
 ```
@@ -256,6 +261,8 @@ POST /workers/{worker_id}/sync
 
 worker は登録時に受け取った `sync_interval_ms` の間隔でこのエンドポイントを呼ぶ。
 リクエストのキャッシュ一覧（`cached_segments`）には、その時点でキャッシュしているセグメントファイルをすべて入れる。
+取得中の一覧（`fetching_segments`）には、その時点で取得しているセグメントを入れる。
+controller は取得中のセグメントの暗号化の指定も、公開に使う可能性がある間は保持する。
 controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
 `fetch_segments` には、キャッシュ対象のうちキャッシュ一覧に含まれないセグメント（未キャッシュのセグメント）を入れる。
 ここでキャッシュ対象とは、全 channel と全 quality の直近のセグメントの範囲に存在するセグメントの集合である。

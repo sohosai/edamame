@@ -19,10 +19,13 @@ pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) 
     let mut registered = false;
     let mut interval_ms = 1000_u64;
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
+    // 取得中のセグメント。取得が終わるまで controller に暗号化の指定を残してもらう
+    let mut fetching: Vec<SegmentKey> = Vec::new();
     loop {
         if !registered {
             // 前の登録で始めた取得が残っていると、捨てたキャッシュを古い内容で埋め直すため止める
             stop_fetch(&mut fetch_task).await;
+            fetching.clear();
             match register(&state, auth_token.as_deref()).await {
                 Ok(received_interval_ms) => {
                     registered = true;
@@ -37,16 +40,20 @@ pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) 
                 }
             }
         }
-        match sync_once(&state).await {
+        // 取得が終わったタスクを回収し、取得中の一覧を空にする。取得済みは次の sync のキャッシュ一覧で報告する
+        if fetch_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            if let Some(handle) = fetch_task.take() {
+                let _ = handle.await;
+            }
+            fetching.clear();
+        }
+        match sync_once(&state, &fetching).await {
             Ok(SyncOutcome::Known(fetch_segments)) => {
-                if !fetch_segments.is_empty()
-                    && fetch_task
-                        .as_ref()
-                        .is_none_or(tokio::task::JoinHandle::is_finished)
-                {
-                    if let Some(handle) = fetch_task.take() {
-                        let _ = handle.await;
-                    }
+                if !fetch_segments.is_empty() && fetch_task.is_none() {
+                    fetching.clone_from(&fetch_segments);
                     let fetch_state = state.clone();
                     fetch_task = Some(tokio::spawn(async move {
                         fetch_missing_segments(fetch_state, fetch_segments).await;
@@ -120,7 +127,10 @@ async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, 
     Ok(body.sync_interval_ms)
 }
 
-async fn sync_once(state: &WorkerState) -> Result<SyncOutcome, EdamameError> {
+async fn sync_once(
+    state: &WorkerState,
+    fetching_segments: &[SegmentKey],
+) -> Result<SyncOutcome, EdamameError> {
     let cached_segments = {
         let cache = state.cache.lock().await;
         cache.keys()
@@ -129,7 +139,10 @@ async fn sync_once(state: &WorkerState) -> Result<SyncOutcome, EdamameError> {
     let response = state
         .client
         .post(&url)
-        .json(&SyncRequest { cached_segments })
+        .json(&SyncRequest {
+            cached_segments,
+            fetching_segments: fetching_segments.to_vec(),
+        })
         .send()
         .await
         .map_err(|error| EdamameError::Internal(format!("sync request failed: {error}")))?;

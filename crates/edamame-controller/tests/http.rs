@@ -111,24 +111,31 @@ async fn publish_series(
     sequences
 }
 
-/// 鍵 URI を付けてセグメントを PUT する
-async fn publish_with_key_uri(
+/// 鍵 URI と任意の IV を付けてセグメントを PUT する
+///
+/// IV を指定しない場合は `None` を渡す。
+async fn publish_with_encryption(
     client: &reqwest::Client,
     base_url: &str,
     quality: &str,
     identifier: &str,
     key_uri: &str,
+    iv: Option<&str>,
 ) -> reqwest::Response {
     let body = format!("segment-{quality}-{identifier}");
     // 鍵 URI は query や `&` を含み得るため、文字列連結ではなく query として組み立てる
+    let mut query = vec![
+        ("duration_ms", "6000"),
+        ("bandwidth", "3000000"),
+        ("resolution", "1280x720"),
+        ("key_uri", key_uri),
+    ];
+    if let Some(iv) = iv {
+        query.push(("iv", iv));
+    }
     client
         .put(format!("{base_url}/segments/live/{quality}/{identifier}"))
-        .query(&[
-            ("duration_ms", "6000"),
-            ("bandwidth", "3000000"),
-            ("resolution", "1280x720"),
-            ("key_uri", key_uri),
-        ])
+        .query(&query)
         .body(body)
         .send()
         .await
@@ -143,7 +150,8 @@ async fn publish_segment_with_key(
     identifier: &str,
     key_uri: &str,
 ) -> u64 {
-    let response = publish_with_key_uri(client, base_url, quality, identifier, key_uri).await;
+    let response =
+        publish_with_encryption(client, base_url, quality, identifier, key_uri, None).await;
     assert_eq!(
         response.status().as_u16(),
         201,
@@ -151,6 +159,52 @@ async fn publish_segment_with_key(
     );
     let body: Value = response.json().await.unwrap();
     body["sequence"].as_u64().unwrap()
+}
+
+/// 鍵 URI と IV を付けてセグメントを PUT し、割り当てられた番号を返す
+async fn publish_segment_with_iv(
+    client: &reqwest::Client,
+    base_url: &str,
+    quality: &str,
+    identifier: &str,
+    key_uri: &str,
+    iv: &str,
+) -> u64 {
+    let response =
+        publish_with_encryption(client, base_url, quality, identifier, key_uri, Some(iv)).await;
+    assert_eq!(
+        response.status().as_u16(),
+        201,
+        "IV 付きセグメントの PUT に失敗した"
+    );
+    let body: Value = response.json().await.unwrap();
+    body["sequence"].as_u64().unwrap()
+}
+
+/// セグメントごとに違う IV を付けて連番の識別子で PUT し、割り当てられた番号を返す
+async fn publish_encrypted_series(
+    client: &reqwest::Client,
+    base_url: &str,
+    quality: &str,
+    key_uri: &str,
+    iv: impl Fn(u64) -> String,
+    identifiers: impl IntoIterator<Item = u64>,
+) -> Vec<u64> {
+    let mut sequences = Vec::new();
+    for index in identifiers {
+        sequences.push(
+            publish_segment_with_iv(
+                client,
+                base_url,
+                quality,
+                &format!("seg-{index}"),
+                key_uri,
+                &iv(index),
+            )
+            .await,
+        );
+    }
+    sequences
 }
 
 fn cached(quality: &str, sequences: impl IntoIterator<Item = u64>) -> Vec<Value> {
@@ -187,9 +241,23 @@ async fn sync_worker(
     worker_id: &str,
     cached_segments: Vec<Value>,
 ) -> reqwest::Response {
+    sync_worker_with(client, base_url, worker_id, cached_segments, Vec::new()).await
+}
+
+/// 取得中のセグメントも付けて sync する
+async fn sync_worker_with(
+    client: &reqwest::Client,
+    base_url: &str,
+    worker_id: &str,
+    cached_segments: Vec<Value>,
+    fetching_segments: Vec<Value>,
+) -> reqwest::Response {
     client
         .post(format!("{base_url}/workers/{worker_id}/sync"))
-        .json(&json!({ "cached_segments": cached_segments }))
+        .json(&json!({
+            "cached_segments": cached_segments,
+            "fetching_segments": fetching_segments
+        }))
         .send()
         .await
         .unwrap()
@@ -888,8 +956,15 @@ async fn key_uri_validation_rejects_invalid_urls() {
     .iter()
     .enumerate()
     {
-        let response =
-            publish_with_key_uri(&client, base, "720p", &format!("bad-{index}"), key_uri).await;
+        let response = publish_with_encryption(
+            &client,
+            base,
+            "720p",
+            &format!("bad-{index}"),
+            key_uri,
+            None,
+        )
+        .await;
         assert_eq!(
             response.status().as_u16(),
             400,
@@ -897,15 +972,188 @@ async fn key_uri_validation_rejects_invalid_urls() {
         );
     }
     // 鍵の配信元が認証に使うことがあるため、query 付きの https は許可する
-    let accepted = publish_with_key_uri(
+    let accepted = publish_with_encryption(
         &client,
         base,
         "720p",
         "good",
         "https://keys.test/key?token=1",
+        None,
     )
     .await;
     assert_eq!(accepted.status().as_u16(), 201);
+}
+
+/// IV は鍵 URI と組でメディアプレイリストに出る
+#[tokio::test]
+async fn iv_is_reflected_in_media_playlist() {
+    let tmp = TempDir::new("iv");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let key = "https://keys.test/live/a";
+    let iv_zero = "00000000000000000000000000000000";
+    let mut sequences = Vec::new();
+    for index in 0..6 {
+        let response = publish_with_encryption(
+            &client,
+            base,
+            "720p",
+            &format!("seg-{index}"),
+            key,
+            Some(iv_zero),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201, "IV 付きの PUT に失敗した");
+        let body: Value = response.json().await.unwrap();
+        sequences.push(body["sequence"].as_u64().unwrap());
+    }
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    sync_worker(&client, base, "worker-a", cached("720p", sequences)).await;
+
+    let playlist = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(playlist.status().as_u16(), 200);
+    let body = playlist.text().await.unwrap();
+    assert!(body.contains(&format!(
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"{key}\",IV=0x{iv_zero}\n"
+    )));
+
+    // 大文字の IV は小文字にそろえ、同じ鍵 URI でも IV が変われば出し直す
+    let iv_one = "0000000000000000000000000000000A";
+    let response = publish_with_encryption(&client, base, "720p", "seg-3", key, Some(iv_one)).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let playlist = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    let body = playlist.text().await.unwrap();
+    assert!(body.contains(&format!(
+        "#EXT-X-KEY:METHOD=AES-128,URI=\"{key}\",IV=0x{}\n",
+        iv_one.to_lowercase()
+    )));
+}
+
+/// 取得の指示は、取得が終わらないまま次の sync が来ても残す
+#[tokio::test]
+async fn keeps_encryption_of_segments_told_to_fetch() {
+    let tmp = TempDir::new("fetching-encryption");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let key = "https://keys.test/live/a";
+    // セグメントごとに IV を変え、指定が 1 つでも失われたら数が減るようにする
+    let iv = |sequence: u64| format!("{sequence:032x}");
+    let first = publish_encrypted_series(&client, base, "720p", key, iv, 0..6).await;
+    register_worker(&client, base, "worker-a", "http://worker.test", 1).await;
+    // キャッシュが空の報告には、最初の 6 セグメントの取得が指示される
+    let sync_body: Value = sync_worker(&client, base, "worker-a", cached("720p", []))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sync_body["fetch_segments"].as_array().unwrap().len(), 6);
+
+    // 取得が終わらないまま、取得中の一覧を付けて再度 sync する
+    publish_encrypted_series(&client, base, "720p", key, iv, 6..12).await;
+    let sync_body: Value = sync_worker_with(
+        &client,
+        base,
+        "worker-a",
+        cached("720p", []),
+        cached("720p", first.clone()),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(
+        sync_body["fetch_segments"].as_array().unwrap().len(),
+        6,
+        "取得一覧は今回の不足分だけにする: {sync_body}"
+    );
+
+    // 取得中の一覧が残ったまま、メタデータに残る範囲から外れるまで追加する
+    publish_encrypted_series(&client, base, "720p", key, iv, 12..18).await;
+
+    // 最初の 6 セグメントだけを報告すると、公開範囲はその古い範囲へ戻る
+    sync_worker(&client, base, "worker-a", cached("720p", first)).await;
+    let body = client
+        .get(format!("{base}/channels/live/720p.m3u8"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        body.matches("#EXT-X-KEY").count(),
+        6,
+        "取得を指示したセグメントの暗号化の指定が失われている: {body}"
+    );
+}
+
+/// IV は鍵 URI があるときだけ受け付ける
+#[tokio::test]
+async fn iv_requires_key_uri() {
+    let tmp = TempDir::new("iv-without-key");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let response = client
+        .put(format!("{base}/segments/live/720p/iv-only"))
+        .query(&[
+            ("duration_ms", "6000"),
+            ("bandwidth", "3000000"),
+            ("iv", "00000000000000000000000000000000"),
+        ])
+        .body("segment")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "鍵 URI なしの IV を受け付けた"
+    );
+}
+
+/// IV は 16 byte を表す 32 文字の hex だけを受け付ける
+#[tokio::test]
+async fn iv_validation_rejects_invalid_values() {
+    let tmp = TempDir::new("iv-invalid");
+    let controller = spawn_controller(any_addr(), tmp.path.join("storage"), 6, 1000, 10000).await;
+    let client = reqwest::Client::new();
+    let base = &controller.base_url;
+    let key = "https://keys.test/live/a";
+    for (index, iv) in [
+        "0000",
+        "0000000000000000000000000000000000",
+        "0x00000000000000000000000000000000",
+        "0000000000000000000000000000000g",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let response = publish_with_encryption(
+            &client,
+            base,
+            "720p",
+            &format!("bad-{index}"),
+            key,
+            Some(iv),
+        )
+        .await;
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "不正な IV を受け付けた: {iv}"
+        );
+    }
 }
 
 /// 公開待ちの間は前の範囲を返し、待ち時間が過ぎたら追いついた worker に合わせて公開範囲を進める

@@ -5,10 +5,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use edamame_domain::{
-    EdamameError, KeyChange, QualityPlaylistInput, SegmentId, SegmentKey, SyncResponse,
-    key_changes_for_segments, normalize_external_m3u8, normalize_http_url, normalize_key_uri,
-    now_ms, plan_master_playlist, plan_media_playlist, record_key_change, render_master_playlist,
-    render_media_playlist, validate_identifier, validate_quality, validate_resolution,
+    EdamameError, QualityPlaylistInput, SegmentEncryption, SegmentId, SegmentKey, SyncResponse,
+    normalize_external_m3u8, normalize_http_url, normalize_iv, normalize_key_uri, now_ms,
+    plan_master_playlist, plan_media_playlist, render_master_playlist, render_media_playlist,
+    validate_identifier, validate_quality, validate_resolution,
 };
 use tokio::sync::Mutex;
 
@@ -72,8 +72,8 @@ impl ChannelState {
 pub struct QualityState {
     pub bandwidth: u64,
     pub resolution: Option<String>,
-    /// 鍵 URI の変更履歴であり、先頭の開始点より前のセグメントは暗号化されていない
-    pub key_changes: Vec<KeyChange>,
+    /// セグメント番号ごとの暗号化の指定。登録がないセグメントは暗号化されていない
+    pub encryption: BTreeMap<u64, SegmentEncryption>,
     /// 配信先の選択で使う worker ごとの現在値
     pub current_weights: BTreeMap<String, i64>,
     /// 公開済みのセグメント番号
@@ -95,6 +95,10 @@ pub struct WorkerState {
     pub weight: i64,
     pub last_sync_ms: u64,
     pub cached: BTreeSet<SegmentId>,
+    /// worker が報告した取得中のセグメントであり、暗号化の指定を残すために使う
+    pub fetching: BTreeSet<SegmentId>,
+    /// 直前に指示した取得対象であり、報告が届くまでの間だけ暗号化の指定を残すために使う
+    pub instructed: BTreeSet<SegmentId>,
 }
 
 /// セグメント登録の結果
@@ -115,6 +119,7 @@ pub struct SegmentIngest<'a> {
     pub bandwidth: u64,
     pub resolution: Option<String>,
     pub key_uri: Option<&'a str>,
+    pub iv: Option<&'a str>,
     pub bytes: &'a [u8],
 }
 
@@ -172,6 +177,7 @@ impl ControllerState {
             bandwidth,
             resolution,
             key_uri,
+            iv,
             bytes,
         } = input;
         validate_identifier("channel_id", channel_id)?;
@@ -192,6 +198,16 @@ impl ControllerState {
         }
         // 鍵は publisher が配信するため、URL としての形式だけを確認する
         let key_uri = key_uri.map(normalize_key_uri).transpose()?;
+        // IV は鍵と組で使うため、鍵 URI なしでは指定できない
+        let iv = match iv {
+            Some(value) => {
+                if key_uri.is_none() {
+                    return Err(EdamameError::BadRequest("iv requires key_uri".to_owned()));
+                }
+                Some(normalize_iv(value)?)
+            }
+            None => None,
+        };
 
         // 属性の確認と番号の割り当てを直列化する。ファイル I/O の間も inner の mutex は保持しない。
         let _write_guard = self.write_lock.lock().await;
@@ -263,6 +279,20 @@ impl ControllerState {
         // 保存が終わる前に待ち時間を始めると、worker が取得する時間を失う
         let committed_at_ms = now_ms();
         let mut inner = self.inner.lock().await;
+        // worker が持つ、または取得を指示したセグメントの暗号化の指定も、公開範囲が古い範囲へ戻る場合のために残す
+        let worker_segments: BTreeSet<u64> = inner
+            .workers
+            .values()
+            .flat_map(|worker| {
+                worker
+                    .cached
+                    .iter()
+                    .chain(worker.fetching.iter())
+                    .chain(worker.instructed.iter())
+            })
+            .filter(|id| id.channel_id == channel_id && id.quality == quality)
+            .map(|id| id.sequence)
+            .collect();
         let channel = inner
             .channels
             .entry(channel_id.to_owned())
@@ -284,7 +314,7 @@ impl ControllerState {
             .or_insert_with(|| QualityState {
                 bandwidth,
                 resolution: resolution.clone(),
-                key_changes: Vec::new(),
+                encryption: BTreeMap::new(),
                 current_weights: BTreeMap::new(),
                 published: BTreeSet::new(),
                 publish_due_ms: None,
@@ -295,7 +325,17 @@ impl ControllerState {
         if quality_state.resolution.is_none() {
             quality_state.resolution = resolution;
         }
-        record_key_change(&mut quality_state.key_changes, sequence, key_uri);
+        // 暗号化の指定は省略できるため、省略されたセグメントは表から消して暗号化なしに戻す
+        match key_uri {
+            Some(key_uri) => {
+                quality_state
+                    .encryption
+                    .insert(sequence, SegmentEncryption { key_uri, iv });
+            }
+            None => {
+                quality_state.encryption.remove(&sequence);
+            }
+        }
         register_segment_metadata(
             quality_state,
             sequence,
@@ -304,6 +344,11 @@ impl ControllerState {
             known_identifier && stored_in_quality,
         );
         prune_segments(&mut quality_state.segments, self.playlist_segments);
+        prune_encryption(
+            &mut quality_state.encryption,
+            &quality_state.segments,
+            &worker_segments,
+        );
         Ok(outcome)
     }
 
@@ -328,6 +373,8 @@ impl ControllerState {
             worker.weight = i64::from(weight);
             // worker は登録のたびにキャッシュを捨てるため、報告済みのキャッシュも無効にする
             worker.cached = BTreeSet::new();
+            worker.fetching = BTreeSet::new();
+            worker.instructed = BTreeSet::new();
             false
         } else {
             inner.workers.insert(
@@ -337,6 +384,8 @@ impl ControllerState {
                     weight: i64::from(weight),
                     last_sync_ms: now_ms,
                     cached: BTreeSet::new(),
+                    fetching: BTreeSet::new(),
+                    instructed: BTreeSet::new(),
                 },
             );
             true
@@ -351,12 +400,17 @@ impl ControllerState {
         &self,
         worker_id: &str,
         cached_segments: Vec<SegmentKey>,
+        fetching_segments: Vec<SegmentKey>,
         now_ms: u64,
     ) -> Result<SyncResponse, EdamameError> {
         validate_identifier("worker_id", worker_id)?;
         let mut cached = BTreeSet::new();
         for key in cached_segments {
             cached.insert(key.into_id()?);
+        }
+        let mut fetching = BTreeSet::new();
+        for key in fetching_segments {
+            fetching.insert(key.into_id()?);
         }
         let mut inner = self.inner.lock().await;
         {
@@ -366,6 +420,7 @@ impl ControllerState {
                 .ok_or_else(|| EdamameError::NotFound("worker is not registered".to_owned()))?;
             worker.last_sync_ms = now_ms;
             worker.cached = cached;
+            worker.fetching = fetching;
         }
         // 公開範囲は GET では変えず、worker の sync 報告を受けた時だけ更新する
         {
@@ -381,13 +436,13 @@ impl ControllerState {
         let target = cache_target(&inner.channels, self.playlist_segments);
         let worker = inner
             .workers
-            .get(worker_id)
+            .get_mut(worker_id)
             // 上の get_mut で存在を確認済みのため、ここでは見つからないことがない
             .expect("worker was checked above");
-        let fetch_segments = target
-            .difference(&worker.cached)
-            .map(SegmentKey::from)
-            .collect();
+        let missing: BTreeSet<SegmentId> = target.difference(&worker.cached).cloned().collect();
+        let fetch_segments = missing.iter().map(SegmentKey::from).collect();
+        // 指示した一覧は、worker が取得中として報告するか、キャッシュとして報告するまで残す
+        worker.instructed = missing;
         Ok(SyncResponse { fetch_segments })
     }
 
@@ -400,7 +455,7 @@ impl ControllerState {
     ) -> Result<String, EdamameError> {
         validate_identifier("channel_id", channel_id)?;
         validate_quality(quality)?;
-        let (segment_duration_ms, published, key_changes, worker_url) = {
+        let (segment_duration_ms, published, encryption, worker_url) = {
             let mut inner = self.inner.lock().await;
             let Inner { channels, workers } = &mut *inner;
             let channel = channels
@@ -427,8 +482,8 @@ impl ControllerState {
             (
                 channel.segment_duration_ms,
                 quality_state.published.clone(),
-                // プレイリストに出す範囲の分だけ複製し、履歴が長くても取得を重くしない
-                key_changes_for_segments(&quality_state.key_changes, &quality_state.published),
+                // 表は公開に使う範囲と worker のキャッシュの範囲に間引いてあるため、そのまま複製する
+                quality_state.encryption.clone(),
                 worker_url,
             )
         };
@@ -454,7 +509,7 @@ impl ControllerState {
             channel_id,
             quality,
             &public_url,
-            &key_changes,
+            &encryption,
         ))
     }
 
@@ -930,6 +985,19 @@ fn prune_segments(segments: &mut BTreeSet<u64>, playlist_segments: u64) {
     }
 }
 
+/// 公開に使う可能性があるセグメントの暗号化の指定だけを残す
+///
+/// worker が持つセグメントと、取得を指示したセグメントを含めるのは、
+/// 遅れた worker の古い公開範囲へ戻る場合に備えるためである。
+fn prune_encryption(
+    encryption: &mut BTreeMap<u64, SegmentEncryption>,
+    segments: &BTreeSet<u64>,
+    worker_segments: &BTreeSet<u64>,
+) {
+    encryption
+        .retain(|sequence, _| segments.contains(sequence) || worker_segments.contains(sequence));
+}
+
 /// worker が取得すべき直近のセグメント範囲を返す
 fn cache_target(
     channels: &BTreeMap<String, ChannelState>,
@@ -957,6 +1025,14 @@ fn cache_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 鍵 URI だけを指定する
+    fn segment_encryption(key_uri: &str) -> SegmentEncryption {
+        SegmentEncryption {
+            key_uri: key_uri.to_owned(),
+            iv: None,
+        }
+    }
 
     fn channel_with_quality(
         segments: &[u64],
@@ -992,7 +1068,7 @@ mod tests {
             QualityState {
                 bandwidth: 3_000_000,
                 resolution: None,
-                key_changes: Vec::new(),
+                encryption: BTreeMap::new(),
                 current_weights: BTreeMap::new(),
                 published: published.iter().copied().collect(),
                 publish_due_ms,
@@ -1023,6 +1099,8 @@ mod tests {
             weight: 1,
             last_sync_ms: 0,
             cached,
+            fetching: BTreeSet::new(),
+            instructed: BTreeSet::new(),
         }
     }
 
@@ -1032,6 +1110,100 @@ mod tests {
         worker.public_url = url.to_owned();
         worker.weight = weight;
         worker
+    }
+
+    /// セグメント番号ごとに違う IV を付けて登録する
+    async fn ingest_encrypted_segment(state: &ControllerState, sequence: u64) {
+        let iv = format!("{sequence:032x}");
+        state
+            .ingest_segment(SegmentIngest {
+                channel_id: "live",
+                quality: "720p",
+                identifier: &format!("seg-{sequence}"),
+                duration_ms: 6000,
+                bandwidth: 3_000_000,
+                resolution: None,
+                key_uri: Some("https://keys.test/a"),
+                iv: Some(&iv),
+                bytes: b"segment",
+            })
+            .await
+            .unwrap();
+    }
+
+    /// sync で送るセグメントの一覧を作る
+    fn segment_keys(sequences: impl IntoIterator<Item = u64>) -> Vec<SegmentKey> {
+        sequences
+            .into_iter()
+            .map(|sequence| SegmentKey {
+                channel_id: "live".to_owned(),
+                quality: "720p".to_owned(),
+                sequence,
+            })
+            .collect()
+    }
+
+    /// worker が取得を指示されているセグメント番号
+    async fn fetching_sequences(state: &ControllerState) -> Vec<u64> {
+        let inner = state.inner.lock().await;
+        inner.workers["worker-a"]
+            .fetching
+            .iter()
+            .map(|id| id.sequence)
+            .collect()
+    }
+
+    /// 取得に失敗したセグメントは、再取得の指示が残る間は暗号化の指定を残す
+    #[tokio::test]
+    async fn keeps_encryption_of_segments_to_refetch() {
+        let dir = std::env::temp_dir().join(format!("edamame-refetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = ControllerState::new(CanonicalStore::new(dir.clone()), 6, 1_000, 10_000, 0, 1);
+        for sequence in 0..6 {
+            ingest_encrypted_segment(&state, sequence).await;
+        }
+        state
+            .register_worker("worker-a", "http://worker.test", 1, 0)
+            .await
+            .unwrap();
+        // 最初のセグメントだけ取得に失敗し、残りを取得した状態で報告する（0 は取得中）
+        state
+            .sync_worker("worker-a", segment_keys(1..6), segment_keys(0..1), 0)
+            .await
+            .unwrap();
+        assert_eq!(fetching_sequences(&state).await, vec![0]);
+        // 再取得の途中で新しいセグメントが届き、0 の取得が続いたまま再度 sync しても 0 は残る
+        ingest_encrypted_segment(&state, 6).await;
+        state
+            .sync_worker("worker-a", segment_keys(1..6), segment_keys(0..1), 0)
+            .await
+            .unwrap();
+        assert!(
+            fetching_sequences(&state).await.contains(&0),
+            "再取得中のセグメントが取得の対象から外れている"
+        );
+        // 再取得の指示が残ったまま、メタデータに残る範囲から外れるまでセグメントを追加する
+        for sequence in 7..18 {
+            ingest_encrypted_segment(&state, sequence).await;
+        }
+        // 再取得できた 0 から 5 を報告しても、0 の暗号化の指定が残っている
+        state
+            .sync_worker("worker-a", segment_keys(0..6), Vec::new(), 0)
+            .await
+            .unwrap();
+        let sequences: Vec<u64> = {
+            let inner = state.inner.lock().await;
+            inner.channels["live"].qualities["720p"]
+                .encryption
+                .keys()
+                .copied()
+                .collect()
+        };
+        assert!(
+            sequences.contains(&0),
+            "再取得したセグメントの暗号化の指定が失われている: {sequences:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1341,6 +1513,27 @@ mod tests {
         segments.insert(110);
         prune_segments(&mut segments, 6);
         assert_eq!(segments, BTreeSet::from([105, 106, 110]));
+    }
+
+    #[test]
+    fn keeps_encryption_for_playlist_and_worker_cache() {
+        let key = segment_encryption("https://keys.test/a");
+        let mut encryption = BTreeMap::from([
+            (99, key.clone()),
+            (100, key.clone()),
+            (101, key.clone()),
+            (102, key.clone()),
+        ]);
+        // メタデータに残る範囲と、worker が公開に使える範囲の指定だけを残す
+        prune_encryption(
+            &mut encryption,
+            &BTreeSet::from([101, 102]),
+            &BTreeSet::from([100]),
+        );
+        assert_eq!(
+            encryption,
+            BTreeMap::from([(100, key.clone()), (101, key.clone()), (102, key)])
+        );
     }
 
     #[test]

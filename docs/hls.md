@@ -9,7 +9,7 @@ Edamame は publisher から受け取ったセグメントの属性からマス�
 - `#EXT-X-VERSION` は 3 とする
 - ライブ配信だけを扱い、`#EXT-X-ENDLIST` は出力しない
 - fMP4、LL-HLS、バイト範囲、複数音声、I フレーム用のプレイリストは扱わない
-- AES-128 の暗号化だけを扱い、`#EXT-X-KEY` の `IV` 属性は出力しない
+- 暗号化は AES-128 だけを扱い、`#EXT-X-KEY` には publisher から受け取った `IV` 属性だけを出力する
 
 ## メディアプレイリスト
 
@@ -43,34 +43,36 @@ http://127.0.0.1:9001/segments/live/720p/102.ts
 
 `key_uri` を付けて PUT されたセグメントには `#EXT-X-KEY` を出力する。
 鍵 URI は publisher が指定した絶対 URL をそのまま使い、controller は鍵を取得も検証もしない。
-セグメント番号ごとに鍵 URI を記録し、直前のセグメントと値が変わったところでタグを出し分ける。
+セグメント番号ごとに鍵 URI と `iv` の組を記録し、暗号化されたセグメントには毎回タグを出す。
 
-たとえばセグメント番号 101 と 102 が `https://keys.example.test/live/key-1`、103 と 104 が `https://keys.example.test/live/key-2` で、公開範囲が 101 から 104 の場合、出力は次のようになる。
+たとえばセグメント番号 101 と 102 が `https://keys.example.test/live/key-1` と IV `0x00000000000000000000000000000000`、103 が `https://keys.example.test/live/key-2` と IV `0x00000000000000000000000000000001`、104 が暗号化なしで、公開範囲が 101 から 104 の場合、出力は次のようになる。
 
 ```text
 #EXTM3U
 #EXT-X-VERSION:3
 #EXT-X-TARGETDURATION:6
 #EXT-X-MEDIA-SEQUENCE:101
-#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-1"
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-1",IV=0x00000000000000000000000000000000
 #EXTINF:6.000,
 http://127.0.0.1:9001/segments/live/720p/101.ts
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-1",IV=0x00000000000000000000000000000000
 #EXTINF:6.000,
 http://127.0.0.1:9001/segments/live/720p/102.ts
-#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-2"
+#EXT-X-KEY:METHOD=AES-128,URI="https://keys.example.test/live/key-2",IV=0x00000000000000000000000000000001
 #EXTINF:6.000,
 http://127.0.0.1:9001/segments/live/720p/103.ts
+#EXT-X-KEY:METHOD=NONE
 #EXTINF:6.000,
 http://127.0.0.1:9001/segments/live/720p/104.ts
 ```
 
 各要素の決まりは次のとおり。
 
-- 鍵 URI があるセグメントの直前に `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` を出力する
-- 鍵 URI が別の値に変わるところでも同じ形式で出力し直す
+- 鍵 URI があるセグメントの直前に `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` を出力する。IV がある場合は `,IV=0x{iv}` を続ける
+- 鍵 URI と IV が同じでも、暗号化されたセグメントには毎回タグを出す
 - 鍵 URI がないセグメントに戻るところでは `#EXT-X-KEY:METHOD=NONE` を出力する
 - 鍵 URI を 1 つも受け取っていない quality には `#EXT-X-KEY` を出力しない
-- 鍵 URI の変更履歴は controller のメモリ上だけにあり、controller の再起動で失われる
+- 鍵 URI と IV は controller のメモリ上だけにあり、controller の再起動で失われる
 
 ## マスタープレイリスト
 

@@ -30,12 +30,13 @@ pub struct QualityPlaylistInput {
     pub segments: BTreeSet<u64>,
 }
 
-/// このセグメント番号以降に適用する鍵 URI
+/// セグメントに適用する暗号化の指定
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KeyChange {
-    pub from_sequence: u64,
-    /// 適用する鍵 URI。`None` なら暗号化しない
-    pub key_uri: Option<String>,
+pub struct SegmentEncryption {
+    /// 適用する鍵 URI
+    pub key_uri: String,
+    /// 適用する IV（16 byte の hex）。`None` なら `#EXT-X-KEY` に `IV` 属性を出さない
+    pub iv: Option<String>,
 }
 
 /// 直近の範囲から連続したメディアプレイリストを計算する
@@ -75,110 +76,6 @@ pub fn plan_media_playlist(
     })
 }
 
-/// セグメントの鍵 URI を変更履歴に記録する
-///
-/// 同じ識別子の再 PUT ではそのセグメントだけを置き換え、前後のセグメントの値は変えない。
-/// 履歴は区間の開始点だけを持ち、直前の区間と同じ値になった開始点は残さない。
-pub fn record_key_change(changes: &mut Vec<KeyChange>, sequence: u64, key_uri: Option<String>) {
-    // 最近の開始点から遡り、そのセグメントに今適用されている値と差し込む位置を探す
-    let mut index = changes.len();
-    while index > 0 && changes[index - 1].from_sequence > sequence {
-        index -= 1;
-    }
-    let previous = index
-        .checked_sub(1)
-        .map(|previous| changes[previous].key_uri.clone())
-        .unwrap_or(None);
-    if previous == key_uri {
-        // 区間の値が変わらないため、開始点も変えない
-        return;
-    }
-    // そのセグメントの開始点があれば置き換え、なければ番号順に差し込む
-    let replace = index > 0 && changes[index - 1].from_sequence == sequence;
-    let position = if replace {
-        changes[index - 1].key_uri = key_uri;
-        index - 1
-    } else {
-        changes.insert(
-            index,
-            KeyChange {
-                from_sequence: sequence,
-                key_uri,
-            },
-        );
-        index
-    };
-    // そのセグメントより後ろが元の値のままになるよう、次の番号から元の値に戻す
-    let next = sequence.checked_add(1);
-    if let Some(next) = next
-        && changes
-            .get(position + 1)
-            .is_none_or(|change| change.from_sequence != next)
-    {
-        changes.insert(
-            position + 1,
-            KeyChange {
-                from_sequence: next,
-                key_uri: previous,
-            },
-        );
-    }
-    // 直前の区間と同じ値になった開始点は残さない。先頭は暗号化なしから始まるため、先頭の暗号化なしも残さない。
-    let previous_value = position
-        .checked_sub(1)
-        .map(|previous| changes[previous].key_uri.clone())
-        .unwrap_or(None);
-    let same_as_previous = previous_value == changes[position].key_uri;
-    if same_as_previous {
-        changes.remove(position);
-    }
-    // そのセグメントに適用する値。直前の開始点を消した場合は前の区間の値が引き継がれる
-    let applied = if same_as_previous {
-        previous_value
-    } else {
-        changes[position].key_uri.clone()
-    };
-    // 次の区間と同じ値になった開始点も残さない
-    let next_position = if same_as_previous {
-        position
-    } else {
-        position + 1
-    };
-    if let Some(next) = next
-        && changes
-            .get(next_position)
-            .is_some_and(|change| change.from_sequence == next && change.key_uri == applied)
-    {
-        changes.remove(next_position);
-    }
-}
-
-/// 指定したセグメント番号の集合を描画するのに必要な変更履歴だけを取り出す
-///
-/// 集合の先頭より前の最後の開始点と、集合の範囲内の開始点を残す。
-#[must_use]
-pub fn key_changes_for_segments(changes: &[KeyChange], segments: &BTreeSet<u64>) -> Vec<KeyChange> {
-    let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
-        return Vec::new();
-    };
-    // 最近の開始点から遡り、集合の先頭より前の最後の開始点を探す
-    let mut newer = changes.len();
-    while newer > 0 && changes[newer - 1].from_sequence >= *first {
-        newer -= 1;
-    }
-    let mut extracted = Vec::new();
-    if newer > 0 {
-        extracted.push(changes[newer - 1].clone());
-    }
-    for change in &changes[newer..] {
-        if change.from_sequence > *last {
-            break;
-        }
-        extracted.push(change.clone());
-    }
-    extracted
-}
-
 /// quality ごとの範囲を持つマスタープレイリストを計算する
 pub fn plan_master_playlist(
     qualities: &BTreeMap<String, QualityPlaylistInput>,
@@ -216,7 +113,7 @@ pub fn render_media_playlist(
     channel_id: &str,
     quality: &str,
     public_url: &str,
-    key_changes: &[KeyChange],
+    encryption: &BTreeMap<u64, SegmentEncryption>,
 ) -> String {
     let mut output = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
     output.push_str(&format!(
@@ -232,35 +129,36 @@ pub fn render_media_playlist(
         playlist.segment_duration_ms / 1000,
         playlist.segment_duration_ms % 1000
     );
-    let mut cursor = 0;
-    let mut previous_key_uri: Option<&str> = None;
+    let mut encrypted = false;
     for sequence in &playlist.sequences {
-        // 開始点は番号順なので、セグメント番号に合わせて位置を進める
-        while key_changes
-            .get(cursor + 1)
-            .is_some_and(|change| change.from_sequence <= *sequence)
-        {
-            cursor += 1;
-        }
-        let key_uri = key_changes
-            .get(cursor)
-            .filter(|change| change.from_sequence <= *sequence)
-            .and_then(|change| change.key_uri.as_deref());
-        if key_uri != previous_key_uri {
-            match key_uri {
-                Some(key_uri) => {
-                    output.push_str(&format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\"\n"))
+        match encryption.get(sequence) {
+            // IV はセグメントごとに変わるため、暗号化されたセグメントには毎回 `#EXT-X-KEY` を出す
+            Some(setting) => {
+                output.push_str(&key_tag(setting));
+                encrypted = true;
+            }
+            None => {
+                if encrypted {
+                    output.push_str("#EXT-X-KEY:METHOD=NONE\n");
+                    encrypted = false;
                 }
-                None => output.push_str("#EXT-X-KEY:METHOD=NONE\n"),
             }
         }
-        previous_key_uri = key_uri;
         output.push_str(&format!("#EXTINF:{duration},\n"));
         output.push_str(&format!(
             "{public_url}/segments/{channel_id}/{quality}/{sequence}.ts\n"
         ));
     }
     output
+}
+
+/// セグメントに適用する暗号化の指定を `#EXT-X-KEY` にする
+fn key_tag(setting: &SegmentEncryption) -> String {
+    let key_uri = &setting.key_uri;
+    match setting.iv.as_deref() {
+        Some(iv) => format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\",IV=0x{iv}\n"),
+        None => format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\"\n"),
+    }
 }
 
 /// マスタープレイリストを文字列にする
@@ -286,27 +184,20 @@ mod tests {
         values.iter().copied().collect()
     }
 
-    fn changes(entries: &[(u64, Option<&str>)]) -> Vec<KeyChange> {
-        entries
-            .iter()
-            .map(|(from_sequence, key_uri)| KeyChange {
-                from_sequence: *from_sequence,
-                key_uri: key_uri.map(str::to_owned),
-            })
-            .collect()
+    /// 鍵 URI だけを指定する
+    fn key(key_uri: &str) -> SegmentEncryption {
+        SegmentEncryption {
+            key_uri: key_uri.to_owned(),
+            iv: None,
+        }
     }
 
-    /// 指定した範囲の各セグメントに適用する鍵 URI
-    fn applied(changes: &[KeyChange], range: std::ops::RangeInclusive<u64>) -> Vec<Option<&str>> {
-        range
-            .map(|sequence| {
-                changes
-                    .iter()
-                    .rev()
-                    .find(|change| change.from_sequence <= sequence)
-                    .and_then(|change| change.key_uri.as_deref())
-            })
-            .collect()
+    /// 鍵 URI と IV を指定する
+    fn key_with_iv(key_uri: &str, iv: &str) -> SegmentEncryption {
+        SegmentEncryption {
+            key_uri: key_uri.to_owned(),
+            iv: Some(iv.to_owned()),
+        }
     }
 
     #[test]
@@ -331,7 +222,13 @@ mod tests {
     #[test]
     fn renders_media_playlist() {
         let playlist = plan_media_playlist(&segments(&[101, 102]), 6000, 6).unwrap();
-        let rendered = render_media_playlist(&playlist, "live", "720p", "http://worker.test", &[]);
+        let rendered = render_media_playlist(
+            &playlist,
+            "live",
+            "720p",
+            "http://worker.test",
+            &BTreeMap::new(),
+        );
         assert!(rendered.contains("#EXT-X-TARGETDURATION:6"));
         assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:101"));
         assert!(rendered.contains("#EXTINF:6.000,"));
@@ -340,98 +237,78 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_key_changes() {
-        let key_a = "https://keys.test/a";
-        let key_b = "https://keys.test/b";
-        let mut changes = Vec::new();
-        // 先頭が暗号化なしなら記録しない
-        record_key_change(&mut changes, 0, None);
-        assert!(changes.is_empty());
-        // 0 から 3 に A、B、B、A の順で鍵を記録する
-        record_key_change(&mut changes, 0, Some(key_a.to_owned()));
-        record_key_change(&mut changes, 1, Some(key_b.to_owned()));
-        record_key_change(&mut changes, 2, Some(key_b.to_owned()));
-        record_key_change(&mut changes, 3, Some(key_a.to_owned()));
-        assert_eq!(
-            applied(&changes, 0..=4),
-            [Some(key_a), Some(key_b), Some(key_b), Some(key_a), None]
-        );
-        // 途中のセグメントの再 PUT はそのセグメントだけを置き換える
-        record_key_change(&mut changes, 1, Some(key_a.to_owned()));
-        assert_eq!(
-            applied(&changes, 0..=4),
-            [Some(key_a), Some(key_a), Some(key_b), Some(key_a), None]
-        );
-        // 同じ値が続くだけの配信では、履歴は変更の数だけしか増えない
-        let mut constant = Vec::new();
-        for sequence in 0..100 {
-            record_key_change(&mut constant, sequence, Some(key_a.to_owned()));
-        }
-        assert_eq!(constant.len(), 2);
-        assert!(
-            applied(&constant, 0..=99)
-                .iter()
-                .all(|key_uri| *key_uri == Some(key_a))
-        );
-    }
-
-    #[test]
-    fn extracts_key_changes_in_range() {
-        let key_a = "https://keys.test/a";
-        let key_b = "https://keys.test/b";
-        let mut changes = Vec::new();
-        record_key_change(&mut changes, 4, Some(key_a.to_owned()));
-        record_key_change(&mut changes, 6, None);
-        record_key_change(&mut changes, 9, Some(key_b.to_owned()));
-        let extracted = key_changes_for_segments(&changes, &segments(&[5, 6, 7, 8, 9, 10]));
-        // 範囲内のすべてのセグメントで、元の履歴と同じ鍵 URI になる
-        for sequence in 5..=10 {
-            assert_eq!(
-                applied(&extracted, sequence..=sequence),
-                applied(&changes, sequence..=sequence)
-            );
-        }
-        assert!(extracted.iter().all(|change| change.from_sequence <= 10));
-    }
-
-    #[test]
-    fn renders_key_uri_changes() {
+    fn renders_a_key_tag_for_each_encrypted_segment() {
         let playlist = plan_media_playlist(&segments(&[101, 102, 103, 104]), 6000, 6).unwrap();
-        let mut changes = Vec::new();
-        record_key_change(&mut changes, 101, Some("https://keys.test/a".to_owned()));
-        record_key_change(&mut changes, 102, Some("https://keys.test/a".to_owned()));
-        record_key_change(&mut changes, 103, Some("https://keys.test/b".to_owned()));
-        record_key_change(&mut changes, 104, None);
+        let encryption = BTreeMap::from([
+            (101, key("https://keys.test/a")),
+            (102, key("https://keys.test/a")),
+            (103, key("https://keys.test/b")),
+        ]);
         let rendered =
-            render_media_playlist(&playlist, "live", "720p", "http://worker.test", &changes);
-        let key_a = rendered
-            .find("#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/a\"")
-            .unwrap();
-        let segment_101 = rendered.find("/101.ts").unwrap();
-        let key_b = rendered
-            .find("#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/b\"")
-            .unwrap();
-        let segment_103 = rendered.find("/103.ts").unwrap();
-        let unencrypted = rendered.find("#EXT-X-KEY:METHOD=NONE").unwrap();
-        let segment_104 = rendered.find("/104.ts").unwrap();
-        assert!(key_a < segment_101);
-        assert!(segment_101 < key_b);
-        assert!(key_b < segment_103);
-        assert!(segment_103 < unencrypted);
+            render_media_playlist(&playlist, "live", "720p", "http://worker.test", &encryption);
+        // 鍵 URI が同じでも、暗号化されたセグメントには毎回タグを出す
+        assert_eq!(
+            rendered.matches("#EXT-X-KEY:METHOD=AES-128").count(),
+            3,
+            "暗号化されたセグメントの数だけタグを出す: {rendered}"
+        );
+        for (tag, segment) in [
+            (
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/a\"\n",
+                101,
+            ),
+            (
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/a\"\n",
+                102,
+            ),
+            (
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/b\"\n",
+                103,
+            ),
+        ] {
+            let tag_position = rendered.find(tag).expect("鍵のタグがない");
+            let segment_position = rendered
+                .find(&format!("/{segment}.ts\n"))
+                .expect("セグメントがない");
+            assert!(tag_position < segment_position);
+        }
+        // 暗号化されていないセグメントに戻るところで解除する
+        let unencrypted = rendered.find("#EXT-X-KEY:METHOD=NONE\n").unwrap();
+        let segment_104 = rendered.find("/104.ts\n").unwrap();
         assert!(unencrypted < segment_104);
     }
 
     #[test]
-    fn renders_key_uri_before_playlist_start() {
-        // 変更が公開範囲より前にある場合も、先頭のセグメントに鍵を出す
-        let playlist = plan_media_playlist(&segments(&[101, 102]), 6000, 6).unwrap();
-        let changes = self::changes(&[(90, Some("https://keys.test/a"))]);
+    fn renders_iv_for_each_segment() {
+        let playlist = plan_media_playlist(&segments(&[101, 102, 103]), 6000, 6).unwrap();
+        let key_uri = "https://keys.test/a";
+        let encryption = BTreeMap::from([
+            (
+                101,
+                key_with_iv(key_uri, "00000000000000000000000000000000"),
+            ),
+            (
+                102,
+                key_with_iv(key_uri, "00000000000000000000000000000001"),
+            ),
+            (
+                103,
+                key_with_iv(key_uri, "00000000000000000000000000000002"),
+            ),
+        ]);
         let rendered =
-            render_media_playlist(&playlist, "live", "720p", "http://worker.test", &changes);
-        let key = rendered.find("#EXT-X-KEY:METHOD=AES-128").unwrap();
-        let segment_101 = rendered.find("/101.ts").unwrap();
-        assert!(key < segment_101);
-        assert_eq!(rendered.matches("#EXT-X-KEY").count(), 1);
+            render_media_playlist(&playlist, "live", "720p", "http://worker.test", &encryption);
+        // 鍵 URI が同じでも IV が違うため、セグメントごとにタグを出す
+        assert_eq!(rendered.matches("#EXT-X-KEY").count(), 3);
+        for (sequence, iv) in [(101, 0), (102, 1), (103, 2)] {
+            let tag = rendered
+                .find(&format!(
+                    "#EXT-X-KEY:METHOD=AES-128,URI=\"https://keys.test/a\",IV=0x{iv:032}\n"
+                ))
+                .unwrap();
+            let segment = rendered.find(&format!("/{sequence}.ts\n")).unwrap();
+            assert!(tag < segment);
+        }
     }
 
     #[test]
