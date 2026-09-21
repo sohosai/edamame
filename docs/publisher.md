@@ -35,14 +35,14 @@ cargo build --release -p edamame-publisher
 | 項目 | 説明 |
 | --- | --- |
 | `segment_duration_ms` | 全 channel 共通のセグメント長（500 以上）。PUT の `duration_ms` にもこの値を使う |
-| `backlog_limit` | channel ごとの未送信セグメントの上限。`segment_duration_ms` を掛けた時間を過ぎたセグメントは捨てる |
+| `backlog_limit` | channel ごとに未送信セットを保持する時間を `segment_duration_ms` の倍数で指定する。この時間を過ぎたセットは捨てる |
 | `encoder.codec` | ffmpeg の映像エンコーダ。`h264_nvenc` を推奨し、GPU のない検証では `libx264` にする |
 | `encoder.preset` | ffmpeg のプリセット（NVEnc は `p1` から `p7`） |
-| `input.channel_id` | channel の識別子（`[A-Za-z0-9_-]` の 1 から 64 文字、`master` は使えない） |
+| `input.channel_id` | channel の識別子（`[A-Za-z0-9_-]` の 1 から 64 文字） |
 | `input.srt_url` | 入力の SRT URL。`mode=listener` で待ち受ける |
 | `input.live_url` | controller の公開マスタープレイリストの HTTPS URL。鍵と一緒に登録する。登録を使う場合は必須 |
 | `input.key_uri` | メディアプレイリストに出力する暗号鍵の URI。指定すると PUT に `key_uri` と `iv` を付ける |
-| `rendition.quality` | quality の識別子。channel の中では同じ値を使い回さない |
+| `rendition.quality` | quality の識別子。channel の中では同じ値を使い回さない。`master` は使えない |
 | `rendition.mode` | `copy` は入力の映像をそのまま使う。省略すると再エンコードする |
 | `rendition.resolution` | `WIDTHxHEIGHT`。偶数であること。`copy` のときは入力の解像度と一致していること |
 | `rendition.bandwidth` | controller へ宣言するビットレート。音声と多重化を含めた値にする |
@@ -62,6 +62,8 @@ ffmpeg の HLS muxer は実行の先頭からセグメント長の倍数の位�
 | option | 説明 |
 | --- | --- |
 | `--config` | TOML 設定ファイルのパス（必須） |
+| `--controller-url` | controller の接続先を表す `http` の絶対 URL（必須） |
+| `--auth-token` | controller の `--auth-token` と同じトークン。省略すると PUT に `Authorization` ヘッダーを付けない |
 | `--work-dir` | 作業ディレクトリを作る親ディレクトリ。指定したディレクトリの配下に `edamame-publisher-<pid>` を作る。省略した場合は一時ディレクトリの配下に作る |
 | `--key-file` | 暗号鍵を読み書きするファイル。ファイルがあれば 16 byte の生データとして読み、なければ生成して 0600 で保存する。省略すると実行ごとに生成する |
 | `--stream-credentials-url` | live2025-server のベース URL。指定すると鍵と配信 URL を登録する |
@@ -210,7 +212,7 @@ ffmpeg の実行ごとに、最初のセットで次を確かめる。
 | 400、401、409 | 設定の誤りとみなし、その channel を止める |
 | 鍵の登録時の接続エラー、5xx | 1 秒から 30 秒の待ち時間を置いて登録を試し直す。配信は続ける |
 | 鍵の登録時の 400、401 | 設定の誤りとみなし、ログを出して登録を打ち切る。配信は続ける |
-| 未送信セットが `backlog_limit` を超える | 古いセットから捨てる |
+| 未送信セットが `segment_duration_ms` × `backlog_limit` の時間を過ぎる | そのセットを捨てる |
 | aac 以外の音声、`copy` の前提を満たさない入力 | その channel を止める。他の channel は続ける |
 | SIGINT、SIGTERM | 全 ffmpeg を止めて終了する |
 
