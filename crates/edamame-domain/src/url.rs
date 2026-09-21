@@ -1,4 +1,4 @@
-//! `public_url`、`controller_url`、外部 URL の検証と正規化
+//! `public_url`、`controller_url`、外部 URL を検証し、正規化する
 
 use url::Url;
 
@@ -68,21 +68,24 @@ pub fn normalize_public_url(value: &str) -> Result<String, EdamameError> {
     Ok(normalized)
 }
 
-/// 暗号鍵の URI を検証し、正規形を返す
+/// 暗号鍵の URI を検証し、`Url` の文字列表現を返す
 ///
 /// 鍵は publisher が配信するため、`http` と `https` の絶対 URL だけを許可する。
+/// query は許可し、末尾の `/` は取り除かない。
 pub fn normalize_key_uri(value: &str) -> Result<String, EdamameError> {
     normalize_fetch_url(value, "key_uri")
 }
 
-/// 外部配信の master m3u8 の URL を検証し、正規形を返す
+/// 外部配信の master m3u8 の URL を検証し、`Url` の文字列表現を返す
 ///
-/// controller が取得する URL のため、`http` と `https` の絶対 URL だけを許可する。
+/// client が直接取得する URL のため、`http` と `https` の絶対 URL だけを許可する。
+/// query は許可し、末尾の `/` は取り除かない。
 pub fn normalize_external_m3u8(value: &str) -> Result<String, EdamameError> {
     normalize_fetch_url(value, "external_m3u8")
 }
 
-/// controller が取得する URL を検証し、正規形を返す
+/// client が取得する URL を検証し、`Url` の文字列表現を返す
+/// query は許可し、末尾の `/` は取り除かない。
 fn normalize_fetch_url(value: &str, name: &str) -> Result<String, EdamameError> {
     let url = Url::parse(value)
         .map_err(|_| EdamameError::BadRequest(format!("{name} must be an absolute URL")))?;

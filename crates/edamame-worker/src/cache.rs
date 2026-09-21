@@ -1,7 +1,7 @@
-//! worker のローカルキャッシュ。走査と索引を担当する。
+//! worker のローカルキャッシュの走査と索引を扱う。
 //!
-//! 索引の mutex をファイル I/O の間で保持しないため、ファイルの読み書きは
-//! 呼び出し側で行う。sync の heartbeat が保存待ちで止まらないようにするためである。
+//! 呼び出し側は索引を参照または変更する間だけ mutex を保持し、セグメントファイルの読み書きの間は保持しない。
+//! sync の応答がセグメントファイルの保存待ちで止まるのを防ぐ。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use edamame_domain::{
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `(channel_id, quality)` ごとにシーケンス番号を保持するキャッシュ索引
+/// `(channel_id, quality)` ごとにセグメント番号を保持するキャッシュ索引
 #[derive(Debug)]
 pub struct Cache {
     dir: PathBuf,
@@ -23,7 +23,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// `cache_dir` を走査してキャッシュ索引を作る
+    /// `dir` を走査してキャッシュ索引を作り、キャッシュ上限を超えた分のファイルを削除する
     pub async fn scan(dir: PathBuf, limit: u64) -> Result<Self, EdamameError> {
         let limit = usize::try_from(limit)
             .map_err(|_| EdamameError::BadRequest("cache limit is too large".to_owned()))?;
@@ -44,7 +44,7 @@ impl Cache {
         Ok(cache)
     }
 
-    /// セグメントを保持しているか
+    /// 指定したセグメントが索引に含まれるかを返す
     #[must_use]
     pub fn contains(&self, channel_id: &str, quality: &str, sequence: u64) -> bool {
         self.entries
@@ -52,7 +52,8 @@ impl Cache {
             .is_some_and(|sequences| sequences.contains(&sequence))
     }
 
-    /// セグメントファイルのパスを検証して返す
+    /// `channel_id` と `quality` を検証し、セグメントファイルのパスを返す
+    /// ファイルの存在は確認しない
     pub fn path_for(
         &self,
         channel_id: &str,
@@ -64,7 +65,8 @@ impl Cache {
         Ok(self.path(channel_id, quality, sequence))
     }
 
-    /// 索引に追加し、キャッシュ上限を超えたファイルのパスを返す
+    /// 索引に追加し、キャッシュ上限を超えた分のファイルのパスを返す
+    /// ファイルの削除は呼び出し側で行う
     pub fn insert(
         &mut self,
         channel_id: &str,
@@ -81,6 +83,7 @@ impl Cache {
     }
 
     /// 索引からセグメントを取り除く
+    /// ファイルの削除が必要な場合は呼び出し側で行う
     pub fn remove(&mut self, channel_id: &str, quality: &str, sequence: u64) {
         let key = (channel_id.to_owned(), quality.to_owned());
         if let Some(sequences) = self.entries.get_mut(&key) {
@@ -91,7 +94,8 @@ impl Cache {
         }
     }
 
-    /// 索引から `(channel_id, quality)` のセグメントをすべて取り除き、削除するファイルのパスを返す
+    /// 索引から `(channel_id, quality)` のセグメントをすべて取り除き、ファイルのパスを返す
+    /// ファイルの削除は呼び出し側で行う
     pub fn clear(&mut self, channel_id: &str, quality: &str) -> Vec<PathBuf> {
         let Some(sequences) = self
             .entries
@@ -105,7 +109,8 @@ impl Cache {
             .collect()
     }
 
-    /// 索引にあるセグメントをすべて取り除き、削除するファイルのパスを返す
+    /// 索引にあるセグメントをすべて取り除き、ファイルのパスを返す
+    /// ファイルの削除は呼び出し側で行う
     pub fn clear_all(&mut self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for ((channel_id, quality), sequences) in &self.entries {
@@ -117,7 +122,7 @@ impl Cache {
         paths
     }
 
-    /// sync に送るキャッシュ一覧
+    /// sync に送るキャッシュ一覧を返す
     #[must_use]
     pub fn keys(&self) -> Vec<SegmentKey> {
         let mut keys = Vec::new();
@@ -133,7 +138,7 @@ impl Cache {
         keys
     }
 
-    /// 保持しているセグメントの識別子
+    /// キャッシュしているセグメントを `SegmentId` の集合で返す
     #[must_use]
     pub fn cached_ids(&self) -> BTreeSet<SegmentId> {
         let mut ids = BTreeSet::new();
@@ -232,7 +237,8 @@ impl Cache {
         Ok(())
     }
 
-    /// キャッシュ上限を超えたセグメントを索引から外し、削除するファイルのパスを返す
+    /// キャッシュ上限を超えた分のセグメントを索引から外し、ファイルのパスを返す
+    /// ファイルの削除は呼び出し側で行う
     fn remove_over_limit(&mut self) -> Vec<PathBuf> {
         let dir = self.dir.clone();
         let limit = self.limit;

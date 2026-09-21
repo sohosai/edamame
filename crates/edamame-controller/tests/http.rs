@@ -1,4 +1,4 @@
-//! controller と worker の HTTP 契約と統合動作を実サーバーで確認する
+//! controller と worker の HTTP API と連携を実際のサーバーで確認する
 
 mod support;
 
@@ -111,9 +111,7 @@ async fn publish_series(
     sequences
 }
 
-/// 鍵 URI と任意の IV を付けてセグメントを PUT する
-///
-/// IV を指定しない場合は `None` を渡す。
+/// 暗号鍵の URI と任意の IV を付けてセグメントを PUT する
 async fn publish_with_encryption(
     client: &reqwest::Client,
     base_url: &str,
@@ -123,7 +121,7 @@ async fn publish_with_encryption(
     iv: Option<&str>,
 ) -> reqwest::Response {
     let body = format!("segment-{quality}-{identifier}");
-    // 鍵 URI は query や `&` を含み得るため、文字列連結ではなく query として組み立てる
+    // 暗号鍵の URI は query や `&` を含み得るため、文字列連結ではなく query として組み立てる
     let mut query = vec![
         ("duration_ms", "6000"),
         ("bandwidth", "3000000"),
@@ -142,7 +140,7 @@ async fn publish_with_encryption(
         .unwrap()
 }
 
-/// 鍵 URI を付けてセグメントを PUT し、割り当てられた番号を返す
+/// 暗号鍵の URI を付けてセグメントを PUT し、割り当てられたセグメント番号を返す
 async fn publish_segment_with_key(
     client: &reqwest::Client,
     base_url: &str,
@@ -161,7 +159,7 @@ async fn publish_segment_with_key(
     body["sequence"].as_u64().unwrap()
 }
 
-/// 鍵 URI と IV を付けてセグメントを PUT し、割り当てられた番号を返す
+/// 暗号鍵の URI と IV を付けてセグメントを PUT し、割り当てられたセグメント番号を返す
 async fn publish_segment_with_iv(
     client: &reqwest::Client,
     base_url: &str,
@@ -895,7 +893,7 @@ async fn media_playlist_reflects_new_segment() {
     assert!(!second_body.contains("http://worker.test/segments/live/720p/0.ts"));
 }
 
-/// 鍵 URI はセグメント PUT からメディアプレイリストまで通り、省略した再 PUT で外れる
+/// セグメント PUT で指定した暗号鍵の URI はメディアプレイリストに反映され、省略して再 PUT すると取り除かれる
 #[tokio::test]
 async fn key_uri_is_reflected_in_media_playlist() {
     let tmp = TempDir::new("key-uri");
@@ -921,7 +919,7 @@ async fn key_uri_is_reflected_in_media_playlist() {
     let body = playlist.text().await.unwrap();
     assert!(body.contains(&format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key}\"\n")));
 
-    // 鍵 URI は競合する属性ではないため、省略した再 PUT は 200 で通り、暗号化なしの区間が出る
+    // 暗号鍵の URI は競合する属性ではないため、省略した再 PUT は 200 で成功し、暗号化なしの区間が出る
     let reput = client
         .put(format!(
             "{base}/segments/live/720p/seg-3?duration_ms=6000&bandwidth=3000000&resolution=1280x720"
@@ -984,7 +982,7 @@ async fn key_uri_validation_rejects_invalid_urls() {
     assert_eq!(accepted.status().as_u16(), 201);
 }
 
-/// IV は鍵 URI と組でメディアプレイリストに出る
+/// IV は暗号鍵の URI と組でメディアプレイリストに出る
 #[tokio::test]
 async fn iv_is_reflected_in_media_playlist() {
     let tmp = TempDir::new("iv");
@@ -1022,7 +1020,7 @@ async fn iv_is_reflected_in_media_playlist() {
         "#EXT-X-KEY:METHOD=AES-128,URI=\"{key}\",IV=0x{iv_zero}\n"
     )));
 
-    // 大文字の IV は小文字にそろえ、同じ鍵 URI でも IV が変われば出し直す
+    // 大文字の IV は小文字にそろえ、暗号鍵の URI が同じでも IV が変われば出し直す
     let iv_one = "0000000000000000000000000000000A";
     let response = publish_with_encryption(&client, base, "720p", "seg-3", key, Some(iv_one)).await;
     assert_eq!(response.status().as_u16(), 200);
@@ -1097,7 +1095,7 @@ async fn keeps_encryption_of_segments_told_to_fetch() {
     );
 }
 
-/// IV は鍵 URI があるときだけ受け付ける
+/// IV は暗号鍵の URI があるときだけ受け付ける
 #[tokio::test]
 async fn iv_requires_key_uri() {
     let tmp = TempDir::new("iv-without-key");
@@ -1340,7 +1338,7 @@ async fn reput_pruned_segment_does_not_start_wait() {
     assert!(media_body.contains("http://worker.test/segments/live/720p/0.ts"));
 }
 
-/// 新しい quality は worker が公開範囲を取り込むまで master playlist に追加しない
+/// 新しい quality は worker が公開範囲を取り込むまでマスタープレイリストに追加しない
 #[tokio::test]
 async fn master_playlist_excludes_quality_until_published() {
     let tmp = TempDir::new("master-wait");
@@ -1652,7 +1650,7 @@ async fn allows_media_sequence_to_move_backwards() {
     assert!(media_body.contains("http://worker.test/segments/live/720p/8.ts"));
 }
 
-/// 直近範囲より前を取り逃がした worker でも、保持している最新範囲へ復旧できる
+/// 直近のセグメントの範囲より古いセグメントを取得できなかった worker でも、保持している最新範囲で配信を再開できる
 #[tokio::test]
 async fn recovers_when_worker_is_farther_behind_than_the_window() {
     let tmp = TempDir::new("recovery");
@@ -1664,7 +1662,7 @@ async fn recovers_when_worker_is_farther_behind_than_the_window() {
     sync_worker(&client, base, "worker-a", cached("720p", 0..6)).await;
     wait_for_playlist(&client, &format!("{base}/channels/live/720p.m3u8")).await;
 
-    // 直近範囲の 6 個を超えて進み、古い範囲はメタデータから消える
+    // 直近のセグメントの範囲の 6 個を超えて進み、古い範囲はメタデータから消える
     for index in 6..21 {
         assert_eq!(
             publish_segment(&client, base, "720p", &format!("seg-{index}")).await,
@@ -2132,7 +2130,7 @@ async fn end_to_end_publish_sync_playlist_serve() {
     );
 }
 
-/// 連続してセグメントを PUT しても、公開待ちの間に playlist が 503 にならない
+/// 連続してセグメントを PUT しても、公開待ちの間にプレイリストが 503 にならない
 #[tokio::test]
 async fn continuous_publish_keeps_playlist_available() {
     let tmp = TempDir::new("continuous-publish");
@@ -2526,7 +2524,7 @@ async fn declare_external_m3u8(
         .unwrap()
 }
 
-/// リダイレクトを追わずに master playlist を取得する
+/// リダイレクトを追わずにマスタープレイリストを取得する
 async fn get_master_without_redirect(url: &str) -> reqwest::Response {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -2564,7 +2562,7 @@ async fn spawn_external_origin(
     (controller, worker, master_url)
 }
 
-/// シェアが 100% のときは master を外部配信の master m3u8 へ転送する
+/// 外部配信へ振り分ける割合が 100% のときは、マスタープレイリストのリクエストを外部配信の master m3u8 へ転送する
 #[tokio::test]
 async fn redirects_master_to_external_playlist() {
     let external_dir = TempDir::new("external-origin");
@@ -2606,7 +2604,7 @@ async fn redirects_master_to_external_playlist() {
         response.headers()[reqwest::header::LOCATION],
         external_master.as_str()
     );
-    // 接続元ごとの判定が中間キャッシュに固定されないようにする
+    // 接続元ごとの転送先を共有キャッシュが使い回さないようにする
     assert_eq!(
         response.headers()[reqwest::header::CACHE_CONTROL],
         "no-store"
@@ -2626,7 +2624,7 @@ async fn redirects_master_to_external_playlist() {
     controller.shutdown().await;
 }
 
-/// シェアが 0% で自前の配信が使えるときは自前の master を返す
+/// 外部配信へ振り分ける割合が 0% で自前の配信が使えるときは、自前のマスタープレイリストを返す
 #[tokio::test]
 async fn keeps_local_master_when_external_percent_is_zero() {
     let external_dir = TempDir::new("external-origin");
@@ -2673,7 +2671,7 @@ async fn keeps_local_master_when_external_percent_is_zero() {
     ))
     .await;
     assert_eq!(response.status().as_u16(), 200);
-    // 接続元ごとに振り分ける応答は、共有キャッシュに固定されないようにする
+    // 接続元ごとに振り分ける応答を共有キャッシュが使い回さないようにする
     assert_eq!(
         response.headers()[reqwest::header::CACHE_CONTROL],
         "no-store"
@@ -2729,7 +2727,7 @@ async fn registers_worker_with_https_public_url() {
     controller.shutdown().await;
 }
 
-/// 配信できる quality が 1 つもないときは、最低の割合が 0 でも外部配信へ逃がす
+/// 配信できる quality が 1 つもないときは、最低の割合が 0 でも外部配信へ振り分ける
 #[tokio::test]
 async fn falls_back_to_external_when_no_quality_can_be_served() {
     let external_dir = TempDir::new("external-origin");

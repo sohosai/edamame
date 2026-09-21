@@ -1,10 +1,10 @@
-//! HLS プレイリストの範囲計算と描画
+//! HLS プレイリストの範囲を計算し、文字列にする
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::EdamameError;
 
-/// 1 つの quality のメディアプレイリスト
+/// 1 つの quality のメディアプレイリストを表す
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaPlaylist {
     pub media_sequence: u64,
@@ -13,7 +13,7 @@ pub struct MediaPlaylist {
     pub sequences: Vec<u64>,
 }
 
-/// マスタープレイリストの 1 エントリ
+/// マスタープレイリストの 1 エントリを表す
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterQuality {
     pub quality: String,
@@ -22,7 +22,7 @@ pub struct MasterQuality {
     pub range: (u64, u64),
 }
 
-/// マスタープレイリストを組み立てるための quality 入力
+/// マスタープレイリストの生成に使う quality の情報を表す
 #[derive(Debug, Clone)]
 pub struct QualityPlaylistInput {
     pub bandwidth: u64,
@@ -30,16 +30,17 @@ pub struct QualityPlaylistInput {
     pub segments: BTreeSet<u64>,
 }
 
-/// セグメントに適用する暗号化の指定
+/// セグメントに適用する暗号化の指定を表す
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentEncryption {
-    /// 適用する鍵 URI
+    /// セグメントに適用する暗号鍵の URI を指定する
     pub key_uri: String,
-    /// 適用する IV（16 byte の hex）。`None` なら `#EXT-X-KEY` に `IV` 属性を出さない
+    /// controller が `normalize_iv` でそろえた 32 文字の hex を IV として受け取る。
+    /// `None` なら `#EXT-X-KEY` に `IV` 属性を出さない。
     pub iv: Option<String>,
 }
 
-/// 直近の範囲から連続したメディアプレイリストを計算する
+/// 直近のセグメントの範囲から、連続したセグメントを含むメディアプレイリストを計算する
 pub fn plan_media_playlist(
     segments: &BTreeSet<u64>,
     segment_duration_ms: u64,
@@ -132,7 +133,7 @@ pub fn render_media_playlist(
     let mut encrypted = false;
     for sequence in &playlist.sequences {
         match encryption.get(sequence) {
-            // IV はセグメントごとに変わるため、暗号化されたセグメントには毎回 `#EXT-X-KEY` を出す
+            // IV の有無や変化にかかわらず、暗号化されたセグメントごとに `#EXT-X-KEY` を出す
             Some(setting) => {
                 output.push_str(&key_tag(setting));
                 encrypted = true;
@@ -184,7 +185,7 @@ mod tests {
         values.iter().copied().collect()
     }
 
-    /// 鍵 URI だけを指定する
+    /// 暗号鍵の URI だけを指定する
     fn key(key_uri: &str) -> SegmentEncryption {
         SegmentEncryption {
             key_uri: key_uri.to_owned(),
@@ -192,7 +193,7 @@ mod tests {
         }
     }
 
-    /// 鍵 URI と IV を指定する
+    /// 暗号鍵の URI と IV を指定する
     fn key_with_iv(key_uri: &str, iv: &str) -> SegmentEncryption {
         SegmentEncryption {
             key_uri: key_uri.to_owned(),
@@ -246,7 +247,7 @@ mod tests {
         ]);
         let rendered =
             render_media_playlist(&playlist, "live", "720p", "http://worker.test", &encryption);
-        // 鍵 URI が同じでも、暗号化されたセグメントには毎回タグを出す
+        // 暗号鍵の URI が同じでも、暗号化されたセグメントごとにタグを出す
         assert_eq!(
             rendered.matches("#EXT-X-KEY:METHOD=AES-128").count(),
             3,
@@ -272,7 +273,7 @@ mod tests {
                 .expect("セグメントがない");
             assert!(tag_position < segment_position);
         }
-        // 暗号化されていないセグメントに戻るところで解除する
+        // 暗号化されていないセグメントに戻る箇所で、暗号化の指定を解除する
         let unencrypted = rendered.find("#EXT-X-KEY:METHOD=NONE\n").unwrap();
         let segment_104 = rendered.find("/104.ts\n").unwrap();
         assert!(unencrypted < segment_104);
@@ -298,7 +299,7 @@ mod tests {
         ]);
         let rendered =
             render_media_playlist(&playlist, "live", "720p", "http://worker.test", &encryption);
-        // 鍵 URI が同じでも IV が違うため、セグメントごとにタグを出す
+        // 暗号鍵の URI が同じでも、セグメントごとの IV をタグに反映する
         assert_eq!(rendered.matches("#EXT-X-KEY").count(), 3);
         for (sequence, iv) in [(101, 0), (102, 1), (103, 2)] {
             let tag = rendered

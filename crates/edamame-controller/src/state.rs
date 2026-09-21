@@ -1,4 +1,4 @@
-//! controller のメモリ状態、インジェスト、registry、playlist 生成
+//! controller のメモリ状態、セグメントの受け入れ、worker の登録、プレイリストの生成
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -25,7 +25,7 @@ pub struct ControllerState {
     /// 外部配信へ流す最低の割合（%）
     pub external_min_percent: u8,
     pub inner: Mutex<Inner>,
-    /// セグメントの属性確認と番号の割り当てからメタデータの更新までを直列化する
+    /// 同時 PUT が競合しないよう、属性の確認から番号の割り当て、メタデータの更新までを直列化するロック
     write_lock: Mutex<()>,
 }
 
@@ -44,18 +44,17 @@ pub struct ChannelState {
     pub external_m3u8: Option<String>,
     /// セグメント識別子から割り当てたセグメント番号への対応
     pub identifiers: BTreeMap<String, IdentifierState>,
-    /// 次に新しい識別子へ割り当てるセグメント番号
+    /// 新しいセグメント識別子に次回割り当てるセグメント番号
     pub next_sequence: u64,
 }
 
-/// セグメント識別子に割り当てた番号と、セグメントファイルを保存した quality
+/// セグメント識別子に割り当てたセグメント番号と、セグメントファイルを保存済みの quality の集合
 pub struct IdentifierState {
     pub sequence: u64,
     pub qualities: BTreeSet<String>,
 }
 
 impl ChannelState {
-    /// channel の状態を作る
     fn new(segment_duration_ms: u64, next_sequence: u64) -> Self {
         Self {
             segment_duration_ms,
@@ -72,7 +71,8 @@ impl ChannelState {
 pub struct QualityState {
     pub bandwidth: u64,
     pub resolution: Option<String>,
-    /// セグメント番号ごとの暗号化の指定。登録がないセグメントは暗号化されていない
+    /// セグメント番号ごとの暗号化の指定
+    /// 登録がないセグメントは暗号化されていない
     pub encryption: BTreeMap<u64, SegmentEncryption>,
     /// 配信先の選択で使う worker ごとの現在値
     pub current_weights: BTreeMap<String, i64>,
@@ -91,13 +91,15 @@ pub struct QualityState {
 /// worker の登録内容と最後の報告
 pub struct WorkerState {
     pub public_url: String,
-    /// 相対的な配信能力
+    /// 相対的な配信能力を表す重み
     pub weight: i64,
     pub last_sync_ms: u64,
     pub cached: BTreeSet<SegmentId>,
-    /// worker が報告した取得中のセグメントであり、暗号化の指定を残すために使う
+    /// worker が取得中と報告したセグメント
+    /// 取得が終わっていなくても暗号化の指定を残すために使う
     pub fetching: BTreeSet<SegmentId>,
-    /// 直前に指示した取得対象であり、報告が届くまでの間だけ暗号化の指定を残すために使う
+    /// 直前の sync 応答で取得を指示したセグメント
+    /// 暗号化の指定を残すために使い、sync ごとにその時点の未キャッシュの集合に置き換える
     pub instructed: BTreeSet<SegmentId>,
 }
 
@@ -124,7 +126,6 @@ pub struct SegmentIngest<'a> {
 }
 
 impl ControllerState {
-    /// 共有状態を作る
     #[must_use]
     pub fn new(
         store: CanonicalStore,
@@ -198,7 +199,7 @@ impl ControllerState {
         }
         // 鍵は publisher が配信するため、URL としての形式だけを確認する
         let key_uri = key_uri.map(normalize_key_uri).transpose()?;
-        // IV は鍵と組で使うため、鍵 URI なしでは指定できない
+        // IV は鍵と組で使うため、暗号鍵の URI なしでは指定できない
         let iv = match iv {
             Some(value) => {
                 if key_uri.is_none() {
@@ -209,7 +210,8 @@ impl ControllerState {
             None => None,
         };
 
-        // 属性の確認と番号の割り当てを直列化する。ファイル I/O の間も inner の mutex は保持しない。
+        // 同時 PUT の属性の確認と番号の割り当てには write_lock を使う
+        // ファイル I/O が共有状態の参照を妨げないよう、inner の mutex は保持しない
         let _write_guard = self.write_lock.lock().await;
         // 保存に成功したときだけメタデータを確定するため、ここでは割り当てる番号を決めるだけにする
         let (sequence, known_identifier, stored_in_quality, next_sequence) = {
@@ -276,10 +278,10 @@ impl ControllerState {
             IngestOutcome::Created { sequence }
         };
 
-        // 保存が終わる前に待ち時間を始めると、worker が取得する時間を失う
+        // controller の保存が終わる前に公開待ちを始めると、worker が取得に使える時間が短くなる
         let committed_at_ms = now_ms();
         let mut inner = self.inner.lock().await;
-        // worker が持つ、または取得を指示したセグメントの暗号化の指定も、公開範囲が古い範囲へ戻る場合のために残す
+        // 公開範囲が古い範囲へ戻る場合に備え、worker が持つセグメントや取得を指示したセグメントの暗号化の指定を残す
         let worker_segments: BTreeSet<u64> = inner
             .workers
             .values()
@@ -371,7 +373,7 @@ impl ControllerState {
         let created = if let Some(worker) = inner.workers.get_mut(worker_id) {
             worker.public_url = public_url;
             worker.weight = i64::from(weight);
-            // worker は登録のたびにキャッシュを捨てるため、報告済みのキャッシュも無効にする
+            // 再登録時は、controller が保持する報告済みのキャッシュを無効にする
             worker.cached = BTreeSet::new();
             worker.fetching = BTreeSet::new();
             worker.instructed = BTreeSet::new();
@@ -390,7 +392,7 @@ impl ControllerState {
             );
             true
         };
-        // 重みが変わると前の周期が合わなくなるため、全 quality の現在値をやり直す
+        // 変更後の重みの比で選べるよう、全 quality の選択に使う現在値をリセットする
         reset_current_weights(&mut inner.channels);
         Ok(created)
     }
@@ -441,12 +443,12 @@ impl ControllerState {
             .expect("worker was checked above");
         let missing: BTreeSet<SegmentId> = target.difference(&worker.cached).cloned().collect();
         let fetch_segments = missing.iter().map(SegmentKey::from).collect();
-        // 指示した一覧は、worker が取得中として報告するか、キャッシュとして報告するまで残す
+        // 暗号化の指定を残す対象として、今回の取得指示を保存する
+        // 前回の一覧は、今回計算した未キャッシュの集合に置き換える
         worker.instructed = missing;
         Ok(SyncResponse { fetch_segments })
     }
 
-    /// メディアプレイリストを生成する
     pub async fn media_playlist(
         &self,
         channel_id: &str,
@@ -515,8 +517,8 @@ impl ControllerState {
 
     /// マスタープレイリストを生成する。外部配信へ流す場合は転送先の URL を返す
     ///
-    /// 外部配信へ振り分けるかどうかは `routing` で指定する。外部配信が登録されていなければ、
-    /// 振り分ける指定でも自前のマスタープレイリストを返す。
+    /// 外部配信へ振り分けるかどうかは `routing` で指定する。
+    /// 外部配信が登録されていなければ、振り分ける指定でも自前のマスタープレイリストを返す。
     pub async fn master_playlist(
         &self,
         channel_id: &str,
@@ -576,7 +578,7 @@ impl ControllerState {
                     ),
                 );
             }
-            // 配信できる quality が 1 つもないときは全量を外部へ逃がす
+            // 配信できる quality が 1 つもないときはすべて外部配信へ振り分ける
             if !published.values().any(|(_, _, _, served)| *served) {
                 external_percent = 100;
             }
@@ -698,7 +700,7 @@ fn is_alive(worker: &WorkerState, now_ms: u64, sync_timeout_ms: u64) -> bool {
     now_ms.saturating_sub(worker.last_sync_ms) <= sync_timeout_ms
 }
 
-/// 全 quality の選択の周期をやり直す
+/// 全 quality について、重み付きの選択に使う現在値をリセットする
 fn reset_current_weights(channels: &mut BTreeMap<String, ChannelState>) {
     for channel in channels.values_mut() {
         for quality_state in channel.qualities.values_mut() {
@@ -900,7 +902,7 @@ fn is_allowed(allowed_through: Option<u64>, pending: &BTreeSet<u64>, sequence: u
     allowed_through.is_some_and(|through| sequence <= through) && !pending.contains(&sequence)
 }
 
-/// 期限内に sync した worker が連続して保持している最新範囲を返す
+/// 期限内に sync した worker が保持する連続範囲を、公開範囲の候補として新しい順に返す
 fn held_candidates(
     channel_id: &str,
     quality: &str,
@@ -974,7 +976,7 @@ fn worker_held_ranges(
     ranges
 }
 
-/// メタデータ上に残す直近の範囲を計算する
+/// メタデータ上に残す直近のセグメントの範囲を計算する
 fn prune_segments(segments: &mut BTreeSet<u64>, playlist_segments: u64) {
     let Some(latest) = segments.iter().next_back().copied() else {
         return;
@@ -998,7 +1000,7 @@ fn prune_encryption(
         .retain(|sequence, _| segments.contains(sequence) || worker_segments.contains(sequence));
 }
 
-/// worker が取得すべき直近のセグメント範囲を返す
+/// worker のキャッシュ対象となる直近のセグメントの範囲を返す
 fn cache_target(
     channels: &BTreeMap<String, ChannelState>,
     playlist_segments: u64,
@@ -1026,7 +1028,7 @@ fn cache_target(
 mod tests {
     use super::*;
 
-    /// 鍵 URI だけを指定する
+    /// 暗号鍵の URI だけを指定する
     fn segment_encryption(key_uri: &str) -> SegmentEncryption {
         SegmentEncryption {
             key_uri: key_uri.to_owned(),
@@ -1505,7 +1507,7 @@ mod tests {
 
     #[test]
     fn keeps_only_latest_playlist_range() {
-        // 直近の範囲に収まるセグメント番号はそのまま残す
+        // 直近のセグメントの範囲に収まるセグメント番号はそのまま残す
         let mut segments = BTreeSet::from([101, 102, 103, 104, 105, 106]);
         prune_segments(&mut segments, 6);
         assert_eq!(segments, BTreeSet::from([101, 102, 103, 104, 105, 106]));

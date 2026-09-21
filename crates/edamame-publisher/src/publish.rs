@@ -17,18 +17,18 @@ use crate::config::{PublisherSettings, RenditionMode, RenditionSettings};
 use crate::credentials;
 use crate::ffmpeg::{self, Ffmpeg, PLAYLIST_NAME};
 
-/// 作業ディレクトリを見に行く間隔
+/// 作業ディレクトリを走査する間隔
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// 1 回の PUT の制限時間
 const PUT_TIMEOUT: Duration = Duration::from_secs(10);
-/// PUT をやり直すまでの待ち時間
+/// PUT を再試行するまでの待ち時間
 const PUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// ffmpeg を起動し直すときの待ち時間
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(10);
 /// コピーする rendition のセグメント長を比べるときの許容幅
 const COPY_DURATION_TOLERANCE_MS: u64 = 100;
-/// プレイリストを読みに行くときの制限時間と試行回数
+/// プレイリスト取得時の制限時間と試行回数
 const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(5);
 const PLAYLIST_ATTEMPTS: u32 = 3;
 const PLAYLIST_RETRY_INTERVAL: Duration = Duration::from_millis(500);
@@ -36,7 +36,7 @@ const PLAYLIST_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// 1 つの channel を動かすために必要な設定
 pub struct ChannelContext {
     pub settings: Arc<PublisherSettings>,
-    /// `settings.inputs` の何番目かを表す
+    /// 対象の入力が `settings.inputs` の何番目にあるかを表す
     pub input_index: usize,
     pub key: [u8; 16],
     pub work_dir: PathBuf,
@@ -71,7 +71,7 @@ impl ChannelContext {
 struct PendingSet {
     /// publisher が数える通し番号。ログだけで使う
     index: u64,
-    /// 全 rendition で同じ値を使う識別子
+    /// 全 rendition で同じ値を使うセグメント識別子
     identifier: String,
     files: Vec<SegmentFile>,
     enqueued_at: Instant,
@@ -84,20 +84,22 @@ struct SegmentFile {
 
 /// 送信中のセットをどう扱うか
 enum PublishError {
-    /// やり直しても直らないので channel を止める
+    /// 再試行では解消しないエラーのため channel を止める
     Fatal(String),
     /// 期限を過ぎたか停止したので、このセットは捨てる
     Abandoned(String),
 }
 
-/// 鍵を作る
+/// 16 byte の乱数から暗号鍵を作る
 pub fn random_key() -> Result<[u8; 16], String> {
     let mut key = [0u8; 16];
     getrandom::fill(&mut key).map_err(|error| format!("failed to generate a key: {error}"))?;
     Ok(key)
 }
 
-/// 鍵ファイルから鍵を読む。ファイルがなければ生成して保存する
+/// 鍵ファイルを読み、内容がちょうど 16 byte でなければエラーにする。
+/// ファイルがなければ鍵を生成し、権限 0600 を指定して新規ファイルに保存する。
+/// 既存のファイルは上書きしない
 pub fn load_or_create_key(path: &Path) -> Result<[u8; 16], String> {
     match fs::read(path) {
         Ok(bytes) => {
@@ -144,7 +146,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     text
 }
 
-/// IV を作る
+/// 16 byte の乱数から IV を作る
 pub fn random_iv() -> Result<[u8; 16], String> {
     let mut iv = [0u8; 16];
     getrandom::fill(&mut iv).map_err(|error| format!("failed to generate an iv: {error}"))?;
@@ -187,7 +189,7 @@ pub fn segment_query(
         ("resolution", rendition.resolution.text()),
     ];
     if let Some(key_uri) = context.input().key_uri.as_deref() {
-        // 暗号化に使った IV を controller に伝え、プレイリストの #EXT-X-KEY に出してもらう
+        // 暗号化に使った IV を controller に伝え、プレイリストの #EXT-X-KEY に反映させる
         query.push(("key_uri", key_uri.to_owned()));
         query.push(("iv", iv_hex.to_owned()));
     }
@@ -324,7 +326,8 @@ fn register_stream_credentials(
     }
 }
 
-/// 起動時に controller のプレイリストから次のセグメント番号を求める
+/// 起動時に controller のプレイリストから次のセグメント番号を求める。
+/// プレイリストを取得できない場合は 0 から始める
 fn starting_sequence(context: &ChannelContext) -> u64 {
     let client = match Client::builder().timeout(PLAYLIST_TIMEOUT).build() {
         Ok(client) => client,
@@ -383,7 +386,8 @@ fn fetch_next_sequence(
     Ok(next)
 }
 
-/// プレイリストを取得する。405 と 422 と 503 は channel が育つまで待つ
+/// プレイリストを取得する。
+/// 再試行が有効な場合、422 と 503 では待ち時間をおいて取得を再試行する
 fn get_playlist(client: &Client, url: &str, retry: bool) -> Result<Option<String>, String> {
     let attempts = if retry { PLAYLIST_ATTEMPTS } else { 1 };
     for attempt in 1..=attempts {
@@ -414,7 +418,7 @@ fn get_playlist(client: &Client, url: &str, retry: bool) -> Result<Option<String
     Err(format!("{url} is not available"))
 }
 
-/// master playlist に並ぶ quality を取り出す
+/// マスタープレイリストに並ぶ quality を取り出す
 fn parse_master_qualities(text: &str) -> Vec<String> {
     let mut qualities = Vec::new();
     for line in text.lines() {
@@ -430,7 +434,7 @@ fn parse_master_qualities(text: &str) -> Vec<String> {
     qualities
 }
 
-/// media playlist に並ぶセグメント番号を取り出す
+/// メディアプレイリストに並ぶセグメント番号を取り出す
 fn parse_playlist_sequences(text: &str) -> Vec<u64> {
     let mut sequences = Vec::new();
     for line in text.lines() {
@@ -500,7 +504,7 @@ fn run_encoder(
             thread::sleep(POLL_INTERVAL);
         }
 
-        // 終了間際のセグメントを拾い、揃わなかったものは捨てる
+        // 終了間際に完成したセグメントを集め、揃わなかったものは捨てる
         collect_segments(context, &mut run, sender)?;
         run.discard_incomplete(context)?;
 
@@ -509,13 +513,13 @@ fn run_encoder(
         } else {
             restart_delay = RESTART_MIN;
         }
-        // 再起動の前に少し待ち、その間も停止要求を見る
+        // 再起動の前に少し待ち、その間も停止要求を確認する
         sleep_interruptible(restart_delay, stop, channel_stop);
     }
     Ok(())
 }
 
-/// ffmpeg の 1 回の実行で作られたセグメントの状態
+/// ffmpeg を 1 回起動して作られたセグメントの状態
 struct RunState {
     run_dir: PathBuf,
     /// セグメント番号 -> quality -> ファイル
@@ -524,9 +528,9 @@ struct RunState {
     sent: BTreeSet<u64>,
     /// 長さを確かめたセグメント番号
     checked: BTreeSet<u64>,
-    /// この実行で最初のセットの検査が済んだか
+    /// 今回の ffmpeg 起動後、最初のセットの検査が済んだか
     validated: bool,
-    /// この実行で送ったセット数
+    /// 今回の ffmpeg 起動後に送信側へ渡したセット数
     produced: u64,
 }
 
@@ -647,7 +651,8 @@ fn read_files(context: &ChannelContext, run: &mut RunState) -> Result<(), String
             let Some(index) = name.to_str().and_then(parse_segment_index) else {
                 continue;
             };
-            // 送信側へ渡したファイルは、消えるまで見つかり続ける
+            // 送信側へ渡したファイルは、送信後も publisher が削除するまでディスクに残る。
+            // 再走査で見つかっても、送信側へ重複して渡さない
             if run.sent.contains(&index) {
                 continue;
             }
@@ -676,7 +681,7 @@ fn parse_segment_index(name: &str) -> Option<u64> {
     name.strip_suffix(".ts")?.parse::<u64>().ok()
 }
 
-/// 実行の最初のセットだけ、入力の形式を確かめる
+/// ffmpeg 起動後の最初のセットだけ、入力の形式を確かめる
 fn validate_first_set(context: &ChannelContext, files: &[SegmentFile]) -> Result<(), String> {
     for file in files {
         let rendition = context
@@ -848,7 +853,7 @@ fn publish_set(
         let plaintext = fs::read(&file.path).map_err(|error| {
             PublishError::Fatal(format!("failed to read {}: {error}", file.path.display()))
         })?;
-        // 鍵 URI を指定しない場合は IV を伝える手段がないため、全ゼロ固定にする
+        // 暗号鍵の URI を指定しない場合は controller を介して IV を伝えられないため、全ゼロ固定にする
         let iv = if context.input().key_uri.is_some() {
             random_iv().map_err(PublishError::Fatal)?
         } else {
@@ -907,7 +912,7 @@ fn publish_set(
 enum PutError {
     /// 時間をおいて同じセグメントを送り直す
     Retryable(String),
-    /// 設定か入力を直さないと直らない
+    /// 設定か入力を直さないと送信に成功しない
     Fatal(String),
 }
 
@@ -968,7 +973,7 @@ fn delete_files(set: &PendingSet) {
     }
 }
 
-/// 停止要求を見ながら待つ
+/// 停止要求を確認しながら待つ
 fn sleep_interruptible(duration: Duration, stop: &AtomicBool, channel_stop: &AtomicBool) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {

@@ -92,7 +92,6 @@ async fn missing_file_removes_index_entry() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// 読み取りに失敗したセグメントファイルは索引から外し、次の sync で取得対象に戻す
 #[tokio::test]
 async fn unreadable_file_removes_index_entry() {
     let dir = temp_dir("unreadable");
@@ -112,7 +111,7 @@ async fn unreadable_file_removes_index_entry() {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    // ディレクトリに置き換えると、存在しない場合とは違う読み取りエラーになる
+    // ファイルの欠落以外の読み取りエラーを起こすため、ディレクトリに置き換える
     std::fs::remove_file(dir.join("live/720p/101.ts")).unwrap();
     std::fs::create_dir(dir.join("live/720p/101.ts")).unwrap();
     let response = reqwest::Client::new()
@@ -126,7 +125,7 @@ async fn unreadable_file_removes_index_entry() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// axum 7 の記法として解釈され得る文字を含むパスの接頭辞も、URL のリテラルとして配信する
+/// パスの接頭辞にある axum 7 の記法に似た文字も、URL の一部として扱う
 #[tokio::test]
 async fn serves_segments_under_path_prefix_with_route_characters() {
     for path in ["/foo/:tenant", "/foo/*", "/foo{bar}"] {
@@ -147,7 +146,7 @@ async fn serves_segments_under_path_prefix_with_route_characters() {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        // 要求 URL では `{` と `}` が `%7B` `%7D` になる
+        // リクエストの URL に含めるため、`{` と `}` を `%7B` と `%7D` に変換する
         let request_path = path.replace('{', "%7B").replace('}', "%7D");
         let response = reqwest::Client::new()
             .get(format!(

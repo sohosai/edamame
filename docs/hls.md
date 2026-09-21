@@ -1,6 +1,6 @@
 # HLS の出力
 
-Edamame は publisher から受け取ったセグメントの属性からマスタープレイリストとメディアプレイリストを生成する。
+Edamame は publisher から受け取ったセグメントの属性を使って、マスタープレイリストとメディアプレイリストを生成する。
 この文書は client に渡すプレイリストの形式を定める。
 
 ## 対応する形式
@@ -9,7 +9,7 @@ Edamame は publisher から受け取ったセグメントの属性からマス�
 - `#EXT-X-VERSION` は 3 とする
 - ライブ配信だけを扱い、`#EXT-X-ENDLIST` は出力しない
 - fMP4、LL-HLS、バイト範囲、複数音声、I フレーム用のプレイリストは扱わない
-- 暗号化は AES-128 だけを扱い、`#EXT-X-KEY` には publisher から受け取った `IV` 属性だけを出力する
+- 暗号化は AES-128 だけを扱う。暗号化されたセグメントの `#EXT-X-KEY` には `METHOD` と `URI` を必ず出力し、publisher が IV を指定したセグメントにだけ `IV` 属性を付ける
 
 ## メディアプレイリスト
 
@@ -30,9 +30,9 @@ http://127.0.0.1:9001/segments/live/720p/102.ts
 
 各要素の決まりは次のとおり。
 
-- `#EXT-X-TARGETDURATION` には channel のセグメント長の基準値（秒）を出力し、値は channel の最初に成功した PUT の `duration_ms` を秒に直し、小数点以下を切り上げた整数（最低 1）として決まり、channel が存在する間は変わらない
-- `#EXT-X-MEDIA-SEQUENCE` は公開範囲の先頭のセグメント番号（HLS では media sequence number、メディアシーケンス番号）とし、client はこの値と `#EXTINF` の並びから、プレイリストを取得し直したときにセグメントの位置を合わせる
-- `#EXTINF` は `duration_ms` を秒に直し、小数第 3 位まで固定で出力し、6000 ミリ秒は `6.000` になる
+- `#EXT-X-TARGETDURATION` には channel のセグメント長の基準値（秒）を出力する。基準値は、channel の最初に成功した PUT の `duration_ms` を秒に直し、小数点以下を切り上げた整数（最低 1）とする。channel が存在する間は変わらない
+- `#EXT-X-MEDIA-SEQUENCE` には公開範囲の先頭のセグメント番号（HLS では media sequence number、メディアシーケンス番号）を出力する。client はプレイリストを取得し直したときに、この値と `#EXTINF` の並びからセグメントの位置を合わせる
+- `#EXTINF` には `duration_ms` を秒に直し、小数第 3 位まで固定で出力する。6000 ミリ秒は `6.000` になる
 - セグメントはセグメント番号の昇順に出力する
 - セグメントファイルの URL は `{public_url}/segments/{channel_id}/{quality}/{sequence}.ts` の絶対 URL とする
 - すべての URL は、controller がその quality の配信先として選んだ worker の `public_url` を使う
@@ -42,8 +42,9 @@ http://127.0.0.1:9001/segments/live/720p/102.ts
 ### 暗号化されたセグメント
 
 `key_uri` を付けて PUT されたセグメントには `#EXT-X-KEY` を出力する。
-鍵 URI は publisher が指定した絶対 URL をそのまま使い、controller は鍵を取得も検証もしない。
-セグメント番号ごとに鍵 URI と `iv` の組を記録し、暗号化されたセグメントには毎回タグを出す。
+暗号鍵の URI には publisher が指定した絶対 URL をそのまま使う。
+controller は鍵を取得も検証もしない。
+controller はセグメント番号ごとに暗号鍵の URI と `iv` の組を記録し、暗号化されたセグメントには毎回タグを出す。
 
 たとえばセグメント番号 101 と 102 が `https://keys.example.test/live/key-1` と IV `0x00000000000000000000000000000000`、103 が `https://keys.example.test/live/key-2` と IV `0x00000000000000000000000000000001`、104 が暗号化なしで、公開範囲が 101 から 104 の場合、出力は次のようになる。
 
@@ -68,11 +69,11 @@ http://127.0.0.1:9001/segments/live/720p/104.ts
 
 各要素の決まりは次のとおり。
 
-- 鍵 URI があるセグメントの直前に `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` を出力する。IV がある場合は `,IV=0x{iv}` を続ける
-- 鍵 URI と IV が同じでも、暗号化されたセグメントには毎回タグを出す
-- 鍵 URI がないセグメントに戻るところでは `#EXT-X-KEY:METHOD=NONE` を出力する
-- 鍵 URI を 1 つも受け取っていない quality には `#EXT-X-KEY` を出力しない
-- 鍵 URI と IV は controller のメモリ上だけにあり、controller の再起動で失われる
+- 暗号鍵の URI があるセグメントの直前に `#EXT-X-KEY:METHOD=AES-128,URI="{key_uri}"` を出力する。IV がある場合は `,IV=0x{iv}` を続ける
+- 暗号鍵の URI と IV が同じでも、暗号化されたセグメントには毎回タグを出す
+- 暗号鍵の URI がないセグメントに戻るところでは `#EXT-X-KEY:METHOD=NONE` を出力する
+- 暗号鍵の URI を 1 つも受け取っていない quality には `#EXT-X-KEY` を出力しない
+- 暗号鍵の URI と IV は controller のメモリ上だけに保持し、controller の再起動で失われる
 
 ## マスタープレイリスト
 
@@ -99,8 +100,10 @@ quality は昇順に出力する。
 
 ### 外部配信への振り分け
 
-channel に外部配信の master m3u8 が登録されているとき、`master.m3u8` は client ごとに固定した判定で `302 Found` を返し、`Location` にその URL を返すことがある。
-外部へ流す割合は、配信できる quality の公開範囲が最新セグメントに追いついていない度合いで上げ、`--external-min-percent` を下限とする。配信できる quality が 1 つもないときは全量を外部へ流す。
+channel に外部配信の master m3u8 が登録されているとき、`master.m3u8` はリクエストごとの判定で `302 Found` を返し、`Location` にその URL を返すことがある。
+判定には、接続元の IP と channel から決まる値と、その時点の外部配信へ振り分ける割合を使う。
+外部配信へ振り分ける割合は、配信できる quality の公開範囲が最新セグメントより遅れるほど高くし、`--external-min-percent` を下限とする。
+配信できる quality が 1 つもないときは、すべてのリクエストを外部配信へ振り分ける。
 controller は外部のプレイリストを取得せず、振り分け先が使えるかどうかも確認しない。
 外部配信を停止するときは、`PUT /channels/{channel_id}/external` に `null` を送って登録を取り消す。
 `master.m3u8?external=0` のように `external=0` を付けたリクエストには振り分けを適用しない。
@@ -116,10 +119,11 @@ controller は quality ごとに公開範囲を決める。
 
 公開範囲は、sync が `--sync-timeout-ms` 以内に届いている worker が連続してキャッシュしている公開可能範囲のうち、最新のものにする。
 quality ごとに独立して決め、quality 間で範囲を一致させる必要はない。
-接続性は保証せず、media sequence は前進・後退・飛び得る。
+接続性は保証せず、media sequence は前進するだけでなく、後退したり飛んだりすることがある。
 公開範囲は worker の sync を受けた時に更新し、プレイリストのリクエストでは変更しない。
 現在の公開範囲を保持している worker がいれば、より新しい候補が出るまで維持する。
-現在の公開範囲を保持している worker がいなければ、次の sync で、より古い範囲も含めて配信可能な最新の候補へ更新する。更新までのプレイリストリクエストは 503 になることがある。
+現在の公開範囲を保持している worker がいなければ、次の sync で、より古い範囲も含めて配信可能な最新の候補へ更新する。
+更新するまでの間、プレイリストのリクエストには 503 を返すことがある。
 
 worker が保持しているセグメントに欠落がある場合、controller は欠落を挟まない連続範囲だけを使う。
 たとえば 101、102、104、105 を保持している場合、公開範囲の候補は 101..102 と 104..105 であり、最新側の 104..105 を優先する。
@@ -138,4 +142,5 @@ controller は生成済みのプレイリストを保存しない。
 公開範囲が変わっていない間は、同じ公開範囲のプレイリストを返す。
 
 ステータスコードは 400、404、302、422、503 の順に判定する。
-公開範囲またはその quality の配信先 worker がない場合は 503 を返し、controller のセグメントファイルの URL には逃がさない。
+公開範囲またはその quality の配信先 worker がない場合は 503 を返す。
+代わりに controller のセグメントファイルの URL を返すことはない。

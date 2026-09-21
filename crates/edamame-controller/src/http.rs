@@ -28,15 +28,15 @@ use crate::state::{
 const SEGMENT_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// worker の登録に使う JSON ボディの上限
 const REGISTER_BODY_LIMIT: usize = 4 * 1024 * 1024;
-/// sync の JSON ボディの上限。worker はキャッシュしている全セグメントを送るため、余裕を持たせる。
+/// sync の JSON ボディの上限
+/// worker はキャッシュ一覧をすべて送るため、登録時より大きな上限を設ける
 const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// 外部配信の登録に使う JSON ボディの上限
 const EXTERNAL_BODY_LIMIT: usize = 64 * 1024;
 
-/// controller のルーター
 pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins, auth_token: Option<&str>) -> Router {
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
-    // PUT の第 3 要素はセグメント識別子、GET の第 3 要素はセグメント番号のファイル名として同じ形のパスを使う
+    // セグメントのパスの第 3 要素は、PUT ではセグメント識別子、GET ではセグメント番号のファイル名として扱う
     let read = Router::new()
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
@@ -97,7 +97,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("Bearer").then_some(token)
 }
 
-/// 一致した文字数からトークンを推測されないよう、すべてのバイトを比較する
+/// 長さが異なる場合は比較せず `false` を返す
+/// 長さが同じ場合は、一致した部分からトークンを推測されないよう、すべてのバイトを比較する
 fn tokens_match(provided: &str, expected: &str) -> bool {
     let (provided, expected) = (provided.as_bytes(), expected.as_bytes());
     if provided.len() != expected.len() {
@@ -120,7 +121,7 @@ fn cors_layer(cors: &CorsOrigins) -> Option<CorsLayer> {
         CorsOrigins::List(origins) => CorsLayer::new().allow_origin(
             origins
                 .iter()
-                // 起動時に URL として検証済みのため、ヘッダー値への変換は失敗しない
+                // 検証済みの CorsOrigins を受け取る前提で、ヘッダー値に変換する
                 .map(|origin| HeaderValue::try_from(origin.as_str()).expect("validated origin"))
                 .collect::<Vec<_>>(),
         ),
@@ -128,7 +129,7 @@ fn cors_layer(cors: &CorsOrigins) -> Option<CorsLayer> {
     Some(layer.allow_methods([Method::GET]))
 }
 
-/// リクエストの JSON を読み取る抽出子。形式が不正な入力は 400 にする。
+/// JSON の形式が不正な場合に 400 を返す抽出子
 struct ValidatedJson<T>(T);
 
 impl<S, T> FromRequest<S> for ValidatedJson<T>
@@ -176,7 +177,10 @@ struct SegmentQuery {
 /// プレイリスト取得の query
 #[derive(Debug, Deserialize)]
 struct PlaylistQuery {
-    /// `1` で外部配信へ振り分け、`0` で自前のマスタープレイリストを返す。省略時は接続元ごとの割合で判定する
+    /// `1` で外部配信へ振り分け、`0` で自前のマスタープレイリストを返す
+    /// それ以外の値は 400 を返す
+    /// 省略時は接続元と channel、その時点の割合で判定する
+    /// 省略時に接続情報がなければ、自前のマスタープレイリストを返す
     external: Option<u8>,
 }
 
@@ -224,7 +228,7 @@ async fn get_playlist(
     State(state): State<Arc<ControllerState>>,
     Path((channel_id, file)): Path<(String, String)>,
     Query(query): Query<PlaylistQuery>,
-    // 接続情報を付けずに router を使う場合でも、プレイリストは返せるようにする
+    // 接続情報なしでもプレイリストを取得できるよう、任意の引数として受け取る
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
 ) -> Result<Response, HttpError> {
     // ルーターは名前付きパラメータの後ろに固定の文字列を置けないため、
@@ -254,7 +258,7 @@ async fn get_master_playlist(
         }
         None => match client_ip {
             Some(client_ip) => ExternalRouting::ByClient(client_ip),
-            // 接続情報を付けずに router を使う場合は外部へ振り分けない
+            // 接続元が不明な場合は自前のマスタープレイリストを返す
             None => ExternalRouting::LocalOnly,
         },
     };
@@ -268,14 +272,14 @@ async fn get_master_playlist(
                 StatusCode::FOUND,
                 [
                     (header::LOCATION, location),
-                    // 接続元ごとの判定が中間キャッシュに固定されないようにする
+                    // 接続元ごとの転送先を共有キャッシュが使い回さないようにする
                     (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
                 ],
             )
                 .into_response());
         }
     };
-    // マスタープレイリストは接続元ごとに変わるため、共有キャッシュに固定されないようにする
+    // 応答は接続元ごとに変わるため、共有キャッシュが使い回さないようにする
     Ok((
         StatusCode::OK,
         [
@@ -290,7 +294,6 @@ async fn get_master_playlist(
         .into_response())
 }
 
-/// メディアプレイリストを返す
 async fn get_media_playlist(
     state: &ControllerState,
     channel_id: &str,

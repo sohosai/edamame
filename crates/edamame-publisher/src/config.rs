@@ -1,6 +1,6 @@
 //! publisher の CLI と TOML 設定
 //!
-//! 入力と rendition は TOML に書き、実行ごとに変わる controller の接続先は CLI で渡す。
+//! 入力と rendition は TOML に書き、controller の接続先は実行時に CLI で渡す。
 
 use std::collections::HashSet;
 use std::fs;
@@ -17,7 +17,7 @@ pub struct Cli {
     #[arg(long)]
     pub config: PathBuf,
 
-    /// controller の絶対 http URL
+    /// controller の接続先を表す http の絶対 URL
     #[arg(long)]
     pub controller_url: String,
 
@@ -25,15 +25,18 @@ pub struct Cli {
     #[arg(long)]
     pub auth_token: Option<String>,
 
-    /// セグメントを作る作業ディレクトリ。省略すると一時ディレクトリを使う
+    /// 作業ディレクトリ `edamame-publisher-<pid>` を作る親ディレクトリ。
+    /// 省略すると一時ディレクトリの配下に作る
     #[arg(long)]
     pub work_dir: Option<PathBuf>,
 
-    /// 暗号鍵を読み書きするファイル。省略すると実行ごとに生成する
+    /// 暗号鍵を読み書きするファイル。
+    /// 省略すると実行ごとに鍵を生成する
     #[arg(long)]
     pub key_file: Option<PathBuf>,
 
-    /// live2025-server のベース URL。指定すると鍵と配信 URL を登録する
+    /// 鍵と配信 URL を登録する live2025-server のベース URL。
+    /// 指定時は --stream-ingest-token と全 input の live_url が必要
     #[arg(long)]
     pub stream_credentials_url: Option<String>,
 
@@ -86,7 +89,7 @@ pub struct InputSettings {
     pub srt_url: String,
     /// controller の公開マスタープレイリストの URL。鍵と一緒に登録する
     pub live_url: Option<String>,
-    /// メディアプレイリストに出す鍵 URI
+    /// メディアプレイリストに出力する暗号鍵の URI
     pub key_uri: Option<String>,
     // TOML では [[input.rendition]] と書く
     #[serde(rename = "rendition")]
@@ -126,7 +129,7 @@ pub struct Resolution {
 }
 
 impl Resolution {
-    /// `WIDTHxHEIGHT` を読み取る
+    /// `WIDTHxHEIGHT` 形式の文字列を解像度として読み取る
     fn parse(text: &str) -> Result<Self, String> {
         let (width_text, height_text) = text
             .split_once('x')
@@ -137,7 +140,7 @@ impl Resolution {
         let height: u32 = height_text
             .parse()
             .map_err(|_| format!("resolution height must be a number: {text}"))?;
-        // yuv420p で割り切れない幅と高さは scale filter が扱えないため、起動時に弾く
+        // mode にかかわらず、幅と高さはそれぞれ 2 以上の偶数だけを受け付ける
         if width < 2 || height < 2 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return Err(format!(
                 "resolution must be even numbers of at least 2: {text}"
@@ -164,7 +167,7 @@ impl<'de> Deserialize<'de> for Resolution {
 }
 
 impl PublisherSettings {
-    /// 設定ファイルと CLI を読み込み、検証して返す
+    /// 設定ファイルと CLI から設定を読み込み、検証済みの設定を返す
     pub fn load(cli: &Cli) -> Result<Self, String> {
         let text = fs::read_to_string(&cli.config)
             .map_err(|error| format!("failed to read {}: {error}", cli.config.display()))?;
@@ -356,7 +359,8 @@ fn normalize_base_url(name: &str, text: &str) -> Result<String, String> {
     Ok(text.trim_end_matches('/').to_owned())
 }
 
-/// 絶対 URL を検証する。`https_only` が真なら https だけを受け付ける
+/// 絶対 URL を検証する。
+/// `https_only` が真なら https だけを受け付ける
 fn validate_url(name: &str, text: &str, https_only: bool) -> Result<(), String> {
     let url = reqwest::Url::parse(text).map_err(|_| format!("{name} must be an absolute URL"))?;
     let scheme_allowed = if https_only {

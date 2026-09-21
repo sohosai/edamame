@@ -1,16 +1,17 @@
 # edamame-publisher の設定例
-# 3 系統の入力を、1080p はそのままコピーし、720p と 480p は NVEnc で作り直す。
+# 3 系統の入力それぞれについて、1080p はそのままコピーし、720p と 480p は NVEnc で作り直す。
 #
-# 鍵と配信 URL の登録は CLI で指定する。
+# 鍵と配信 URL の登録先、登録用トークン、鍵の保存先は CLI で指定する。
 #   --stream-credentials-url https://live.example.test
 #   --stream-ingest-token <STREAM_INGEST_TOKEN>
 #   --key-file /var/lib/edamame-publisher/key.bin
 
-# 全 channel で共通のセグメント長。PUT の duration_ms にもこの値を使う
+# 全 channel で共通のセグメント長。
+# PUT の duration_ms にもこの値を使う
 segment_duration_ms = 6000
 
-# channel ごとの未送信セグメントの上限。segment_duration_ms を掛けた時間を過ぎた
-# セグメントは捨てて、ライブの遅れを取り戻す
+# 未送信のセットを保持する期限は、backlog_limit に segment_duration_ms を掛けた時間とする。
+# channel ごとに、送信待ちになってからこの時間を過ぎたセットを捨て、ライブ配信の遅れを減らす
 backlog_limit = 6
 
 [encoder]
@@ -21,9 +22,11 @@ preset = "p5"
 [[input]]
 channel_id = "uni"
 srt_url = "srt://0.0.0.0:9101?mode=listener&latency=200000"
-# controller の公開マスタープレイリスト。鍵と一緒に live2025-server へ登録する
+# controller の公開マスタープレイリストの URL。
+# 鍵と一緒に live2025-server へ登録する
 live_url = "https://live.example.test/channels/uni/master.m3u8"
-# メディアプレイリストに出す鍵 URI。再生側はここから鍵を取る
+# メディアプレイリストに出力する暗号鍵の URI。
+# client はこの URI から鍵を取得する
 key_uri = "https://live.example.test/key/uni"
 
 # bandwidth は controller へ宣言する値で、音声と MPEG-TS の多重化を含めた見積もりを書く

@@ -22,11 +22,11 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL")]
     pub public_url: String,
 
-    /// controller に接続するための URL
+    /// controller の接続先。http の絶対 URL のみ許可する
     #[arg(long, env = "EDAMAME_CONTROLLER_URL")]
     pub controller_url: String,
 
-    /// セグメントファイルのキャッシュ先
+    /// セグメントファイルをキャッシュするディレクトリ
     #[arg(long, env = "EDAMAME_CACHE_DIR")]
     pub cache_dir: PathBuf,
 
@@ -34,11 +34,12 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
     pub cache_limit: u64,
 
-    /// 相対的な配信能力
+    /// worker の重み（相対的な配信能力）
     #[arg(long, env = "EDAMAME_WEIGHT", default_value_t = 1)]
     pub weight: u32,
 
-    /// controller の認証に使うトークン。省略すると Authorization ヘッダーを送らない
+    /// controller への登録 PUT にだけ付ける認証トークン
+    /// 省略すると Authorization ヘッダーを送らない
     #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
 
@@ -80,7 +81,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// テストで使う設定。option の解析は実バイナリのテストで確認する
+    /// CLI の option の解析は、バイナリを起動するテストで確認する
     fn config() -> WorkerConfig {
         WorkerConfig {
             worker_id: "worker-a".to_owned(),
@@ -166,7 +167,6 @@ mod tests {
 
     #[test]
     fn names_environment_variables() {
-        // 全 option に `EDAMAME_` と option 名からなる環境変数名が設定されている
         let names = WorkerConfig::command()
             .get_arguments()
             .filter_map(|arg| {

@@ -1,7 +1,6 @@
 //! 実プロセスを使った結合テスト
 //!
-//! controller、worker、ffmpeg、publisher をすべて起動し、暗号化したセグメントが
-//! controller に保存されて再生できるところまでを確認する。
+//! controller、worker、ffmpeg、publisher をすべて起動し、暗号化したセグメントが controller に保存され、再生できることを確認する。
 
 mod common;
 
@@ -145,7 +144,7 @@ video_bitrate = 500000
         Duration::from_secs(30),
     );
     assert!(stored, "セグメントが保存されません: {}", publisher.log());
-    // 送信中のセットが終わるのを待つ
+    // 送信中のセットの送信が終わるのを待つ
     thread::sleep(Duration::from_millis(500));
 
     let main = controller.sequences("1A", "main");
@@ -156,7 +155,7 @@ video_bitrate = 500000
     );
 
     let key = publisher.key();
-    // 鍵 URI を指定しない場合は IV を伝える手段がないため、全ゼロ固定になる
+    // 暗号鍵の URI を指定しない場合は controller を介して IV を伝えられないため、全ゼロ固定になる
     let iv_zero = "0".repeat(32);
     for (quality, resolution) in [("main", "640,360"), ("small", "320,180")] {
         let sequence = main[0];
@@ -222,7 +221,7 @@ video_bitrate = 500000
     );
 }
 
-/// 鍵 URI とセグメントごとの乱数 IV はプレイリストまで通り、その IV で復号できる
+/// 暗号鍵の URI とセグメントごとの乱数 IV がプレイリストに反映され、その IV で復号できる
 #[test]
 fn publishes_key_uri_and_iv() {
     let dir = TestDir::new("key-uri");

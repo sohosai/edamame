@@ -126,7 +126,8 @@ async fn get_segment(
             Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
         }
         Err(error) => {
-            // 読めないセグメントファイルを索引に残すと、次の sync で取得対象に戻らないため索引から外す
+            // 読めないセグメントファイルを索引に残すと、controller が次の sync で取得対象に戻さない。
+            // 再取得できるよう、索引から外す。
             let mut cache = state.cache.lock().await;
             cache.remove(&channel_id, &quality, sequence);
             if error.kind() == std::io::ErrorKind::NotFound {

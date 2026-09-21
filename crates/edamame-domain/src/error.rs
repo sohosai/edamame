@@ -1,8 +1,8 @@
-//! HTTP のステータスコードに対応する共通エラー型
+//! HTTP のステータスコードに対応する共通エラー型を定義する
 
 use std::fmt;
 
-/// controller と worker が共有するエラー
+/// controller と worker が共有するエラーを表す
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdamameError {
     /// 入力が不正である (400)
@@ -11,16 +11,16 @@ pub enum EdamameError {
     NotFound(String),
     /// 既存のデータと競合する (409)
     Conflict(String),
-    /// playlist を生成できない (422)
+    /// プレイリストを生成できない (422)
     Unprocessable(String),
     /// 配信できる worker がない (503)
     Unavailable(String),
-    /// 予期しない内部エラー (500)
+    /// 予期しない内部エラーが発生した (500)
     Internal(String),
 }
 
 impl EdamameError {
-    /// このエラーに対応する HTTP ステータスコード
+    /// このエラーに対応する HTTP ステータスコードを返す
     #[must_use]
     pub fn status_code(&self) -> u16 {
         match self {
@@ -33,7 +33,7 @@ impl EdamameError {
         }
     }
 
-    /// エラーの説明
+    /// エラーの説明を返す
     #[must_use]
     pub fn message(&self) -> &str {
         match self {

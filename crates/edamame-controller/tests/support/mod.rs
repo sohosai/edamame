@@ -86,7 +86,7 @@ pub async fn spawn_controller(
     .await
 }
 
-/// 公開待ち時間を指定して controller を実際の HTTP サーバーとして起動する
+/// 公開待ちを指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_publish_wait(
     addr: SocketAddr,
     storage_dir: PathBuf,
@@ -111,7 +111,7 @@ pub async fn spawn_controller_with_publish_wait(
     .await
 }
 
-/// CORS の設定を指定して controller を実際の HTTP サーバーとして起動する
+/// CORS の設定を指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_cors(
     addr: SocketAddr,
     storage_dir: PathBuf,
@@ -136,7 +136,7 @@ pub async fn spawn_controller_with_cors(
     .await
 }
 
-/// 認証トークンを指定して controller を実際の HTTP サーバーとして起動する
+/// 認証トークンを指定して controller の HTTP サーバーを起動する
 pub async fn spawn_controller_with_auth(
     addr: SocketAddr,
     storage_dir: PathBuf,
@@ -161,7 +161,7 @@ pub async fn spawn_controller_with_auth(
     .await
 }
 
-/// 外部配信へ流す最低の割合と公開待ち時間を指定して controller を起動する
+/// 外部配信へ振り分ける最低の割合と公開待ちを指定して controller を起動する
 pub async fn spawn_controller_with_external_percent(
     addr: SocketAddr,
     storage_dir: PathBuf,
@@ -198,7 +198,7 @@ struct ControllerOptions<'a> {
     auth_token: Option<&'a str>,
 }
 
-/// controller の全設定を指定して実際の HTTP サーバーとして起動する
+/// controller の全設定を指定して HTTP サーバーを起動する
 async fn spawn_controller_with_options(
     addr: SocketAddr,
     storage_dir: PathBuf,
@@ -263,7 +263,7 @@ pub async fn spawn_worker(
     .await
 }
 
-/// CORS の設定を指定して worker を実際の HTTP サーバーとして起動する
+/// CORS の設定を指定して worker の HTTP サーバーを起動する
 pub async fn spawn_worker_with_cors(
     worker_id: &str,
     controller_url: &str,
@@ -286,7 +286,7 @@ pub async fn spawn_worker_with_cors(
     .await
 }
 
-/// 認証トークンを指定して worker を実際の HTTP サーバーとして起動する
+/// 認証トークンを指定して worker の HTTP サーバーを起動する
 pub async fn spawn_worker_with_auth(
     worker_id: &str,
     controller_url: &str,
@@ -309,7 +309,7 @@ pub async fn spawn_worker_with_auth(
     .await
 }
 
-/// 重みを指定して worker を実際の HTTP サーバーとして起動する
+/// 重みを指定して worker の HTTP サーバーを起動する
 pub async fn spawn_worker_with_weight(
     worker_id: &str,
     controller_url: &str,
@@ -391,7 +391,7 @@ async fn spawn_worker_with_options(
     }
 }
 
-/// playlist が 200 になるまで待つ
+/// プレイリストの取得が成功（2xx）するまで待つ
 pub async fn wait_for_playlist(client: &reqwest::Client, url: &str) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -406,7 +406,7 @@ pub async fn wait_for_playlist(client: &reqwest::Client, url: &str) -> String {
     }
 }
 
-/// playlist が 200 になり、指定した文字列を含むまで待つ
+/// プレイリストの取得が成功（2xx）し、本文に指定した文字列が含まれるまで待つ
 pub async fn wait_for_playlist_contains(
     client: &reqwest::Client,
     url: &str,

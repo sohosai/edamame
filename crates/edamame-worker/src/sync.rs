@@ -14,23 +14,23 @@ enum SyncOutcome {
     UnknownWorker,
 }
 
-/// 登録と sync を永続的に実行する
+/// 登録と sync を繰り返す
 pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) {
     let mut registered = false;
     let mut interval_ms = 1000_u64;
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
-    // 取得中のセグメント。取得が終わるまで controller に暗号化の指定を残してもらう
+    // 取得が終わるまで controller が暗号化の指定を保持できるよう、取得中のセグメントを報告する
     let mut fetching: Vec<SegmentKey> = Vec::new();
     loop {
         if !registered {
-            // 前の登録で始めた取得が残っていると、捨てたキャッシュを古い内容で埋め直すため止める
+            // 前の登録で始めた取得タスクがキャッシュ破棄後に古い内容を保存しないよう、先に止める
             stop_fetch(&mut fetch_task).await;
             fetching.clear();
             match register(&state, auth_token.as_deref()).await {
                 Ok(received_interval_ms) => {
                     registered = true;
                     interval_ms = received_interval_ms;
-                    // 前の登録で集めたキャッシュは controller の前の起動のものかもしれないため捨てる
+                    // 前の登録で集めた索引を捨て、controller が指示するセグメントを取り直せるようにする
                     discard_cache(&state).await;
                 }
                 Err(error) => {
@@ -40,7 +40,8 @@ pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) 
                 }
             }
         }
-        // 取得が終わったタスクを回収し、取得中の一覧を空にする。取得済みは次の sync のキャッシュ一覧で報告する
+        // 取得タスクの終了後は fetching を空にする。
+        // 取得済みのセグメントは、次の sync のキャッシュ一覧で報告する。
         if fetch_task
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
@@ -74,7 +75,7 @@ pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) 
 async fn stop_fetch(fetch_task: &mut Option<tokio::task::JoinHandle<()>>) {
     if let Some(handle) = fetch_task.take() {
         handle.abort();
-        // 中断が終わるまで待ち、あとからキャッシュを書き換えないようにする
+        // 取得タスクがあとからキャッシュを書き換えないよう、中断が終わるまで待つ
         let _ = handle.await;
     }
 }
@@ -206,8 +207,8 @@ async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKe
                                     );
                                 }
                             }
-                            // 保存したセグメントファイル自身が上限を超えた分として削除された場合、キャッシュが
-                            // キャッシュ対象より新しいセグメント番号で埋まっているため、捨てて取り直す
+                            // 保存したファイル自身が削除対象なら、索引はそのセグメントより新しい番号で埋まっている。
+                            // 同じ channel と quality の索引とファイルを捨て、キャッシュ対象を取り直せるようにする。
                             if paths.contains(&path) {
                                 let cleared = {
                                     let mut cache = state.cache.lock().await;

@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::config::{PublisherSettings, RenditionMode, RenditionSettings};
 
-/// HLS muxer が書くプレイリストの名前
+/// publisher が HLS muxer の出力先として指定するプレイリストのファイル名
 pub const PLAYLIST_NAME: &str = "index.m3u8";
 
 /// ffmpeg に渡す引数を組み立てる
@@ -136,14 +136,14 @@ impl Ffmpeg {
         })
     }
 
-    /// 終了していれば状態を返す
+    /// ffmpeg が終了していれば終了状態を返す
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, String> {
         self.child
             .try_wait()
             .map_err(|error| format!("failed to check ffmpeg: {error}"))
     }
 
-    /// ffmpeg を止め、ログ転送の thread を待つ
+    /// ffmpeg を止め、ログ転送スレッドの終了を待つ
     pub fn stop(&mut self) {
         stop_child(&mut self.child);
         if let Some(reader) = self.reader.take() {
@@ -179,7 +179,7 @@ fn stop_child(child: &mut Child) {
 
 /// ffmpeg の出力を行単位で転送する
 ///
-/// 進捗の行は改行ではなく復帰で区切られるため、復帰でも行を切る。
+/// 進捗の行は改行ではなく復帰で区切られるため、復帰も行の区切りとして扱う。
 fn forward_lines(mut reader: impl Read, prefix: &str) {
     let mut line = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -248,7 +248,7 @@ pub fn probe_streams(path: &Path) -> Result<Vec<StreamInfo>, String> {
     Ok(parsed.streams)
 }
 
-/// プレイリストから (ファイル名, 長さ秒) を順に取り出す
+/// プレイリストから (ファイル名, 秒単位の長さ) を順に取り出す
 #[must_use]
 pub fn parse_segment_durations(text: &str) -> Vec<(String, f64)> {
     let mut segments = Vec::new();

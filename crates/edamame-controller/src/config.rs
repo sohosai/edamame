@@ -12,7 +12,7 @@ pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "edamame-controller", about = "Edamame controller")]
 pub struct ControllerConfig {
-    /// HTTP server の待ち受けアドレス
+    /// HTTP サーバーの待ち受けアドレス
     #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
@@ -32,11 +32,12 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_SYNC_TIMEOUT_MS")]
     pub sync_timeout_ms: u64,
 
-    /// 新しいセグメントを公開する前に worker の取得を待つ時間
+    /// worker が新しいセグメントを取得するための公開待ち
     #[arg(long, env = "EDAMAME_PUBLISH_WAIT_MS")]
     pub publish_wait_ms: Option<u64>,
 
-    /// PUT の認証に使うトークン。省略すると PUT の認証を無効にし、起動時に警告を出す
+    /// PUT の認証に使うトークン
+    /// 省略すると認証は無効になり、controller の起動時に警告を出す
     #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
     pub auth_token: Option<String>,
 
@@ -50,7 +51,6 @@ pub struct ControllerConfig {
 }
 
 impl ControllerConfig {
-    /// 設定値を検証する
     pub fn validate(&self) -> Result<(), EdamameError> {
         if self.playlist_segments < 6 {
             return Err(EdamameError::BadRequest(
@@ -78,12 +78,11 @@ impl ControllerConfig {
         Ok(())
     }
 
-    /// CORS の設定を検証して返す
     pub fn cors_origins(&self) -> Result<CorsOrigins, EdamameError> {
         CorsOrigins::parse(&self.cors_origin)
     }
 
-    /// 公開までの待ち時間を返す。未指定なら既定値を使う。
+    /// 公開待ちが未指定なら既定値を使う
     #[must_use]
     pub fn publish_wait_ms(&self) -> u64 {
         self.publish_wait_ms.unwrap_or(DEFAULT_PUBLISH_WAIT_MS)
@@ -97,7 +96,8 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// テストで使う設定。option の解析は実バイナリのテストで確認する
+    /// 値の検証用の設定
+    /// CLI 引数と環境変数の解析は、controller を起動するテストで確認する
     fn config() -> ControllerConfig {
         ControllerConfig {
             bind: "127.0.0.1:9000".parse().unwrap(),
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn names_environment_variables() {
-        // 全 option に `EDAMAME_` と option 名からなる環境変数名が設定されている
+        // 環境変数を持つ option について、環境変数名が `EDAMAME_` と option 名に対応することを確かめる
         let names = ControllerConfig::command()
             .get_arguments()
             .filter_map(|arg| {

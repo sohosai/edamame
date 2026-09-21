@@ -1,22 +1,22 @@
-//! ブラウザからの読み取りを許可する origin の設定
+//! ブラウザからの読み取りを許可する origin を設定する
 
 use url::Url;
 
 use crate::error::EdamameError;
 
-/// ブラウザからの読み取りを許可する origin の集合
+/// ブラウザからの読み取りを許可する origin の集合を表す
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CorsOrigins {
     /// CORS を有効にしない
     Disabled,
     /// すべての origin を許可する
     Any,
-    /// 並べた origin だけ許可する
+    /// リストに含まれる origin だけを許可する
     List(Vec<String>),
 }
 
 impl CorsOrigins {
-    /// CLI で受け取った値を検証し、設定に変換する
+    /// CLI で受け取った値を検証し、許可する origin の設定に変換する
     pub fn parse(values: &[String]) -> Result<Self, EdamameError> {
         if values.is_empty() {
             return Ok(Self::Disabled);

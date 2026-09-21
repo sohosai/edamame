@@ -7,13 +7,14 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 use serde_json::json;
 
-/// 1 回の登録の制限時間
+/// 登録用 HTTP リクエスト 1 回あたりの制限時間
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// 再試行の待ち時間。倍にしながら上限まで延ばす
+/// 再試行までの待ち時間。
+/// 再試行のたびに倍にし、上限まで延ばす
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
-/// 登録に使う HTTP client を作る
+/// 登録に使う HTTP クライアントを作る
 pub fn client() -> Result<Client, String> {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -41,9 +42,9 @@ pub fn credentials_body(channel_id: &str, live_url: &str, encryption_key_hex: &s
 
 /// 登録の結果
 enum RegisterError {
-    /// 時間をおいて試し直す
+    /// 時間をおいて再試行する
     Retryable(String),
-    /// 設定を直さないと通らない
+    /// 設定を直さないと登録できない
     Fatal(String),
 }
 
@@ -67,7 +68,7 @@ fn register_once(client: &Client, url: &str, token: &str, body: &str) -> Result<
         "status {status} {}",
         response.text().unwrap_or_default().trim()
     );
-    // 認証と入力の誤りは、試し直しても通らない
+    // 400 と 401 は入力や認証の誤りなので、再試行しても登録できない
     if matches!(status.as_u16(), 400 | 401) {
         Err(RegisterError::Fatal(message))
     } else {
@@ -75,7 +76,8 @@ fn register_once(client: &Client, url: &str, token: &str, body: &str) -> Result<
     }
 }
 
-/// 成功するまで登録を試みる
+/// 登録が成功するまで再試行する。
+/// 停止要求を受けた場合や再試行できないエラーの場合は、登録を打ち切る
 pub fn register_until_success(
     client: &Client,
     url: &str,
@@ -103,7 +105,7 @@ pub fn register_until_success(
     }
 }
 
-/// 停止要求を見ながら待つ
+/// 停止要求を確認しながら待つ
 fn sleep_interruptible(duration: Duration, stop: &AtomicBool) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline {

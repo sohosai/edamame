@@ -1,4 +1,4 @@
-//! 認証トークンの検証
+//! 認証トークンを検証する
 
 use crate::error::EdamameError;
 
@@ -9,7 +9,7 @@ pub fn validate_auth_token(token: &str) -> Result<(), EdamameError> {
             "auth token must not be empty".to_owned(),
         ));
     }
-    // Authorization ヘッダーにそのまま載せられるよう、空白と制御文字を除く
+    // Authorization ヘッダーにそのまま載せられるよう、空白を除く印字可能な ASCII 文字だけを許可する
     if !token.chars().all(|character| character.is_ascii_graphic()) {
         return Err(EdamameError::BadRequest(
             "auth token must be printable ASCII without spaces".to_owned(),

@@ -32,7 +32,8 @@ fn run() -> Result<i32, String> {
     let cli = Cli::parse();
     let settings = PublisherSettings::load(&cli)?;
 
-    // 鍵は実行中は全 channel で同じものを使う。ファイルを指定すると再起動しても変わらない
+    // 実行中は全 channel で同じ鍵を使う。
+    // --key-file を指定すると再起動後も同じ鍵を使い、省略すると実行ごとに違う鍵を生成する
     let key = match &settings.key_file {
         Some(path) => {
             let key = publish::load_or_create_key(path)?;
@@ -98,7 +99,8 @@ fn run() -> Result<i32, String> {
 
 /// 作業ディレクトリを作る
 ///
-/// セグメントは暗号化する前の状態で一時的に置かれるため、他の利用者から読めないようにする。
+/// 暗号化前のセグメントファイルを置くため、他の利用者から読めないようにする。
+/// channel が失敗した場合は、終了後も作業ディレクトリを残す。
 fn make_work_dir(requested: Option<PathBuf>) -> Result<PathBuf, String> {
     let base = requested.unwrap_or_else(std::env::temp_dir);
     let session = base.join(format!("edamame-publisher-{}", process::id()));

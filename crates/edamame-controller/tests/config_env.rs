@@ -1,4 +1,4 @@
-//! 環境変数からの設定を実バイナリで確認する
+//! controller を起動し、環境変数から設定を読み込めることを確認する
 
 mod support;
 
@@ -53,7 +53,7 @@ async fn reads_configuration_from_environment() {
     child.kill().await.unwrap();
 }
 
-/// 空の環境変数は値として扱うため、起動に失敗する
+/// EDAMAME_CORS_ORIGIN に空文字列を指定すると、不正な値として起動に失敗する
 #[tokio::test]
 async fn rejects_empty_environment_variable() {
     let tmp = TempDir::new("config-env-empty");

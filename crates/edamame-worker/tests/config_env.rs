@@ -1,4 +1,4 @@
-//! 環境変数からの設定を実バイナリで確認する
+//! バイナリを起動し、環境変数からの設定を確認する
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -20,7 +20,6 @@ fn temp_dir(tag: &str) -> PathBuf {
     path
 }
 
-/// 環境変数だけで起動でき、CLI の値は環境変数より優先される
 #[tokio::test]
 async fn reads_configuration_from_environment() {
     let dir = temp_dir("env");
@@ -30,9 +29,8 @@ async fn reads_configuration_from_environment() {
         .env("EDAMAME_PUBLIC_URL", "http://127.0.0.1:0")
         .env("EDAMAME_CONTROLLER_URL", "http://127.0.0.1:1")
         .env("EDAMAME_CACHE_DIR", dir.join("cache"))
-        // 環境変数の値は不正だが、CLI の値が優先される
+        // CLI の値が優先されることを確かめるため、EDAMAME_CACHE_LIMIT に不正な値を設定する
         .env("EDAMAME_CACHE_LIMIT", "0")
-        // CORS は未指定にする
         .env_remove("EDAMAME_CORS_ORIGIN")
         .args(["--cache-limit", "12"])
         .stdout(Stdio::piped())
@@ -64,7 +62,7 @@ async fn reads_configuration_from_environment() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// 空の環境変数は値として扱うため、起動に失敗する
+/// 空文字列は未指定とは異なり、CORS の設定値として検証される
 #[tokio::test]
 async fn rejects_empty_environment_variable() {
     let dir = temp_dir("env-empty");

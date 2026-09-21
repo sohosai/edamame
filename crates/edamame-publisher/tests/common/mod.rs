@@ -1,6 +1,6 @@
 //! 結合テストで使う実サーバーと実プロセスの起動と後始末
 //!
-//! モックは使わず、controller と worker は同じリポジトリの crate としてその場で起動し、
+//! モックは使わず、同じリポジトリの controller と worker の crate をテストプロセス内で起動する。
 //! ffmpeg と publisher は別プロセスとして起動する。
 
 use std::fs;
@@ -55,7 +55,7 @@ fn cors() -> CorsOrigins {
     CorsOrigins::parse(&["*".to_owned()]).expect("CORS の設定を作れません")
 }
 
-/// HTTP server を別スレッドで起動し、待ち受けている URL を返す
+/// HTTP サーバーを別スレッドで起動し、待ち受け先の URL を返す
 fn serve(app: axum::Router) -> String {
     let (sender, receiver) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -102,13 +102,13 @@ pub struct Controller {
 }
 
 impl Controller {
-    /// テストのプロセスの中で controller を起動する
+    /// テストプロセス内で controller を起動する
     pub fn start(dir: &Path, auth_token: &str) -> Self {
         let storage_dir = dir.join("controller");
         fs::create_dir_all(&storage_dir).expect("保存先を作成できません");
         let store = CanonicalStore::new(storage_dir.clone());
-        // 公開待ちは 0、同期の間隔は 1 秒にしてテストを短くする
-        // 外部配信へ流す割合は controller のテストと同じ 1 % にし、外部配信は設定しない
+        // 公開待ちは 0、sync の間隔は 1 秒にしてテスト時間を短くする
+        // 外部配信へ振り分ける割合は controller のテストと同じ 1 % にし、外部配信は設定しない
         let state = ControllerState::new(store, 6, 1000, 10000, 0, 1);
         let base_url = serve(controller_router(state, &cors(), Some(auth_token)));
         Self {
@@ -150,7 +150,7 @@ impl Controller {
 pub struct Worker;
 
 impl Worker {
-    /// テストのプロセスの中で worker と sync を起動する
+    /// テストプロセス内で worker と sync を起動する
     pub fn start(dir: &Path, controller_url: &str, auth_token: &str) -> Self {
         let port = free_port();
         let cache_dir = dir.join("worker");
@@ -341,7 +341,7 @@ impl Publisher {
         }
     }
 
-    /// 実行中かどうか
+    /// publisher が実行中かどうかを返す
     pub fn is_running(&mut self) -> bool {
         self.child
             .try_wait()

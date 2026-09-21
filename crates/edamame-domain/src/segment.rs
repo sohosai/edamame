@@ -1,13 +1,14 @@
-//! セグメントの識別子、ファイル名、解像度の検証
+//! セグメントの識別子、ファイル名、解像度を検証する
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::EdamameError;
 
-/// 識別子の最大長
+/// 識別子の最大長をバイト単位で表す
 pub const MAX_IDENTIFIER_LEN: usize = 64;
 
-/// 検証済みのセグメント識別子
+/// channel、quality、セグメント番号の組でセグメントを識別する。
+/// `new` で作成するときに channel と quality の識別子を検証する。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SegmentId {
     pub channel_id: String,
@@ -16,7 +17,7 @@ pub struct SegmentId {
 }
 
 impl SegmentId {
-    /// 識別子を検証してセグメント識別子を作る
+    /// channel と quality の識別子を検証して、セグメントを識別する組を作る
     pub fn new(
         channel_id: impl Into<String>,
         quality: impl Into<String>,
@@ -34,7 +35,7 @@ impl SegmentId {
     }
 }
 
-/// sync の JSON で使うセグメント識別子
+/// sync の JSON でセグメントを識別するために使う
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentKey {
     pub channel_id: String,
@@ -53,7 +54,7 @@ impl From<&SegmentId> for SegmentKey {
 }
 
 impl SegmentKey {
-    /// 検証済みのセグメント識別子に変換する
+    /// channel と quality の識別子を検証して、`SegmentId` に変換する
     pub fn into_id(self) -> Result<SegmentId, EdamameError> {
         SegmentId::new(self.channel_id, self.quality, self.sequence)
     }
@@ -82,7 +83,8 @@ pub fn validate_identifier(kind: &str, value: &str) -> Result<(), EdamameError> 
     Ok(())
 }
 
-/// quality の識別子を検証する。`master` は予約語として拒否する。
+/// quality の識別子を検証する。
+/// `master` は予約語として拒否する。
 pub fn validate_quality(value: &str) -> Result<(), EdamameError> {
     validate_identifier("quality", value)?;
     if value == "master" {
@@ -136,7 +138,7 @@ pub fn validate_resolution(value: &str) -> Result<(), EdamameError> {
     Ok(())
 }
 
-/// IV を 16 byte の hex（小文字）にそろえる
+/// IV を表す 16 byte 分の hex を小文字にそろえる
 pub fn normalize_iv(value: &str) -> Result<String, EdamameError> {
     if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(EdamameError::BadRequest(

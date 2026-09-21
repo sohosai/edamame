@@ -1,38 +1,38 @@
-//! HTTP API で使う JSON の型
+//! HTTP API で使う JSON の型を定義する
 
 use serde::{Deserialize, Serialize};
 
 use crate::segment::SegmentKey;
 
-/// セグメントファイルの登録レスポンス
+/// セグメントファイルの登録レスポンスを表す
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentPutResponse {
     pub sequence: u64,
 }
 
-/// worker の登録リクエスト
+/// worker の登録リクエストを表す
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub public_url: String,
-    /// worker の相対的な配信能力
+    /// worker の重みを指定する
     pub weight: u32,
 }
 
-/// worker の登録レスポンス
+/// worker の登録レスポンスを表す
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub sync_interval_ms: u64,
 }
 
-/// worker の sync リクエスト
+/// worker の sync リクエストを表す
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub cached_segments: Vec<SegmentKey>,
-    /// 取得中のセグメントであり、暗号化の指定を保持する範囲に含める
+    /// worker が取得中のセグメントを表す
     pub fetching_segments: Vec<SegmentKey>,
 }
 
-/// worker の sync レスポンス
+/// worker の sync レスポンスを表す
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncResponse {
     pub fetch_segments: Vec<SegmentKey>,

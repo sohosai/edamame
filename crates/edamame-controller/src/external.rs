@@ -2,15 +2,16 @@
 
 use std::net::IpAddr;
 
-/// 公開範囲の遅れから外部へ振り分ける割合（%）を求める
+/// 公開範囲の遅れから外部配信へ振り分ける割合（%）を求める
 ///
 /// - `published_delay`：公開範囲が最新セグメントより遅れているセグメント数
-/// - `normal_delay`：公開待ちで生じる通常の遅れ
-/// - `full_delay`：全量を外部へ流す遅れ
-/// - `min_percent`：外部へ流す最低の割合（%）
+/// - `normal_delay`：公開待ちに相当するセグメント数
+/// - `full_delay`：すべて外部配信へ振り分ける遅れ（セグメント数）
+/// - `min_percent`：外部配信へ振り分ける最低の割合（%）
 ///
-/// 遅れが `normal_delay` 以下なら `min_percent` を返し、`full_delay` 以上なら 100 を返す。
-/// その間は遅れに比例して上げる。
+/// 遅れが `full_delay` 以上なら、先に 100 を返す。
+/// それ未満で `normal_delay` 以下なら `min_percent` を返す。
+/// その間は `min_percent` から 100 まで線形に上げる。
 pub fn external_routing_percent(
     published_delay: u64,
     normal_delay: u64,
@@ -32,14 +33,14 @@ pub fn external_routing_percent(
     u8::try_from(percent.min(100)).unwrap_or(100)
 }
 
-/// 接続元ごとに固定した抽選で、外部配信へ流すかどうかを返す
+/// 接続元 IP と channel から決まる値を、その時点の割合と比べて外部配信へ振り分けるか判定する
 ///
 /// 同じ channel と接続元 IP の組み合わせは、割合が変わらない限り同じ結果になる。
 pub fn routes_to_external(channel_id: &str, client_ip: IpAddr, external_percent: u8) -> bool {
     if external_percent == 0 {
         return false;
     }
-    // 実行をまたいでも同じ接続元が同じ結果になるよう、channel と接続元から値を決める
+    // 実行をまたいでも同じ値で比較できるよう、channel と接続元 IP からハッシュ値を決める
     let client = client_ip.to_string();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in channel_id
@@ -134,7 +135,7 @@ mod tests {
         if selected {
             assert!(routes_to_external("live", address, 60));
         }
-        // channel が違えば選ばれる接続元も変わる
+        // 別の channel でも呼び出すが、結果の違いは検証しない
         let _ = routes_to_external("other", address, 30);
     }
 }
