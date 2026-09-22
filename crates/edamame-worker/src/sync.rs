@@ -16,12 +16,25 @@ enum SyncOutcome {
 
 /// 登録と sync を繰り返す
 pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) {
+    let (_shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+    run_sync_loop_until(state, auth_token, shutdown_receiver).await;
+}
+
+/// 登録と sync を繰り返す。`shutdown` が true になったら、取得中のタスクも止めて終了する
+pub async fn run_sync_loop_until(
+    state: Arc<WorkerState>,
+    auth_token: Option<String>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     let mut registered = false;
     let mut interval_ms = 1000_u64;
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
     // 取得中のセグメントを controller に報告し、同じ番号に保存し直したときに再取得を指示できるようにする
     let mut fetching: Vec<SegmentKey> = Vec::new();
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
         if !registered {
             // 前の登録で始めた取得タスクがキャッシュ破棄後に古い内容を保存しないよう、先に止める
             stop_fetch(&mut fetch_task).await;
@@ -66,8 +79,17 @@ pub async fn run_sync_loop(state: Arc<WorkerState>, auth_token: Option<String>) 
             }
             Err(error) => eprintln!("sync failed: {error}"),
         }
-        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
     }
+    // 取得中のタスクが残ったまま再開すると、古いキャッシュを書き戻すため、停止を待つ
+    stop_fetch(&mut fetch_task).await;
 }
 
 /// 進行中のセグメント取得を止める

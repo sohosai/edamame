@@ -3,7 +3,7 @@
 use clap::Parser;
 use edamame_domain::{normalize_http_url, normalize_public_url};
 use edamame_worker::cache::Cache;
-use edamame_worker::config::WorkerConfig;
+use edamame_worker::config::{TlsMode, WorkerConfig};
 use edamame_worker::http::{WorkerState, router};
 use edamame_worker::sync::run_sync_loop;
 
@@ -11,10 +11,16 @@ use edamame_worker::sync::run_sync_loop;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = WorkerConfig::parse();
     config.validate()?;
+    let tls = config.tls_mode()?;
     let cors = config.cors_origins()?;
     if config.cors_origin.is_empty() {
         eprintln!(
             "warning: --cors-origin is not specified; cross-origin browser access is disabled"
+        );
+    }
+    if let TlsMode::Acme { contact: None, .. } = &tls {
+        eprintln!(
+            "warning: --acme-contact is not specified; certificate problem notices cannot be sent"
         );
     }
     // client へは TLS 終端の reverse proxy 越しに配信することがあるため、https も許可する
@@ -29,16 +35,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.weight,
         cache,
     )?;
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let app = router(state.clone(), &cors);
-    let sync_state = state.clone();
-    tokio::spawn(async move {
-        run_sync_loop(sync_state, config.auth_token).await;
-    });
-    println!(
-        "edamame-worker {} listening on {}",
-        config.worker_id, config.bind
-    );
-    axum::serve(listener, app).await?;
+    let bind = config.bind;
+    let auth_token = config.auth_token.clone();
+    let run_sync = move |state: std::sync::Arc<WorkerState>| {
+        let auth_token = auth_token.clone();
+        tokio::spawn(run_sync_loop(state, auth_token))
+    };
+    println!("edamame-worker {} listening on {}", config.worker_id, bind);
+    match tls {
+        TlsMode::Plain => {
+            // 待ち受けに成功してから controller に登録する
+            let listener = tokio::net::TcpListener::bind(bind).await?;
+            run_sync(state.clone());
+            axum::serve(listener, app).await?;
+        }
+        TlsMode::Static { cert, key } => {
+            // 証明書を読み込んでから controller に登録する
+            let config = edamame_worker::tls::static_config(cert, key).await?;
+            let listener = bind_std_listener(bind)?;
+            run_sync(state.clone());
+            edamame_worker::tls::serve_static(listener, app, config).await?;
+        }
+        TlsMode::Acme {
+            domain,
+            directory,
+            cache_dir,
+            contact,
+        } => {
+            let listener = bind_std_listener(bind)?;
+            let (valid_sender, mut valid_receiver) = tokio::sync::watch::channel(false);
+            let server = tokio::spawn(async move {
+                edamame_worker::tls::serve_acme(
+                    listener,
+                    app,
+                    &domain,
+                    &directory,
+                    cache_dir,
+                    contact.as_deref(),
+                    valid_sender,
+                )
+                .await
+            });
+            // 証明書が有効な間だけ controller に登録する
+            let monitor_state = state.clone();
+            let monitor_token = config.auth_token.clone();
+            tokio::spawn(async move {
+                let mut sync_task: Option<tokio::task::JoinHandle<()>> = None;
+                let mut shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+                while valid_receiver.changed().await.is_ok() {
+                    let valid = *valid_receiver.borrow();
+                    if valid && sync_task.is_none() {
+                        let (sender, receiver) = tokio::sync::watch::channel(false);
+                        shutdown = Some(sender);
+                        let state = monitor_state.clone();
+                        let token = monitor_token.clone();
+                        sync_task = Some(tokio::spawn(async move {
+                            edamame_worker::sync::run_sync_loop_until(state, token, receiver).await;
+                        }));
+                    } else if !valid && let Some(sender) = shutdown.take() {
+                        let _ = sender.send(true);
+                        // 取得中のタスクの停止を待ってから再開できるようにする
+                        if let Some(task) = sync_task.take() {
+                            let _ = task.await;
+                        }
+                    }
+                }
+            });
+            server.await??;
+        }
+    }
     Ok(())
+}
+
+/// 待ち受けを先に確保し、失敗を早く返す
+fn bind_std_listener(bind: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(bind)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }

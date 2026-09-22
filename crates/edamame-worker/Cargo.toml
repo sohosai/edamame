@@ -5,15 +5,25 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
+axum-server.workspace = true
 bytes.workspace = true
 clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
 reqwest.workspace = true
+rustls.workspace = true
+rustls-acme.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
 tower-http.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
+# TLS のテストで自己署名証明書を作り、HTTPS で取得するために使う
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 # 設定のテストで実バイナリを起動して出力を読むために使う
-tokio = { workspace = true, features = ["io-util", "process"] }
+tokio = { workspace = true, features = ["io-util", "process", "test-util"] }

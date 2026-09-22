@@ -43,6 +43,12 @@ client には、controller に到達できる URL を設定する。
 | `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http` または `https` で始まる絶対 URL（TLS 終端の reverse proxy を置く場合は `https`） |
 | `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | worker から controller に接続するための、`http` の絶対 URL |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
+| `--tls-cert` | `EDAMAME_TLS_CERT` | 任意 | TLS 配信に使う証明書の PEM ファイル。`--tls-key` と一緒に指定する |
+| `--tls-key` | `EDAMAME_TLS_KEY` | 任意 | TLS 配信に使う秘密鍵の PEM ファイル。`--tls-cert` と一緒に指定する |
+| `--acme` | `EDAMAME_ACME` | 任意 | ACME で証明書を取得して TLS 配信する |
+| `--acme-directory` | `EDAMAME_ACME_DIRECTORY` | 任意 | ACME ディレクトリの `https` URL（省略時は Let's Encrypt の本番環境） |
+| `--acme-cache-dir` | `EDAMAME_ACME_CACHE_DIR` | `--acme` と一緒に必須 | ACME のアカウント鍵と証明書の保存先 |
+| `--acme-contact` | `EDAMAME_ACME_CONTACT` | 任意 | ACME の連絡先メール（省略すると起動時に警告を出す） |
 | `--weight` | `EDAMAME_WEIGHT` | 任意 | worker の重み（1 以上の整数、省略時は 1） |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | controller の `--auth-token` と同じトークン（省略すると登録の PUT に `Authorization` ヘッダーを付けない） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
@@ -52,6 +58,21 @@ client には、controller に到達できる URL を設定する。
 `0.0.0.0` など client から到達できないアドレスで待ち受ける場合でも、`--public-url` には client から到達できる URL を指定する。
 `--controller-url` には、worker から到達できる `http` の絶対 URL だけを指定できる。
 query と fragment は含めず、末尾の `/` は取り除いて使う。
+
+## TLS 配信
+
+worker は既定で HTTP で待ち受ける。TLS 終端の reverse proxy を置く場合はそのまま使う。
+worker 自身で TLS を終端する場合は、次のどちらかを指定する。
+
+- `--tls-cert` と `--tls-key`: PEM ファイルの証明書を使う
+- `--acme`: ACME で証明書を取得する。`--acme-cache-dir` にアカウント鍵と証明書を保存する永続ボリュームを指定する
+
+TLS を有効にするときは、`--public-url` に `https` を指定する。
+`--acme` の証明書は `--public-url` のホストに対して取得する。client はそのホストへ接続するため、証明書のドメインと公開 URL のホストは常に一致する。
+`--acme-directory` でステージングなど別の ACME ディレクトリを指定できる。ZeroSSL は EAB が必要で対応していない。
+ACME では 443 を worker に割り当てる。80 は使わない。
+証明書の更新は worker の中で行うため、再起動は要らない。
+`--tls-cert` と `--tls-key` の場合も、ファイルの更新時刻を 1 分ごとに確認して読み直す。
 
 ## 起動と確認
 
@@ -234,6 +255,7 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得する。公開範囲を保持していなければ配信先に使われない |
 | 公開範囲のセグメントファイルが容量超過で削除された | controller はその quality のプレイリストを生成せず 422 を返し、worker がキャッシュしているセグメントファイルの配信は続く |
 | 保存容量より大きいセグメントを PUT した | controller は 413 を返し、セグメントファイルを保存せず、channel の属性もセグメント番号も確定しない |
+| ACME の証明書取得に失敗した | worker はログを出して再試行する。取得済みの証明書があればそれを期限まで使い続ける |
 | 容量超過で削除された quality に同じ識別子を再 PUT した | 別の quality に識別子が残っていれば同じセグメント番号に保存し直す。古いバイト列をキャッシュしているか、取得中の worker には次の sync で再取得を指示する |
 | worker のトークンが controller と一致しない | controller は登録の PUT に 401 を返し、worker はログを出して 1 秒後に再試行する |
 | controller がメタデータを失った | セグメント番号は 0 から始まり、publisher がセグメントファイルを PUT するまでプレイリストは 404 になる。worker は登録時にキャッシュを捨てて取り直す |
