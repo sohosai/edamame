@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
@@ -119,9 +120,35 @@ async fn get_segment(
         cache.get(&channel_id, &quality, sequence)
     };
     match bytes {
-        Some(bytes) => {
-            Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
-        }
+        Some(bytes) => Ok(segment_response(bytes)),
         None => Err(EdamameError::NotFound("segment is not cached".to_owned()).into()),
     }
+}
+
+/// セグメントファイルを小さな塊に分けて返す
+/// 一度に大きなバイト列を書くと、遅い client への接続ごとに TLS のバッファが膨らむ
+fn segment_response(bytes: bytes::Bytes) -> Response {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let length = bytes.len();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < length {
+        let end = (start + CHUNK_SIZE).min(length);
+        chunks.push(Ok::<bytes::Bytes, std::convert::Infallible>(
+            bytes.slice(start..end),
+        ));
+        start = end;
+    }
+    let headers = [
+        (
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        ),
+        (
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&length.to_string())
+                .expect("segment length is a valid header value"),
+        ),
+    ];
+    (headers, Body::from_stream(tokio_stream::iter(chunks))).into_response()
 }
