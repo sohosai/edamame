@@ -86,7 +86,8 @@ pub struct EncoderSettings {
 #[serde(deny_unknown_fields)]
 pub struct InputSettings {
     pub channel_id: String,
-    pub srt_url: String,
+    /// ffmpeg に渡す入力 URL。srt:// は URL の mode で待ち受け、rtmp:// は publisher が待ち受ける
+    pub input_url: String,
     /// controller の公開マスタープレイリストの URL。鍵と一緒に登録する
     pub live_url: Option<String>,
     /// メディアプレイリストに出力する暗号鍵の URI
@@ -229,9 +230,9 @@ impl PublisherSettings {
             if !channel_ids.insert(input.channel_id.as_str()) {
                 return Err(format!("channel_id is duplicated: {}", input.channel_id));
             }
-            if !input.srt_url.starts_with("srt://") {
+            if !input.input_url.starts_with("srt://") && !input.input_url.starts_with("rtmp://") {
                 return Err(format!(
-                    "srt_url must start with srt://: channel {}",
+                    "input_url must start with srt:// or rtmp://: channel {}",
                     input.channel_id
                 ));
             }
@@ -317,8 +318,8 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
 fn normalize_controller_url(text: &str) -> Result<String, String> {
     let url =
         reqwest::Url::parse(text).map_err(|error| format!("invalid controller URL: {error}"))?;
-    if url.scheme() != "http" {
-        return Err("controller URL must start with http://".to_owned());
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("controller URL must start with http:// or https://".to_owned());
     }
     if url.host().is_none() {
         return Err("controller URL must contain a host".to_owned());
@@ -403,7 +404,7 @@ mod tests {
             stream_ingest_token: None,
             inputs: vec![InputSettings {
                 channel_id: "1A".to_owned(),
-                srt_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
+                input_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
                 live_url: None,
                 key_uri: None,
                 renditions: vec![RenditionSettings {
@@ -436,7 +437,7 @@ mod tests {
     fn rejects_duplicated_channel_id() {
         let mut target = settings();
         let mut second = target.inputs[0].clone();
-        second.srt_url = "srt://0.0.0.0:9102?mode=listener".to_owned();
+        second.input_url = "srt://0.0.0.0:9102?mode=listener".to_owned();
         target.inputs.push(second);
         assert!(target.validate().is_err());
     }
@@ -464,10 +465,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_srt_url() {
+    fn rejects_input_url_with_other_scheme() {
         let mut target = settings();
-        target.inputs[0].srt_url = "http://127.0.0.1:9101".to_owned();
+        target.inputs[0].input_url = "http://127.0.0.1:9101".to_owned();
         assert!(target.validate().is_err());
+        target.inputs[0].input_url = "rtmps://0.0.0.0:1935/live/1A".to_owned();
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_rtmp_input_url() {
+        let mut target = settings();
+        target.inputs[0].input_url = "rtmp://0.0.0.0:1935/live/1A".to_owned();
+        target.validate().unwrap();
     }
 
     #[test]
@@ -485,6 +495,13 @@ mod tests {
     fn normalizes_controller_url() {
         let url = normalize_controller_url("http://127.0.0.1:9000/").unwrap();
         assert_eq!(url, "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn accepts_https_controller_url() {
+        let url = normalize_controller_url("https://edamame-controller.sohosai.com/").unwrap();
+        assert_eq!(url, "https://edamame-controller.sohosai.com");
+        assert!(normalize_controller_url("ftp://edamame-controller.sohosai.com").is_err());
     }
 
     #[test]

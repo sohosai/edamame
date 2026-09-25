@@ -6,7 +6,8 @@
 
 - Rust 1.85 以降（edition 2024）
 - controller と worker が同じ network から到達できること
-- publisher を動かす場合は、NVEnc と SRT を含む ffmpeg と NVIDIA の GPU とドライバ
+- publisher を動かす場合は、NVEnc と QSV と SRT と RTMP を含む ffmpeg。
+  NVEnc を使う場合は NVIDIA の GPU とドライバ、QSV を使う場合は Intel の GPU と VA-API のドライバと oneVPL の GPU ランタイム
 
 ## ビルド
 
@@ -53,7 +54,7 @@ publisher もセグメントファイルの PUT に `Authorization: Bearer {toke
 
 ## publisher
 
-publisher は `crates/edamame-publisher` にあり、SRT で受け取った映像を NVEnc でエンコードしてセグメントを作り、
+publisher は `crates/edamame-publisher` にあり、SRT または RTMP で受け取った映像を NVEnc や QSV でエンコードしてセグメントを作り、
 controller へ PUT する。GPU と ffmpeg が要るため、controller と worker とは別の機械で動かす。
 
 ```bash
@@ -101,7 +102,8 @@ services:
       - "9001:9001"
 ```
 
-publisher のイメージは ffmpeg を含むため別のターゲットで作る。GPU は NVIDIA Container Toolkit で渡す。
+publisher のイメージは ffmpeg と Intel のドライバを含むため別のターゲットで作る。
+NVIDIA の GPU は NVIDIA Container Toolkit で渡し、Intel の GPU は `--device /dev/dri:/dev/dri` で渡す。
 
 ```bash
 docker build --target publisher -t edamame-publisher .

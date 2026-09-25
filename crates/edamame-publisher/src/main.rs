@@ -1,4 +1,4 @@
-//! SRT を受け取り、映像をエンコードしてセグメントを作り、暗号化して controller へ送る
+//! SRT または RTMP を受け取り、映像をエンコードしてセグメントを作り、暗号化して controller へ送る
 
 mod config;
 mod credentials;
@@ -70,9 +70,9 @@ fn run() -> Result<i32, String> {
             work_dir: work_dir.join(format!("channel-{input_index}")),
         };
         println!(
-            "channel={} srt_url={} renditions={}",
+            "channel={} input_url={} renditions={}",
             context.channel_id(),
-            context.srt_url(),
+            context.input_url(),
             context.renditions().len()
         );
         handles.push(publish::spawn_channel(

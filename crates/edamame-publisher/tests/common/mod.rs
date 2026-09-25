@@ -170,7 +170,7 @@ impl Worker {
     }
 }
 
-/// SRT を送る ffmpeg
+/// publisher へ映像を送る ffmpeg
 pub struct Sender {
     child: Child,
 }
@@ -186,45 +186,30 @@ impl Sender {
         seconds: u32,
     ) -> Self {
         let url = format!("srt://127.0.0.1:{port}?mode=caller&latency=200000");
+        let args = sender_args(&url, "mpegts", resolution, fps, gop, audio_codec, seconds);
+        Self::spawn(&args, "SRT")
+    }
+
+    /// testsrc2 と sine を H.264 と AAC の FLV にして RTMP で送る
+    pub fn start_rtmp(
+        port: u16,
+        channel_id: &str,
+        resolution: &str,
+        fps: u32,
+        gop: u32,
+        audio_codec: &str,
+        seconds: u32,
+    ) -> Self {
+        let url = format!("rtmp://127.0.0.1:{port}/live/{channel_id}");
+        let args = sender_args(&url, "flv", resolution, fps, gop, audio_codec, seconds);
+        Self::spawn(&args, "RTMP")
+    }
+
+    /// ffmpeg を起動し、接続できるまで試し直す
+    fn spawn(args: &[String], protocol: &str) -> Self {
         for _ in 0..5 {
             let child = Command::new("ffmpeg")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "warning",
-                    "-re",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &format!("testsrc2=size={resolution}:rate={fps}"),
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:sample_rate=48000",
-                    "-t",
-                    &seconds.to_string(),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-tune",
-                    "zerolatency",
-                    "-g",
-                    &gop.to_string(),
-                    "-sc_threshold",
-                    "0",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-b:v",
-                    "800k",
-                    "-c:a",
-                    audio_codec,
-                    "-b:a",
-                    "64k",
-                    "-f",
-                    "mpegts",
-                    &url,
-                ])
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -236,8 +221,57 @@ impl Sender {
             }
             thread::sleep(Duration::from_millis(500));
         }
-        panic!("SRT を送信できません。publisher が待ち受けているか確認してください");
+        panic!("{protocol} を送信できません。publisher が待ち受けているか確認してください");
     }
+}
+
+/// 映像を送る ffmpeg の引数を組み立てる
+fn sender_args(
+    url: &str,
+    output_format: &str,
+    resolution: &str,
+    fps: u32,
+    gop: u32,
+    audio_codec: &str,
+    seconds: u32,
+) -> Vec<String> {
+    vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "warning".to_owned(),
+        "-re".to_owned(),
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        format!("testsrc2=size={resolution}:rate={fps}"),
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        "sine=frequency=440:sample_rate=48000".to_owned(),
+        "-t".to_owned(),
+        seconds.to_string(),
+        "-c:v".to_owned(),
+        "libx264".to_owned(),
+        "-preset".to_owned(),
+        "ultrafast".to_owned(),
+        "-tune".to_owned(),
+        "zerolatency".to_owned(),
+        "-g".to_owned(),
+        gop.to_string(),
+        "-sc_threshold".to_owned(),
+        "0".to_owned(),
+        "-pix_fmt".to_owned(),
+        "yuv420p".to_owned(),
+        "-b:v".to_owned(),
+        "800k".to_owned(),
+        "-c:a".to_owned(),
+        audio_codec.to_owned(),
+        "-b:a".to_owned(),
+        "64k".to_owned(),
+        "-f".to_owned(),
+        output_format.to_owned(),
+        url.to_owned(),
+    ]
 }
 
 impl Drop for Sender {

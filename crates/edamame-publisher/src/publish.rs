@@ -49,8 +49,8 @@ impl ChannelContext {
     }
 
     #[must_use]
-    pub fn srt_url(&self) -> &str {
-        &self.input().srt_url
+    pub fn input_url(&self) -> &str {
+        &self.input().input_url
     }
 
     #[must_use]
@@ -476,7 +476,7 @@ fn run_encoder(
         let offset_ms = published.load(Ordering::Relaxed) * context.settings.segment_duration_ms;
         let args = ffmpeg::build_command(
             &context.settings,
-            context.srt_url(),
+            context.input_url(),
             context.renditions(),
             &run_dir,
             offset_ms,
@@ -1019,7 +1019,7 @@ mod tests {
             stream_ingest_token: None,
             inputs: vec![InputSettings {
                 channel_id: "1A".to_owned(),
-                srt_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
+                input_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
                 live_url: None,
                 key_uri: None,
                 renditions: vec![rendition("1080p")],
@@ -1137,7 +1137,7 @@ mod tests {
             settings: Arc::new(PublisherSettings {
                 inputs: vec![InputSettings {
                     channel_id: "1A".to_owned(),
-                    srt_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
+                    input_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
                     live_url: None,
                     key_uri: None,
                     renditions: vec![rendition("1080p"), rendition("720p")],

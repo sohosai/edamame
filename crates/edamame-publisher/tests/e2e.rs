@@ -29,7 +29,7 @@ fn input_config(channel_id: &str, srt_port: u16, copy: bool) -> String {
             r#"
 [[input]]
 channel_id = "{channel_id}"
-srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+input_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
 
 [[input.rendition]]
 quality = "main"
@@ -43,7 +43,7 @@ bandwidth = 12000000
             r#"
 [[input]]
 channel_id = "{channel_id}"
-srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+input_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
 
 [[input.rendition]]
 quality = "main"
@@ -162,12 +162,9 @@ video_bitrate = 500000
         let stored = controller
             .segment("1A", quality, sequence)
             .expect("セグメントを読めません");
-        assert_ne!(
-            stored.first(),
-            Some(&0x47),
-            "保存されたファイルが暗号化されていません"
-        );
         let plain = decrypt_segment(&key, &iv_zero, &stored);
+        // 暗号文の先頭バイトは同期バイトと同じ値になり得るため、平文との比較で確かめる
+        assert_ne!(stored, plain, "保存されたファイルが暗号化されていません");
         assert_mpegts(&plain);
         let streams = probe_streams(dir.path(), &plain);
         assert!(
@@ -243,7 +240,7 @@ preset = "ultrafast"
 
 [[input]]
 channel_id = "1A"
-srt_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
+input_url = "srt://127.0.0.1:{srt_port}?mode=listener&latency=200000"
 key_uri = "{key_uri}"
 
 [[input.rendition]]
@@ -528,6 +525,83 @@ preset = "ultrafast"
         resumed,
         "送信を再開しても配信が続きません: {}",
         publisher.log()
+    );
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+/// RTMP で受け取った映像も、暗号化されたセグメントとして保存されて復号できる
+#[test]
+fn publishes_segments_from_an_rtmp_input() {
+    let dir = TestDir::new("rtmp");
+    let rtmp_port = free_port();
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1B"
+input_url = "rtmp://127.0.0.1:{rtmp_port}/live/1B"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 12000000
+"#
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    assert!(
+        publisher.wait_for_log("input_url=rtmp://127.0.0.1", Duration::from_secs(10)),
+        "RTMP の入力 URL がログに出ません: {}",
+        publisher.log()
+    );
+    let _sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);
+
+    let stored = wait_for(
+        || controller.sequences("1B", "main").len() >= 2,
+        Duration::from_secs(30),
+    );
+    assert!(stored, "セグメントが保存されません: {}", publisher.log());
+    // 送信中のセットの送信が終わるのを待つ
+    thread::sleep(Duration::from_millis(500));
+
+    let sequences = controller.sequences("1B", "main");
+    let stored = controller
+        .segment("1B", "main", sequences[0])
+        .expect("セグメントを読めません");
+    // 暗号鍵の URI を指定しない場合は controller を介して IV を伝えられないため、全ゼロ固定になる
+    let iv_zero = "0".repeat(32);
+    let plain = decrypt_segment(&publisher.key(), &iv_zero, &stored);
+    // 暗号文の先頭バイトは同期バイトと同じ値になり得るため、平文との比較で確かめる
+    assert_ne!(stored, plain, "保存されたファイルが暗号化されていません");
+    assert_mpegts(&plain);
+    let streams = probe_streams(dir.path(), &plain);
+    assert!(
+        streams.contains("h264") && streams.contains("640,360") && streams.contains("aac"),
+        "復号したセグメントの内容が違います: {streams}"
     );
 
     let status = publisher.stop();

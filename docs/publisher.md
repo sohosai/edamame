@@ -2,7 +2,7 @@
 
 この文書は `crates/edamame-publisher` の導入手順、処理の流れ、運用上の仕様を定める。
 
-SRT で受け取った映像をエンコードして MPEG-TS のセグメントを作り、AES-128 で暗号化して edamame controller へ PUT し続ける。
+SRT または RTMP で受け取った映像をエンコードして MPEG-TS のセグメントを作り、AES-128 で暗号化して edamame controller へ PUT し続ける。
 1 本の入力が 1 つの channel になり、1 つの channel は複数の quality（rendition）を持つ。
 controller から見ると publisher は HTTP API を使う外部ソフトウェアであり、プレイリストの生成や worker の管理には関与しない。
 鍵は publisher が作り、live2025-server の `POST /internal/stream-credentials` で配信 URL と一緒に登録する。
@@ -10,15 +10,25 @@ controller から見ると publisher は HTTP API を使う外部ソフトウェ
 ## 必要な環境
 
 - NVIDIA の GPU とドライバ（NVEnc を使う場合）。同時に使う NVEnc セッション数は、driver 550.54.14 以降では 8 までである
-- SRT を扱える ffmpeg と ffprobe（Ubuntu の ffmpeg パッケージは両方を満たす）
+- Intel の GPU と VA-API のドライバ、oneVPL の GPU ランタイム（QSV を使う場合）。
+  Ubuntu 26.04 では intel-media-va-driver-non-free と libmfx-gen1.2 を入れる。oneVPL の本体は ffmpeg が依存する libvpl2 で入る
+- SRT と RTMP を扱える ffmpeg と ffprobe（Ubuntu の ffmpeg パッケージは両方を満たす）
 - 起動済みの edamame controller
-- SRT を送ってくる送信側
+- SRT または RTMP を送ってくる送信側
 
 GPU 機で NVEnc が使えるかは、次のコマンドで確かめる。
 
 ```bash
 ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 5 \
   -c:v h264_nvenc -f null -
+```
+
+Intel の GPU で QSV が使えるかは、次のコマンドで確かめる。
+
+```bash
+vainfo --display drm --device /dev/dri/renderD128
+ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 5 \
+  -c:v h264_qsv -f null -
 ```
 
 ## ビルド
@@ -29,17 +39,17 @@ cargo build --release -p edamame-publisher
 
 ## 設定
 
-`crates/edamame-publisher/publisher.example.toml` をコピーし、`channel_id`、`srt_url`、quality の設定を環境に合わせる。
+`crates/edamame-publisher/publisher.example.toml` をコピーし、`channel_id`、`input_url`、quality の設定を環境に合わせる。
 実行ごとに変わる値（controller の URL と認証トークン）は CLI で渡す。
 
 | 項目 | 説明 |
 | --- | --- |
 | `segment_duration_ms` | 全 channel 共通のセグメント長（500 以上）。PUT の `duration_ms` にもこの値を使う |
 | `backlog_limit` | channel ごとに未送信セットを保持する時間を `segment_duration_ms` の倍数で指定する。この時間を過ぎたセットは捨てる |
-| `encoder.codec` | ffmpeg の映像エンコーダ。`h264_nvenc` を推奨し、GPU のない検証では `libx264` にする |
-| `encoder.preset` | ffmpeg のプリセット（NVEnc は `p1` から `p7`） |
+| `encoder.codec` | ffmpeg の映像エンコーダ。NVIDIA の GPU では `h264_nvenc`、Intel の GPU では `h264_qsv` を推奨し、GPU のない検証では `libx264` にする |
+| `encoder.preset` | ffmpeg のプリセット（NVEnc は `p1` から `p7`、QSV は `veryfast` から `veryslow`） |
 | `input.channel_id` | channel の識別子（`[A-Za-z0-9_-]` の 1 から 64 文字） |
-| `input.srt_url` | 入力の SRT URL。`mode=listener` で待ち受ける |
+| `input.input_url` | 入力の URL。`srt://` は URL の `mode` で待ち受け、`rtmp://` は publisher が待ち受ける。RTMP では URL の app と stream が送信側と一致していること |
 | `input.live_url` | controller の公開マスタープレイリストの HTTPS URL。鍵と一緒に登録する。登録を使う場合は必須 |
 | `input.key_uri` | メディアプレイリストに出力する暗号鍵の URI。指定すると PUT に `key_uri` と `iv` を付ける |
 | `rendition.quality` | quality の識別子。channel の中では同じ値を使い回さない。`master` は使えない |
@@ -62,7 +72,7 @@ ffmpeg の HLS muxer は実行の先頭からセグメント長の倍数の位�
 | option | 説明 |
 | --- | --- |
 | `--config` | TOML 設定ファイルのパス（必須） |
-| `--controller-url` | controller の接続先を表す `http` の絶対 URL（必須） |
+| `--controller-url` | controller の接続先を表す `http` または `https` の絶対 URL（必須） |
 | `--auth-token` | controller の `--auth-token` と同じトークン。省略すると PUT に `Authorization` ヘッダーを付けない |
 | `--work-dir` | 作業ディレクトリを作る親ディレクトリ。指定したディレクトリの配下に `edamame-publisher-<pid>` を作る。省略した場合は一時ディレクトリの配下に作る |
 | `--key-file` | 暗号鍵を読み書きするファイル。ファイルがあれば 16 byte の生データとして読み、なければ生成して 0600 で保存する。省略すると実行ごとに生成する |
@@ -107,7 +117,7 @@ encryption key file is /var/lib/edamame-publisher/key.bin
 encryption key (hex) is 0123456789abcdef0123456789abcdef
 segment duration is 6000 ms
 work directory is /tmp/edamame-publisher-1234
-channel=1A srt_url=srt://0.0.0.0:9101?mode=listener&latency=200000 renditions=3
+channel=1A input_url=srt://0.0.0.0:9101?mode=listener&latency=200000 renditions=3
 channel=1A starting ffmpeg run=1 offset_ms=0
 channel=1A registered stream credentials
 channel=1A published index=0 quality=1080p identifier=... sequence=0
@@ -207,7 +217,7 @@ ffmpeg の実行ごとに、最初のセットで次を確かめる。
 | 事象 | 扱い |
 | --- | --- |
 | ffmpeg の終了 | 1 秒から 10 秒の待ち時間を置いて起動し直す。終了した ffmpeg がセグメントを作れていた場合は、待ち時間を 1 秒に戻す |
-| SRT の切断 | ffmpeg の終了と同じ扱いとする。送信側が接続し直せば配信を再開する |
+| SRT や RTMP の切断 | ffmpeg の終了と同じ扱いとする。送信側が接続し直せば配信を再開する |
 | 接続エラー、5xx、応答の読み取り失敗 | 同じセグメントを 1 秒間隔で送り直す |
 | 400、401、409 | 設定の誤りとみなし、その channel を止める |
 | 鍵の登録時の接続エラー、5xx | 1 秒から 30 秒の待ち時間を置いて登録を試し直す。配信は続ける |
@@ -222,8 +232,8 @@ channel が 1 つでも失敗して止まった場合、または鍵の登録が
 ## Docker で起動する
 
 このリポジトリの Dockerfile にある `publisher` ターゲットでイメージを作る。
-controller と worker のイメージ（distroless）と違い、ffmpeg を含む。
-GPU は NVIDIA Container Toolkit で渡す。
+controller と worker のイメージ（distroless）と違い、ffmpeg と Intel のドライバを含む。
+NVIDIA の GPU は NVIDIA Container Toolkit で渡し、Intel の GPU は `--device /dev/dri:/dev/dri` で渡す。
 
 ```bash
 docker build --target publisher -t edamame-publisher .
@@ -236,12 +246,25 @@ docker run --rm --gpus all \
   --auth-token example-token
 ```
 
-`compose.yaml` にも起動例がある。
+Intel の GPU を使う場合は `--gpus all` の代わりに `--device /dev/dri:/dev/dri` を渡す。
+
+```bash
+docker run --rm --device /dev/dri:/dev/dri \
+  --network host \
+  -v "$PWD/publisher.toml:/etc/edamame-publisher/publisher.toml:ro" \
+  edamame-publisher \
+  --config /etc/edamame-publisher/publisher.toml \
+  --controller-url https://edamame-controller.example.test \
+  --auth-token example-token
+```
+
 SRT は UDP で届くため、待ち受けるポートを開けるか `--network host` を使う。
+RTMP は TCP で届くため、公開するポートを指定すれば `--network host` は要らない。
 
 ## 制限
 
 - `input.key_uri` を指定しない場合は IV が全ゼロ固定になり、セグメントごとに変えられない
 - live2025-server は channel ごとに 1 つの鍵を持つため、publisher を再起動して鍵を変えると、視聴中の再生は鍵を取り直すまで止まる
 - `copy` の quality は、入力のキーフレーム間隔がセグメント長を割り切る場合だけセグメントの長さが揃う
-- 入力の映像はソフトウェアでデコードする。CPU が足りない場合は NVDEC の利用を検討する
+- `h264_qsv` では入力の映像コーデックを QSV がデコードできる必要がある。デコードできない入力では ffmpeg が起動に失敗し、ソフトウェアデコードへは切り替わらない
+- `h264_nvenc` と `libx264` では入力の映像をソフトウェアでデコードする。CPU が足りない場合は NVDEC の利用を検討する

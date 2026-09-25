@@ -17,7 +17,7 @@ pub const PLAYLIST_NAME: &str = "index.m3u8";
 #[must_use]
 pub fn build_command(
     settings: &PublisherSettings,
-    srt_url: &str,
+    input_url: &str,
     renditions: &[RenditionSettings],
     run_dir: &Path,
     offset_ms: u64,
@@ -32,9 +32,21 @@ pub fn build_command(
         "-stats".to_owned(),
         "-stats_period".to_owned(),
         "60".to_owned(),
-        "-i".to_owned(),
-        srt_url.to_owned(),
     ];
+    // QSV は入力を指定する前に有効にし、デコードしたフレームをハードウェアメモリのまま扱う
+    if settings.encoder.codec.ends_with("_qsv") {
+        args.extend([
+            "-hwaccel".to_owned(),
+            "qsv".to_owned(),
+            "-hwaccel_output_format".to_owned(),
+            "qsv".to_owned(),
+        ]);
+    }
+    // RTMP は publisher が接続を待ち受ける。SRT は URL の mode で待ち受ける
+    if input_url.starts_with("rtmp://") {
+        args.extend(["-listen".to_owned(), "1".to_owned()]);
+    }
+    args.extend(["-i".to_owned(), input_url.to_owned()]);
 
     for rendition in renditions {
         args.extend([
@@ -53,16 +65,19 @@ pub fn build_command(
                     settings.encoder.codec.clone(),
                     "-preset".to_owned(),
                     settings.encoder.preset.clone(),
-                    "-pix_fmt".to_owned(),
-                    "yuv420p".to_owned(),
                 ]);
+                // QSV はハードウェアフレームのまま扱うため、ピクセル形式の変換を挟まない
+                if !settings.encoder.codec.ends_with("_qsv") {
+                    args.extend(["-pix_fmt".to_owned(), "yuv420p".to_owned()]);
+                }
+                // 強制したキーフレームが IDR にならないと、セグメントが指定した長さで切れない
+                if let Some(option) = forced_idr_option(&settings.encoder.codec) {
+                    args.extend([option.to_owned(), "1".to_owned()]);
+                }
                 let bitrate = rendition.video_bitrate.unwrap_or(0);
                 args.extend([
                     "-vf".to_owned(),
-                    format!(
-                        "scale={}:{},setsar=1",
-                        rendition.resolution.width, rendition.resolution.height
-                    ),
+                    scale_filter(&settings.encoder.codec, rendition),
                     "-b:v".to_owned(),
                     bitrate.to_string(),
                     "-maxrate".to_owned(),
@@ -72,10 +87,6 @@ pub fn build_command(
                     "-force_key_frames".to_owned(),
                     format!("expr:gte(t,n_forced*{segment_seconds})"),
                 ]);
-                // NVEnc は強制したキーフレームが IDR にならないことがある
-                if settings.encoder.codec.ends_with("nvenc") {
-                    args.extend(["-forced-idr".to_owned(), "1".to_owned()]);
-                }
             }
         }
         args.extend(["-c:a".to_owned(), "copy".to_owned()]);
@@ -103,6 +114,30 @@ pub fn build_command(
         ]);
     }
     args
+}
+
+/// 強制したキーフレームを IDR にするオプション。
+/// 指定が要らないエンコーダでは None を返す
+fn forced_idr_option(codec: &str) -> Option<&'static str> {
+    if codec.ends_with("_qsv") {
+        Some("-forced_idr")
+    } else if codec.ends_with("nvenc") {
+        Some("-forced-idr")
+    } else {
+        None
+    }
+}
+
+/// rendition の解像度へ変換するフィルタ。
+/// QSV はハードウェアフレームのまま縮小できるフィルタを使う
+fn scale_filter(codec: &str, rendition: &RenditionSettings) -> String {
+    let width = rendition.resolution.width;
+    let height = rendition.resolution.height;
+    if codec.ends_with("_qsv") {
+        format!("scale_qsv=w={width}:h={height},setsar=1")
+    } else {
+        format!("scale={width}:{height},setsar=1")
+    }
 }
 
 /// 起動中の ffmpeg
@@ -305,7 +340,7 @@ mod tests {
             stream_ingest_token: None,
             inputs: vec![InputSettings {
                 channel_id: "1A".to_owned(),
-                srt_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
+                input_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
                 live_url: None,
                 key_uri: None,
                 renditions: Vec::new(),
@@ -373,6 +408,57 @@ mod tests {
             0,
         );
         assert!(!args.join(" ").contains("-forced-idr"));
+    }
+
+    #[test]
+    fn listens_for_an_rtmp_input() {
+        let args = build_command(
+            &settings(),
+            "rtmp://0.0.0.0:1935/live/1A",
+            &renditions(),
+            Path::new("/tmp/run-1"),
+            0,
+        );
+        assert!(
+            args.join(" ")
+                .contains("-listen 1 -i rtmp://0.0.0.0:1935/live/1A")
+        );
+    }
+
+    #[test]
+    fn does_not_listen_for_an_srt_input() {
+        let args = build_command(
+            &settings(),
+            "srt://0.0.0.0:9101?mode=listener",
+            &renditions(),
+            Path::new("/tmp/run-1"),
+            0,
+        );
+        assert!(!args.join(" ").contains("-listen"));
+    }
+
+    #[test]
+    fn builds_command_for_qsv() {
+        let mut target = settings();
+        target.encoder.codec = "h264_qsv".to_owned();
+        target.encoder.preset = "medium".to_owned();
+        let args = build_command(
+            &target,
+            "rtmp://0.0.0.0:1935/live/1A",
+            &renditions(),
+            Path::new("/tmp/run-1"),
+            0,
+        );
+        let text = args.join(" ");
+        assert!(text.contains("-hwaccel qsv -hwaccel_output_format qsv -listen 1 -i rtmp://"));
+        assert!(text.contains("-forced_idr 1"));
+        assert!(text.contains("-vf scale_qsv=w=1280:h=720,setsar=1"));
+        // ハードウェアフレームを渡す経路ではピクセル形式を指定しない
+        assert!(!text.contains("-pix_fmt"));
+        // NVEnc 用のオプションは付けない
+        assert!(!text.contains("-forced-idr 1"));
+        // copy の rendition は QSV でもそのままコピーする
+        assert!(text.contains("-c:v copy"));
     }
 
     #[test]

@@ -19,11 +19,17 @@ FROM runtime AS worker
 COPY --from=builder /build/target/release/edamame-worker /usr/local/bin/edamame-worker
 ENTRYPOINT ["edamame-worker"]
 
-# publisher は ffmpeg で NVEnc と SRT を扱うため、distroless ではなく ffmpeg を含む image にする
-# GPU は NVIDIA Container Toolkit がホストのドライバごと渡す
+# publisher は ffmpeg で NVEnc、QSV、SRT、RTMP を扱うため、distroless ではなく ffmpeg を含む image にする
+# GPU は NVIDIA Container Toolkit か --device /dev/dri でホストのドライバごと渡す。
+# QSV には VA-API のドライバと oneVPL の GPU ランタイムが要る（oneVPL の本体は ffmpeg の依存で入る）
 FROM ubuntu:26.04 AS publisher
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        intel-media-va-driver-non-free \
+        libmfx-gen1.2 \
+        vainfo \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/edamame-publisher /usr/local/bin/edamame-publisher
 RUN mkdir -p /work
