@@ -7,9 +7,16 @@ use std::time::{Duration, SystemTime};
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use edamame_domain::EdamameError;
+use rustls::pki_types::pem::PemObject;
 use rustls_acme::AcmeConfig;
 use rustls_acme::caches::DirCache;
 use tokio_stream::StreamExt;
+
+/// 再開用に保持するセッションの数
+///
+/// 視聴者ごとに接続が作られるため、既定の 256 では同時接続数を下回る。保持できなかった
+/// 接続は毎回ハンドシェイクの署名と鍵交換を行うことになる
+const SESSION_CACHE_SIZE: usize = 16384;
 
 /// TLS の暗号実装をプロセスに 1 度だけ登録する
 fn install_crypto_provider() {
@@ -17,12 +24,76 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// 配信に共通の TLS 設定を加える
+///
+/// 既定の rustls はチケットを発行しないため、client が前回のセッションを提示しても
+/// 再開できない。配信では同じ client が繰り返し接続するので、再開できないと
+/// 接続のたびに証明書の署名と鍵交換をやり直すことになる
+fn apply_serving_defaults(config: &mut rustls::ServerConfig) -> Result<(), EdamameError> {
+    // 配信の応答は 1 本が数 MB のセグメント 1 つで、多重化する相手がいない。h2 を
+    // 広告すると、そのセグメントをフレーム分割してフロー制御の更新を挟むことになる
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(|error| {
+        EdamameError::Internal(format!("create tls ticketer failed: {error}"))
+    })?;
+    config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE);
+    Ok(())
+}
+
+/// 配信に使う rustls の crypto provider を作る
+fn crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    std::sync::Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// PEM ファイルから TLS 設定を組み立てる
+///
+/// axum-server の `from_pem_file` は既定の rustls 設定をそのまま使うため、
+/// セッション再開を有効にした設定を自前で作る
+async fn load_server_config(
+    cert: &Path,
+    key: &Path,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, EdamameError> {
+    let cert_pem = tokio::fs::read(cert).await.map_err(|error| {
+        EdamameError::Internal(format!("read tls certificate failed: {error}"))
+    })?;
+    let key_pem = tokio::fs::read(key)
+        .await
+        .map_err(|error| EdamameError::Internal(format!("read tls key failed: {error}")))?;
+    let certs = rustls::pki_types::CertificateDer::pem_slice_iter(&cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            EdamameError::Internal(format!("parse tls certificate failed: {error}"))
+        })?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_pem)
+        .map_err(|error| EdamameError::Internal(format!("parse tls key failed: {error}")))?;
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| EdamameError::Internal(format!("build tls config failed: {error}")))?;
+    apply_serving_defaults(&mut config)?;
+    Ok(std::sync::Arc::new(config))
+}
+
+/// ACME の証明書リゾルバを使う TLS 設定を組み立てる
+///
+/// rustls-acme の `default_rustls_config` はセッション再開が無効なため、
+/// 同じ設定を自前で作り、配信に必要な設定を加える
+fn acme_server_config(
+    resolver: std::sync::Arc<rustls_acme::ResolvesServerCertAcme>,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, EdamameError> {
+    let mut config = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| EdamameError::Internal(format!("build tls config failed: {error}")))?
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    apply_serving_defaults(&mut config)?;
+    Ok(std::sync::Arc::new(config))
+}
+
 /// PEM ファイルの証明書を読み込み、更新の監視を始める
 pub async fn static_config(cert: PathBuf, key: PathBuf) -> Result<RustlsConfig, EdamameError> {
     install_crypto_provider();
-    let config = RustlsConfig::from_pem_file(&cert, &key)
-        .await
-        .map_err(|error| EdamameError::Internal(format!("load tls certificate failed: {error}")))?;
+    let config = RustlsConfig::from_config(load_server_config(&cert, &key).await?);
     // 証明書ファイルが更新されたら読み直し、再起動を不要にする
     spawn_reload(config.clone(), cert, key);
     Ok(config)
@@ -72,7 +143,7 @@ pub async fn serve_acme(
         .cache(DirCache::new(cache_dir.clone()))
         .directory(directory)
         .state();
-    let acceptor = state.axum_acceptor(state.default_rustls_config());
+    let acceptor = state.axum_acceptor(acme_server_config(state.resolver())?);
     // rustls-acme のアクセプタにはハンドシェイクの時間制限がないため、資源を使い続けないようにする
     let acceptor = HandshakeTimeoutAcceptor {
         inner: acceptor,
@@ -208,13 +279,12 @@ fn probe_client_config() -> std::sync::Arc<rustls::ClientConfig> {
 
 /// 指定した root 証明書で検証する設定を作る
 fn client_config(roots: rustls::RootCertStore) -> std::sync::Arc<rustls::ClientConfig> {
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(crypto_provider())
         .with_safe_default_protocol_versions()
         .expect("ring provider supports the default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     std::sync::Arc::new(config)
 }
 
@@ -242,8 +312,10 @@ fn spawn_reload(config: RustlsConfig, cert: PathBuf, key: PathBuf) {
             if current == last {
                 continue;
             }
-            match config.reload_from_pem_file(&cert, &key).await {
-                Ok(()) => {
+            // 読み直しでもセッション再開の設定を保つため、同じ手順で組み立て直す
+            match load_server_config(&cert, &key).await {
+                Ok(updated) => {
+                    config.reload_from_config(updated);
                     println!("reloaded tls certificate from {}", cert.display());
                     last = current;
                 }
