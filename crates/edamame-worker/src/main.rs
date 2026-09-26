@@ -110,7 +110,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// 待ち受けを先に確保し、失敗を早く返す
 fn bind_std_listener(bind: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
-    let listener = std::net::TcpListener::bind(bind)?;
+    // std の TcpListener::bind は backlog を 128 で固定する。接続が集中する時間帯に
+    // accept 待ちの接続が溢れないよう、backlog を広げる
+    let listener = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    listener.set_reuse_address(true)?;
+    listener.bind(&bind.into())?;
+    listener.listen(4096)?;
+    let listener: std::net::TcpListener = listener.into();
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
