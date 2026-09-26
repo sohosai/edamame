@@ -33,9 +33,8 @@ fn apply_serving_defaults(config: &mut rustls::ServerConfig) -> Result<(), Edama
     // 配信の応答は 1 本が数 MB のセグメント 1 つで、多重化する相手がいない。h2 を
     // 広告すると、そのセグメントをフレーム分割してフロー制御の更新を挟むことになる
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config.ticketer = rustls::crypto::ring::Ticketer::new().map_err(|error| {
-        EdamameError::Internal(format!("create tls ticketer failed: {error}"))
-    })?;
+    config.ticketer = rustls::crypto::ring::Ticketer::new()
+        .map_err(|error| EdamameError::Internal(format!("create tls ticketer failed: {error}")))?;
     config.session_storage = rustls::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE);
     Ok(())
 }
@@ -53,9 +52,9 @@ async fn load_server_config(
     cert: &Path,
     key: &Path,
 ) -> Result<std::sync::Arc<rustls::ServerConfig>, EdamameError> {
-    let cert_pem = tokio::fs::read(cert).await.map_err(|error| {
-        EdamameError::Internal(format!("read tls certificate failed: {error}"))
-    })?;
+    let cert_pem = tokio::fs::read(cert)
+        .await
+        .map_err(|error| EdamameError::Internal(format!("read tls certificate failed: {error}")))?;
     let key_pem = tokio::fs::read(key)
         .await
         .map_err(|error| EdamameError::Internal(format!("read tls key failed: {error}")))?;
