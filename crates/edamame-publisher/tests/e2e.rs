@@ -292,7 +292,8 @@ bandwidth = 12000000
 }
 
 #[test]
-fn stops_only_the_channel_with_non_aac_audio() {
+fn restarts_the_channel_with_non_aac_audio() {
+    // 入力の不備でチャンネルが止まっても、待ち受けを再開して次の入力を待つことを確かめる
     let dir = TestDir::new("non-aac");
     let first_port = free_port();
     let second_port = free_port();
@@ -337,6 +338,16 @@ preset = "ultrafast"
         "aac 以外の音声で 1B が止まりません: {}",
         publisher.log()
     );
+    // 止まったチャンネルは待ち受けを再開し、次の入力を待つ
+    let restarted = publisher.wait_for_log(
+        "channel=1B restarting the channel after",
+        Duration::from_secs(10),
+    );
+    assert!(
+        restarted,
+        "1B の待ち受けが再開しません: {}",
+        publisher.log()
+    );
     assert!(
         controller.sequences("1B", "main").is_empty(),
         "aac 以外の音声のセグメントが保存されています"
@@ -350,12 +361,88 @@ preset = "ultrafast"
     );
     assert!(kept, "1A の配信が止まりました: {}", publisher.log());
 
+    // 入力の不備で publisher 全体は終了しない
     let status = publisher.stop();
     assert_eq!(
         status.code(),
-        Some(1),
-        "channel が失敗したときの終了コード: {status}"
+        Some(0),
+        "channel を再起動したときの終了コード: {status}"
     );
+}
+
+#[test]
+fn recovers_after_rejecting_an_input_that_does_not_match_the_rendition() {
+    // 設定と違う解像度の入力でチャンネルが止まったあと、
+    // 正しい解像度の入力で配信を再開できることを確かめる
+    let dir = TestDir::new("recover-resolution");
+    let srt_port = free_port();
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+"#,
+            input_config("1A", srt_port, true)
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+
+    // レンディションと違う解像度を送り、チャンネルが止まるのを待つ
+    let wrong = Sender::start(srt_port, "320x180", 30, 30, "aac", 20);
+    let stopped = publisher.wait_for_log(
+        "channel=1A stopped: copied video resolution must be 640x360",
+        Duration::from_secs(30),
+    );
+    assert!(
+        stopped,
+        "解像度が合わない入力で 1A が止まりません: {}",
+        publisher.log()
+    );
+    drop(wrong);
+
+    // 待ち受けが再開したら、正しい解像度を送る
+    let restarted = publisher.wait_for_log(
+        "channel=1A restarting the channel after",
+        Duration::from_secs(10),
+    );
+    assert!(
+        restarted,
+        "1A の待ち受けが再開しません: {}",
+        publisher.log()
+    );
+    let _right = Sender::start(srt_port, "640x360", 30, 30, "aac", 120);
+
+    let published = wait_for(
+        || !controller.sequences("1A", "main").is_empty(),
+        Duration::from_secs(40),
+    );
+    assert!(
+        published,
+        "正しい解像度の入力で配信が再開しません: {}",
+        publisher.log()
+    );
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
 }
 
 #[test]

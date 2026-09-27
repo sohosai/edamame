@@ -100,7 +100,7 @@ fn run() -> Result<i32, String> {
 /// 作業ディレクトリを作る
 ///
 /// 暗号化前のセグメントファイルを置くため、他の利用者から読めないようにする。
-/// channel が失敗した場合は、終了後も作業ディレクトリを残す。
+/// 鍵の登録が成功しないまま終了した場合は、終了後も作業ディレクトリを残す。
 fn make_work_dir(requested: Option<PathBuf>) -> Result<PathBuf, String> {
     let base = requested.unwrap_or_else(std::env::temp_dir);
     let session = base.join(format!("edamame-publisher-{}", process::id()));
