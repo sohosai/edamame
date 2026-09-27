@@ -84,7 +84,7 @@ struct SegmentFile {
 
 /// 送信中のセットをどう扱うか
 enum PublishError {
-    /// 再試行では解消しないエラーのため channel を止める
+    /// 再試行では解消しないエラーのため、いったん channel を止める
     Fatal(String),
     /// 期限を過ぎたか停止したので、このセットは捨てる
     Abandoned(String),
@@ -204,12 +204,9 @@ pub fn spawn_channel(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let context = Arc::new(context);
-        let channel_stop = Arc::new(AtomicBool::new(false));
-        let published = Arc::new(AtomicU64::new(starting_sequence(&context)));
         let registered = Arc::new(AtomicBool::new(
             context.settings.stream_credentials_url.is_none(),
         ));
-        let (sender, receiver) = mpsc::channel();
 
         let registration = {
             let context = Arc::clone(&context);
@@ -220,42 +217,80 @@ pub fn spawn_channel(
                 register_stream_credentials(&context, &stop, &failed, &registered)
             })
         };
-        let encoder = {
-            let context = Arc::clone(&context);
-            let stop = Arc::clone(&stop);
-            let channel_stop = Arc::clone(&channel_stop);
-            let published = Arc::clone(&published);
-            let failed = Arc::clone(&failed);
-            thread::spawn(move || {
-                if let Err(message) =
-                    run_encoder(&context, &sender, &stop, &channel_stop, &published)
-                {
-                    println!("channel={} stopped: {message}", context.channel_id());
-                    channel_stop.store(true, Ordering::Relaxed);
-                    failed.store(true, Ordering::Relaxed);
-                }
-            })
-        };
-        let publisher = {
-            let context = Arc::clone(&context);
-            let stop = Arc::clone(&stop);
-            let channel_stop = Arc::clone(&channel_stop);
-            let published = Arc::clone(&published);
-            let failed = Arc::clone(&failed);
-            thread::spawn(move || {
-                if let Err(message) =
-                    run_publisher(&context, &receiver, &stop, &channel_stop, &published)
-                {
-                    println!("channel={} stopped: {message}", context.channel_id());
-                    failed.store(true, Ordering::Relaxed);
-                }
-            })
-        };
 
-        let _ = encoder.join();
-        // エンコードが終わったら送信側も止め、残りのセグメントは捨てる
-        channel_stop.store(true, Ordering::Relaxed);
-        let _ = publisher.join();
+        // 入力が設定に合わないなどでチャンネルが止まっても、待ち受けを再開して次の入力を待つ。
+        // 止まったままにすると、送信側が設定を直して接続し直しても復帰できない。
+        // run の番号は作業ディレクトリに残っている番号の続きから使い、
+        // 前の実行が残したセグメントを新しい実行が読み直さないようにする
+        let run_counter = Arc::new(AtomicU64::new(last_run_number(&context.work_dir)));
+        let mut restart_delay = RESTART_MIN;
+        while !stop.load(Ordering::Relaxed) {
+            let channel_stop = Arc::new(AtomicBool::new(false));
+            let start_sequence = starting_sequence(&context);
+            let published = Arc::new(AtomicU64::new(start_sequence));
+            let (sender, receiver) = mpsc::channel();
+
+            let encoder = {
+                let context = Arc::clone(&context);
+                let stop = Arc::clone(&stop);
+                let channel_stop = Arc::clone(&channel_stop);
+                let published = Arc::clone(&published);
+                let run_counter = Arc::clone(&run_counter);
+                thread::spawn(move || {
+                    if let Err(message) = run_encoder(
+                        &context,
+                        &sender,
+                        &stop,
+                        &channel_stop,
+                        &published,
+                        &run_counter,
+                    ) {
+                        println!("channel={} stopped: {message}", context.channel_id());
+                    }
+                })
+            };
+            let publisher = {
+                let context = Arc::clone(&context);
+                let stop = Arc::clone(&stop);
+                let channel_stop = Arc::clone(&channel_stop);
+                let published = Arc::clone(&published);
+                thread::spawn(move || {
+                    if let Err(message) =
+                        run_publisher(&context, &receiver, &stop, &channel_stop, &published)
+                    {
+                        println!("channel={} stopped: {message}", context.channel_id());
+                    }
+                })
+            };
+
+            let _ = encoder.join();
+            // エンコードが終わったら送信側も止め、残りのセグメントは捨てる
+            channel_stop.store(true, Ordering::Relaxed);
+            let _ = publisher.join();
+
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // セグメントを 1 つでも配信できた場合はすぐ再開し、
+            // 一度も配信できないまま止まった場合は間隔を広げる
+            if published.load(Ordering::Relaxed) > start_sequence {
+                restart_delay = RESTART_MIN;
+            } else {
+                restart_delay = (restart_delay * 2).min(RESTART_MAX);
+            }
+            println!(
+                "channel={} restarting the channel after {} ms",
+                context.channel_id(),
+                restart_delay.as_millis()
+            );
+            // channel は既に止まっているため、プロセスの停止要求だけを確認しながら待つ
+            let deadline = Instant::now() + restart_delay;
+            while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+
         let _ = registration.join();
         // 登録できないまま終わった場合も、運用者が気づけるように失敗として扱う
         if !registered.load(Ordering::Relaxed) {
@@ -266,6 +301,26 @@ pub fn spawn_channel(
             failed.store(true, Ordering::Relaxed);
         }
     })
+}
+
+/// channel の作業ディレクトリに残っている run の最大番号。
+///
+/// 前のプロセスが残した run には、止まる原因になったセグメントが残っている。
+/// 番号を続きから使わないと、新しい実行がそれを読み直して同じ理由で止まる。
+fn last_run_number(work_dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(work_dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("run-")?.parse::<u64>().ok())
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// 鍵と配信 URL を live2025-server へ登録する
@@ -460,12 +515,12 @@ fn run_encoder(
     stop: &AtomicBool,
     channel_stop: &AtomicBool,
     published: &AtomicU64,
+    run_counter: &AtomicU64,
 ) -> Result<(), String> {
-    let mut run_number = 0;
     let mut restart_delay = RESTART_MIN;
 
     while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
-        run_number += 1;
+        let run_number = run_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let run_dir = context.work_dir.join(format!("run-{run_number}"));
         for rendition in context.renditions() {
             fs::create_dir_all(run_dir.join(&rendition.quality))
@@ -1109,6 +1164,21 @@ mod tests {
         );
         assert!(!query.iter().any(|(name, _)| *name == "key_uri"));
         assert!(!query.iter().any(|(name, _)| *name == "iv"));
+    }
+
+    #[test]
+    fn continues_run_numbers_after_the_runs_left_on_disk() {
+        // 前の実行が残した run を新しい実行が読み直さないよう、番号を続きから始める
+        let dir =
+            std::env::temp_dir().join(format!("edamame-publisher-run-{}", std::process::id()));
+        fs::create_dir_all(dir.join("run-2")).unwrap();
+        fs::create_dir_all(dir.join("run-7")).unwrap();
+        fs::create_dir_all(dir.join("other")).unwrap();
+
+        assert_eq!(last_run_number(&dir), 7);
+        // 作業ディレクトリがない channel は 0 から始める
+        assert_eq!(last_run_number(&dir.join("missing")), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
