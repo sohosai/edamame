@@ -12,7 +12,8 @@ controller から見ると publisher は HTTP API を使う外部ソフトウェ
 - NVIDIA の GPU とドライバ（NVEnc を使う場合）。同時に使う NVEnc セッション数は、driver 550.54.14 以降では 8 までである
 - Intel の GPU と VA-API のドライバ、oneVPL の GPU ランタイム（QSV を使う場合）。
   Ubuntu 26.04 では intel-media-va-driver-non-free と libmfx-gen1.2 を入れる。oneVPL の本体は ffmpeg が依存する libvpl2 で入る
-- SRT と RTMP を扱える ffmpeg と ffprobe（Ubuntu の ffmpeg パッケージは両方を満たす）
+- OpenCL のランタイム（`mode = "upscale"` の超解像を使う場合）。Ubuntu 26.04 では intel-opencl-icd を入れる。実行時にホストの `/dev/dri` を渡す
+- SRT と RTMP を扱える ffmpeg と ffprobe。超解像を使う場合は Intel VSR (raisr) を組み込んだ ffmpeg が要る（publisher の Docker イメージには同梱される）
 - 起動済みの edamame controller
 - SRT または RTMP を送ってくる送信側
 
@@ -53,7 +54,7 @@ cargo build --release -p edamame-publisher
 | `input.live_url` | controller の公開マスタープレイリストの HTTPS URL。鍵と一緒に登録する。登録を使う場合は必須 |
 | `input.key_uri` | メディアプレイリストに出力する暗号鍵の URI。指定すると PUT に `key_uri` と `iv` を付ける |
 | `rendition.quality` | quality の識別子。channel の中では同じ値を使い回さない。`master` は使えない |
-| `rendition.mode` | `copy` は入力の映像をそのまま使う。省略すると再エンコードする |
+| `rendition.mode` | `copy` は入力の映像をそのまま使う。`upscale` は Intel VSR (raisr) で 2 倍に拡大してから作り直す（`h264_qsv` 専用）。省略すると再エンコードする |
 | `rendition.resolution` | `WIDTHxHEIGHT`。偶数であること。`copy` のときは入力の解像度と一致していること |
 | `rendition.bandwidth` | controller へ宣言するビットレート。音声と多重化を含めた値にする |
 | `rendition.video_bitrate` | エンコーダの目標ビットレート。`mode = "copy"` のときは指定しない |
@@ -66,6 +67,16 @@ cargo build --release -p edamame-publisher
 たとえばセグメント長が 6 秒なら、1 秒、2 秒、3 秒、6 秒の間隔は使える。
 ffmpeg の HLS muxer は実行の先頭からセグメント長の倍数の位置で区切るため、割り切れないと長いセグメントと短いセグメントが混ざる。
 指定値から 100 ms を超えてずれた場合は警告が出るので、送信側のキーフレーム間隔を直す。
+
+`upscale` を使う quality では、入力のちょうど 2 倍の解像度を指定する。
+1080p の入力から 4K を作る場合は `resolution = "3840x2160"` と書く。
+拡大は Intel VSR (raisr) が行い、倍率は 2 倍固定である。
+`upscale` は `encoder.codec` が `h264_qsv` のときだけ使える。
+エンコードの設定は他の quality と同じで、`encoder.preset` と `video_bitrate` を使う。
+
+raisr は Intel GPU の OpenCL で動く。
+publisher の Docker イメージには OpenCL のランタイムとフィルタデータが入っているため、ホストの `/dev/dri` を渡せば動く。
+入力は 8 bit の H.264 にする。
 
 実行ごとに変わる値は CLI で渡す。
 
@@ -148,6 +159,15 @@ ffprobe plain.ts
 `$IV` には、取得するセグメントに適用されるプレイリストの `#EXT-X-KEY` の `IV` 属性から `0x` を除いた値を設定しておく。
 `input.key_uri` を指定していない場合はプレイリストに `IV` 属性が出ないため、全ゼロの IV を使う。
 
+超解像を使う場合は、先に raisr が動くことを確かめる。
+publisher のイメージで次のコマンドを実行し、`fps` が入力のフレームレートに追いついているかを見る。
+
+```bash
+docker run --rm --device /dev/dri:/dev/dri --entrypoint ffmpeg ghcr.io/sohosai/edamame-publisher:latest \
+  -hide_banner -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 10 \
+  -vf raisr=filterfolder=/usr/local/share/raisr/filters_2x/filters_highres:asm=opencl -f null -
+```
+
 鍵と配信 URL の登録を確かめる。
 `GET /channel/:channel_id` の `live_url` と、`GET /key/:channel_id` が返す鍵を見る。
 鍵のエンドポイントはセッション cookie を要求するため、実際の確認は client と同じ経路で行う。
@@ -227,6 +247,8 @@ ffmpeg の実行ごとに、最初のセットで次を確かめる。
 | 鍵の登録時の 400、401 | 設定の誤りとみなし、ログを出して登録を打ち切る。配信は続ける |
 | 未送信セットが `segment_duration_ms` × `backlog_limit` の時間を過ぎる | そのセットを捨てる |
 | aac 以外の音声、`copy` の前提を満たさない入力 | その channel を止める。待ち時間を置いて起動し直し、他の channel は続ける |
+| `upscale` のセグメントが設定した解像度と違う | その channel を止める。待ち時間を置いて起動し直す（入力の解像度が想定と違う設定の誤り） |
+| OpenCL が使えず raisr を初期化できない | ffmpeg が終了する。ffmpeg の終了と同じ扱いとする |
 | SIGINT、SIGTERM | 全 ffmpeg を止めて終了する |
 
 channel が止まった場合、publisher はその channel の ffmpeg と送信を終わらせ、他の channel の配信を続ける。
@@ -273,3 +295,5 @@ RTMP は TCP で届くため、公開するポートを指定すれば `--networ
 - `copy` の quality は、入力のキーフレーム間隔がセグメント長を割り切る場合だけセグメントの長さが揃う
 - `h264_qsv` では入力の映像コーデックを QSV がデコードできる必要がある。デコードできない入力では ffmpeg が起動に失敗し、ソフトウェアデコードへは切り替わらない
 - `h264_nvenc` と `libx264` では入力の映像をソフトウェアでデコードする。CPU が足りない場合は NVDEC の利用を検討する
+- `upscale` は OpenCL が使える Intel GPU が必須で、拡大の倍率は 2 倍固定である。1080p から 2160p のリアルタイム変換は GPU の性能に依存する
+- `upscale` の入力は 8 bit の H.264 を前提にする。入力の解像度が `resolution` の半分でない場合、最初のセットの検査で channel が止まる

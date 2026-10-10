@@ -7,7 +7,8 @@
 - Rust 1.85 以降（edition 2024）
 - controller と worker が同じ network から到達できること
 - publisher を動かす場合は、NVEnc と QSV と SRT と RTMP を含む ffmpeg。
-  NVEnc を使う場合は NVIDIA の GPU とドライバ、QSV を使う場合は Intel の GPU と VA-API のドライバと oneVPL の GPU ランタイム
+  NVEnc を使う場合は NVIDIA の GPU とドライバ、QSV を使う場合は Intel の GPU と VA-API のドライバと oneVPL の GPU ランタイム。
+  4K の超解像（`mode = "upscale"`）を使う場合は Intel VSR (raisr) を組み込んだ ffmpeg と OpenCL のランタイムが要る（publisher のイメージにはどちらも同梱される）
 
 ## ビルド
 
@@ -56,6 +57,7 @@ publisher もセグメントファイルの PUT に `Authorization: Bearer {toke
 
 publisher は `crates/edamame-publisher` にあり、SRT または RTMP で受け取った映像を NVEnc や QSV でエンコードしてセグメントを作り、
 controller へ PUT する。GPU と ffmpeg が要るため、controller と worker とは別の機械で動かす。
+QSV を使う場合は、Intel VSR (raisr) で 4K へ超解像する quality も作れる（`mode = "upscale"`）。
 
 ```bash
 cargo run --release -p edamame-publisher -- \
@@ -102,7 +104,7 @@ services:
       - "9001:9001"
 ```
 
-publisher のイメージは ffmpeg と Intel のドライバを含むため別のターゲットで作る。
+publisher のイメージは raisr 入りの ffmpeg をビルドして Intel のドライバと一緒に含むため、別のターゲットで作る（ビルドに時間がかかる）。
 NVIDIA の GPU は NVIDIA Container Toolkit で渡し、Intel の GPU は `--device /dev/dri:/dev/dri` で渡す。
 
 ```bash
