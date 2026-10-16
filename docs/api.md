@@ -7,6 +7,8 @@
 
 | 提供元 | メソッドとパス | 呼び出し元 | 認証 | 用途 |
 | --- | --- | --- | --- | --- |
+| controller | `GET /health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
+| controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
 | controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（任意設定） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
 | controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（任意設定） | 外部配信のマスタープレイリスト URL の登録と解除 |
 | controller | `PUT /workers/{worker_id}` | worker | Bearer（任意設定） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
@@ -31,22 +33,122 @@
 ### リクエストとレスポンスの形式
 
 - JSON を送るリクエストの Content-Type は `application/json` とする。Content-Type の不一致、JSON の構文エラー、型の不一致、必須項目の欠落はすべて `400 Bad Request` を返す
-- リクエストボディのサイズ上限は、`PUT /segments/...` と `POST /workers/{worker_id}/sync` が 64 MiB、`PUT /workers/{worker_id}` が 4 MiB、`PUT /channels/{channel_id}/external` が 64 KiB とする。JSON エンドポイントで上限を超えた場合は `400 Bad Request`、`PUT /segments/...` で上限を超えた場合は `413 Payload Too Large` を返す
+- リクエストボディのサイズ上限は、`PUT /segments/...` と `POST /workers/{worker_id}/sync` が 64 MiB、`PUT /workers/{worker_id}` と `POST /internal/cluster/heartbeat` が 4 MiB、`PUT /channels/{channel_id}/external` が 64 KiB とする。JSON エンドポイントで上限を超えた場合は `400 Bad Request`、`PUT /segments/...` で上限を超えた場合は `413 Payload Too Large` を返す
 - JSON を返すレスポンスの Content-Type は `application/json` とする
 - プレイリストの Content-Type は `application/vnd.apple.mpegurl`、セグメントファイルの Content-Type は `application/octet-stream` とする
 - エラー応答の本文は英語の plain text とし、Content-Type は `text/plain; charset=utf-8` とする
 
 ### 認証と CORS
 
-- `controller` は `--auth-token` を指定したときだけ、すべての `PUT` エンドポイントに `Authorization: Bearer {token}` を要求する。ヘッダがない場合やトークンが一致しない場合は、`WWW-Authenticate: Bearer` ヘッダを付けて `401 Unauthorized` を返す。`GET` と `POST` は認証を要求しない
+- `controller` は `--auth-token` を指定したときだけ、すべての `PUT` エンドポイントに `Authorization: Bearer {token}` を要求する。ヘッダがない場合やトークンが一致しない場合は、`WWW-Authenticate: Bearer` ヘッダを付けて `401 Unauthorized` を返す。`GET` と sync の `POST` は認証を要求せず、heartbeat の `POST` は常に Bearer 認証を要求する
 - ブラウザからは `GET` だけ cross-origin で読み取れる。許可する origin は `controller` と `worker` の `--cors-origin`（`*`、`none`、またはカンマ区切りの origin 一覧。`*` や `none` は他の値と混在不可）で指定し、省略または `none` を指定すると CORS ヘッダを返さない
 
 ### ステータスコードの判定順
 
-- 基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
+- leader での基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
 - 予期しない内部エラーは `500 Internal Server Error` を返す
 
 ## controller の API
+
+### インスタンスの役割を取得する
+
+```http
+GET /health
+```
+
+認証なしで常に 200 と、そのインスタンス自身の状態を返す。
+leader に転送しない。
+
+```json
+{
+  "role": "follower",
+  "public_url": "http://controller-b.test:9000",
+  "metric": 10,
+  "leader_url": "http://controller-a.test:9000"
+}
+```
+
+`role` は `leader` または `follower` とする。
+cluster の起動直後は `follower` と `leader_url: null` を返す。
+public URL を省略した単独構成では `public_url` と `leader_url` は `null`、metric を省略した場合は 0 になる。
+200 はインスタンス自身が応答できることを示し、leader の確定や配信可能なプレイリストの存在を保証しない。
+
+### peer と heartbeat を交換する
+
+```http
+POST /internal/cluster/heartbeat
+Authorization: Bearer {token}
+Content-Type: application/json
+```
+
+全 peer に共通の `--auth-token` が必須になる。
+自分の public URL、metric、既知の member 一覧を送る。
+リクエストの `role` と `leader_url` は省略でき、省略した role は `follower` として扱う。
+送信例を示す。
+
+```json
+{
+  "public_url": "http://controller-b.test:9000",
+  "metric": 10,
+  "role": "follower",
+  "leader_url": "http://controller-a.test:9000",
+  "members": [
+    {
+      "public_url": "http://controller-a.test:9000",
+      "metric": 20,
+      "role": "leader"
+    }
+  ]
+}
+```
+
+受信側は 200 と自分の `public_url`、`metric`、`role`、`leader_url`、`members` を同じ形式で返す。
+member の role を省略した場合も `follower` として扱う。
+member 一覧には受信側が既知の peer を返し、自分自身は一覧に含めない。
+URL は HTTP または HTTPS の絶対 URL とし、query と fragment は許可しない。
+JSON body の上限は 4 MiB とする。
+生存確認と leader 判定の規則は [controller の冗長化](./cluster.md) に従う。
+
+| status | 条件 |
+| --- | --- |
+| 200 | heartbeat を受け付けた |
+| 401 | token が未設定、Authorization がない、または token が一致しない |
+| 400 | JSON または URL が不正、または body が上限を超えている |
+| 503 | token は一致するが cluster が無効になっている |
+
+### follower の転送と leader 未確定時の応答
+
+`/health` と heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
+Location は leader の public URL に元の API の path と query を連結する。
+HTTP と HTTPS の両方を許可する。
+public URL に接頭辞がある場合、API はその下に公開され、転送では leader の接頭辞に置き換わる。
+
+```http
+HTTP/1.1 307 Temporary Redirect
+Location: https://controller-a.test/base/segments/live/720p/0.ts?x=1
+Cache-Control: no-store
+```
+
+GET の応答には `--cors-origin` の設定に応じた読み取り用 CORS ヘッダーを付ける。
+sync の redirect に CORS ヘッダーは付けない。
+client は 307 に追従し、sync では POST と JSON body を保持する。
+
+認証付き PUT は follower 自身で認証した後、leader へ内部中継する。
+Authorization、Content-Type、body を保持し、leader の status、応答ヘッダー、body を返す。
+入力の検証と採番は leader が行い、follower は保存しない。
+
+leader URL が未確定の間は、各業務 API に次の応答を返す。
+PUT の認証はこの判定より先に行う。
+PUT の中継失敗でも同じ 503 を返し、heartbeat の再確認を要求する。
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 1
+Cache-Control: no-store
+```
+
+leader の交代で状態は失われる。
+worker は sync の 404 で再登録し、client はプレイリストの 404 または 503 の後に取り直す。
 
 ### セグメントファイルを登録する（publisher 用）
 

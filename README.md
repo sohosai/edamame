@@ -74,7 +74,7 @@ cargo run -p edamame-worker -- \
 - 必須：`--bind`、`--storage-capacity`、`--playlist-segments`（直近 6 セグメント以上）、`--sync-interval-ms`、`--sync-timeout-ms`
 - 任意：
   - `--publish-wait-ms`：新しいセグメントをプレイリストに載せる前の待ち時間。省略すると `2000`（ミリ秒）を使い、起動時に警告を出す
-  - `--auth-token`：`PUT` リクエストの認証トークン。省略すると `PUT` を認証せず、起動時に警告を出す
+  - `--auth-token`：`PUT` と heartbeat の認証トークン。省略すると `PUT` を認証せず、起動時に警告を出す
   - `--cors-origin`：ブラウザからの `GET` を許可する origin。省略すると CORS ヘッダを返さず、起動時に警告を出す
   - `--external-min-percent`：外部配信を登録したときに振り分ける最小の割合（%）。省略すると `1` になる
 
@@ -93,6 +93,9 @@ cargo run -p edamame-worker -- \
 
 `--auth-token` を使う場合は、`controller`、`worker`、`publisher` に同じトークンを設定する。
 全オプションの詳細と TLS の設定手順は [運用](./docs/operations.md) で説明する。
+
+同じ token を持つ controller を複数起動する場合は、`--public-url`、`--metric`、`--seed` を指定する。
+DNS の共有名から各機へ到達させる起動例は [運用](./docs/operations.md#controller-を冗長化する)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
 
 ## publisher
 
@@ -204,10 +207,10 @@ cargo test --workspace
 
 ## 運用上の契約と制約
 
-- **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。プロセスを再起動すると、これらのデータは失われる。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
+- **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。プロセスの再起動や leader の交代で、これらのデータは失われる。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
 - **容量上限と自動削除** ：`controller` は、メモリ上のセグメントの合計サイズが `--storage-capacity` を超えると、書き込んだ順に古いセグメントから削除する。プレイリストの公開範囲にあるセグメントまで削除されると、プレイリストの取得には `422 Unprocessable Entity` が返る。必要なメモリ容量は [運用](./docs/operations.md) の計算式で見積もり、余裕を持たせて設定する。
 - **画質間のセグメント識別子** ：複数の画質（`quality`）を配信する場合、同じ時間帯のセグメントには同じセグメント識別子（`identifier`）を付けて `PUT` する。`controller` は同じ識別子に対して同じセグメント番号（`sequence`）を割り当てる。
 - **プレイリスト反映の遅延と独立性** ：セグメントを `PUT` してからプレイリストに反映されるまでには、`--publish-wait-ms` の待ち時間と、`worker` が `sync` でセグメントを取得する時間がかかる。公開範囲は `quality` ごとに独立して決まるため、`worker` の停止やセグメントの欠落が起きると、メディアプレイリストのセグメント番号（`#EXT-X-MEDIA-SEQUENCE`）は前に進むだけでなく、戻ったり飛んだりすることがある。
 - **キャッシュ上限の推奨値** ：`worker` の `--cache-limit` は、`controller` の `--playlist-segments` より 1 以上大きく設定することを推奨する。公開待ちの間も、直前の公開範囲と新しいセグメントの両方を同時にキャッシュへ残せるようにするためである。
-- **認証と通信保護** ：`--auth-token` による Bearer 認証は、セグメントの `PUT`、`worker` の登録、外部配信の登録にだけ適用される。`GET` と `POST /workers/{worker_id}/sync` には認証がない。`controller` は HTTP のみで待ち受けるため、内部通信はプライベートネットワーク内にとどめ、外部へ公開する場合はリバースプロキシなどで TLS を終端する。なお、`worker` は単体での TLS 終端と ACME による証明書取得にも対応している。
+- **認証と通信保護** ：`--auth-token` による Bearer 認証は、セグメントの `PUT`、`worker` の登録、外部配信の登録と heartbeat に適用される。`GET` と `POST /workers/{worker_id}/sync` には認証がない。`controller` は HTTP のみで待ち受けるため、内部通信はプライベートネットワーク内にとどめ、外部へ公開する場合はリバースプロキシなどで TLS を終端する。なお、`worker` は単体での TLS 終端と ACME による証明書取得にも対応している。
 - **障害時の扱いと関連仕様** ：各コンポーネントが停止したときの動作は [運用](./docs/operations.md)、HTTP ステータスコードの詳細は [HTTP API](./docs/api.md)、プレイリストの出力形式は [HLS の出力](./docs/hls.md) で説明する。

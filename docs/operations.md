@@ -5,7 +5,7 @@
 
 ## 構成と接続関係
 
-Edamame は 1 つの `controller` と 1 つ以上の `worker` で構成する。
+Edamame は単独または冗長化した `controller` と、1 つ以上の `worker` で構成する。
 `publisher` は `controller` にセグメントファイルを `PUT` し、`client` はプレイリストを `controller` から、セグメントファイルを `worker` から取得する。
 
 ```text
@@ -34,9 +34,12 @@ client    ── GET セグメントファイル (.ts) ────────�
 | `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | `worker` に指示する `sync` の間隔をミリ秒で指定する（1 以上の整数） |
 | `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | `sync` が届かない `worker` を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
 | `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に `worker` の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は `2000` を使い警告を出す） |
-| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | `PUT` の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると `PUT` を認証せず警告を出す） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | `PUT` と heartbeat の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると `PUT` を認証せず警告を出す） |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの `GET` を許可する origin（`*`、`none`、またはカンマ区切りの origin 一覧。省略すると CORS ヘッダを付けず警告を出す） |
 | `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 外部配信が登録されているときに外部配信へ流す最低の割合（%、0 以上 100 以下、省略時は `1`。公開の遅れが増えると最大 100% まで上昇する） |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | seed 指定時に必須 | peer、worker、client のすべてから到達できる、このインスタンス固有の HTTP または HTTPS の絶対 URL。query と fragment は不可、path の接頭辞は許可する |
+| `--metric` | `EDAMAME_METRIC` | seed 指定時に必須 | leader の優先度。0 以上 4294967295 以下で、大きい値を優先する |
+| `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の URL。カンマ区切りと繰り返しを許可し、重複と自分の URL を除く。省略時は単独 leader |
 
 ### worker の設定
 
@@ -64,6 +67,63 @@ URL にパスを含めた場合（例：`https://edge.example.test/worker-a`）�
 
 `--controller-url` には、`worker` から到達できる `http` の絶対 URL だけを指定できる。
 この URL には query と fragment を含めず、末尾に `/` がある場合は取り除いて使う。
+
+## controller を冗長化する
+
+全 controller に同じ `--auth-token` と、異なる `--public-url` を指定する。
+`--seed` を指定する場合は `--public-url` と `--metric` も必須にする。
+token がなければ cluster を無効化して警告を出し、単独 leader として起動する。
+
+2 台をローカルで確認する最小例を示す。
+それぞれ別のターミナルで起動する。
+
+```bash
+edamame-controller \
+  --bind 127.0.0.1:9000 --public-url http://127.0.0.1:9000 \
+  --metric 20 --seed http://127.0.0.1:9002 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
+
+```bash
+edamame-controller \
+  --bind 127.0.0.1:9002 --public-url http://127.0.0.1:9002 \
+  --metric 10 --seed http://127.0.0.1:9000 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
+
+```bash
+curl http://127.0.0.1:9000/health
+curl http://127.0.0.1:9002/health
+```
+
+metric が 20 の機体が leader、10 の機体が follower になる。
+全 member に対する heartbeat は 1 秒間隔、timeout は 1 秒、死亡判定は最後の直接疎通から 3 秒とする。
+これらは option では変更できない。
+
+本番では reverse proxy を置かず、controller の共有名を DNS ラウンドロビンで複数の A レコードに対応させる。
+例えば `controller.example.test` に 2 台の IP を登録し、TTL は 5 秒など短い値にする。
+全機で共有名に対する待ち受けポートと API の path を揃える。
+各機の `--public-url` と `--seed` は共有名ではなく、機体固有の名前を使う。
+その public URL は peer、worker、client のすべてから同じ scheme で到達できるようにする。
+controller 自体の待ち受けは HTTP であり、HTTPS の public URL を指定するだけでは TLS は有効にならない。
+
+worker と publisher の `--controller-url` は、例えば `http://controller.example.test:9000` のような共有名に揃える。
+client のプレイリスト URL も共有名を使い、GET と sync の 307 に追従する。
+認証付き PUT は follower が内部中継するため、publisher の Authorization は維持される。
+
+停止した機体の A レコードは速やかに削除する。
+短い TTL でも、既存の DNS キャッシュや接続が切り替わる時刻は client によって異なる。
+DNS ラウンドロビンだけでは死んだ機体への接続失敗を回避できないため、接続失敗時は再試行する。
+既存 TCP 接続への応答が途絶えた場合、worker はリクエストの timeout まで最大 30 秒待つため、復旧が leader の交代より遅れる場合がある。
+leader 未確定時や中継失敗時の 503 では `Retry-After: 1` に従う。
+
+上位機が復帰すると自動で切り戻し、セグメント、採番、worker の登録、外部配信の登録は失われる。
+切り替え中はプレイリストが数秒間 404 または 503 になり得る。
+状態の責務、転送規則、二重 leader の条件は [controller の冗長化](./cluster.md) を参照する。
 
 ## パラメータ設計とメモリ見積もり
 
@@ -126,10 +186,10 @@ TLS 配信を有効にした `worker` は、公開ルート CA で検証でき�
 
 ### セキュリティと信頼境界
 
-- `controller` は `--auth-token` を指定すると `PUT` に Bearer トークンを要求し、指定しなければ警告を出して `PUT` を認証しない
+- `controller` は `--auth-token` を指定すると `PUT` と heartbeat に Bearer トークンを要求する。省略すると警告を出して `PUT` を認証せず、cluster は無効、heartbeat は 401 にする
 - `GET` と `POST /workers/{worker_id}/sync` には認証がないため、`controller` の待ち受けポートへは信頼できるネットワークからか、reverse proxy 経由でのみアクセスできるようにする
 - `publisher` が送るセグメント識別子は文字種を限定し、`controller` と `worker` は識別子をメモリ上の索引にだけ使う
-- `worker` は取得先の URL を `--controller-url` を基底として `channel_id`、`quality`、セグメント番号（`sequence`）から組み立て、外部から渡された任意の URL は取得しない
+- `worker` は `--controller-url` から GET と sync を送り、follower が返す leader の URL への redirect に追従する。cluster の token を持つ peer は転送先を宣言できるため、信頼できる controller だけに token を渡す
 - `--public-url` には `client` から到達できる URL を指定し、`controller` はこの URL をプレイリストに書く
 - `controller` は登録された外部配信の URL を取得せず、`client` が外部配信から直接取得する
 - 外部配信への振り分けは、接続元の IP と `channel` から決まる値と、その時点の公開の遅れに応じた外部配信の割合とを比較し、リクエストごとに判定する。外部配信へ流す割合が変われば、同じ接続元と `channel` でも判定結果が変わることがある。reverse proxy や NAT の配下で接続元の IP が同じ `client` は、同じ `channel` と割合であれば同じ判定結果になる
@@ -138,7 +198,8 @@ TLS 配信を有効にした `worker` は、公開ルート CA で検証でき�
 ### ログ出力
 
 - ログメッセージはすべて英語で出力する
-- 起動時に待ち受けアドレスを標準出力へ出力する
+- 起動時に待ち受けアドレス、public URL、metric、現在の役割を標準出力へ出力する
+- cluster の役割の変化、member の追加、死亡、復帰と中継失敗を出力する
 - `sync` の失敗とセグメントファイルの取得失敗は標準エラーへ出力する
 - メトリクス用のエンドポイントは提供しない
 
@@ -231,7 +292,12 @@ curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
 
 | 状況 | 動作 |
 | --- | --- |
-| controller が停止した | client はプレイリストを取得できない。worker はキャッシュしているセグメントファイルの配信を続けるが、sync は失敗し続ける。controller が復帰すると、worker は再登録してキャッシュを捨てる |
+| 単独の controller が停止した | client はプレイリストを取得できない。worker はキャッシュしているセグメントファイルの配信を続けるが、sync は失敗し続ける。controller が復帰すると、worker は再登録してキャッシュを捨てる |
+| cluster の leader が停止した | 残った最大の metric の機体が昇格する。状態は複製しないため、採番は 0 から始まり、worker は sync の 404 で再登録する |
+| 上位の metric の controller が復帰した | 上位機へ切り戻す。直前の状態は失われ、プレイリストは再構築まで 404 または 503 になる |
+| leader が未確定、または PUT を中継できない | 503 と `Retry-After: 1` を返す。中継失敗では heartbeat を再要求する |
+| DNS が停止機体の IP を返した | 接続に失敗する。停止機体の A レコードを削除し、client は再試行する |
+| peer 間の通信が分断された | 二重 leader と PUT の取りこぼしがあり得る。通信回復後は最大の metric の機体へ戻り、分断中の状態は統合しない |
 | worker が停止した | controller は `--sync-timeout-ms` の経過後にその worker を配信先の候補から外す。その quality の公開範囲を保持する他の worker があればそれを使い、なければ次の sync で公開範囲が更新されるまで 503 になる |
 | セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得する。公開範囲を保持していなければ配信先に使われない |
 | 公開範囲のセグメントファイルが容量超過で削除された | controller はその quality のプレイリストを生成せず 422 を返し、worker がキャッシュしているセグメントファイルの配信は続く |
