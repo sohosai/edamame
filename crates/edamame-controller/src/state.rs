@@ -151,6 +151,12 @@ impl ControllerState {
         })
     }
 
+    pub async fn clear(&self) {
+        let mut inner = self.inner.lock().await;
+        *inner = Inner::default();
+        self.store.clear();
+    }
+
     /// channel の外部配信の master m3u8 を登録する。`None` で取り消す
     pub async fn set_external_m3u8(
         &self,

@@ -1,5 +1,6 @@
 //! Edamame の controller
 
+pub mod cluster;
 pub mod config;
 mod external;
 pub mod http;

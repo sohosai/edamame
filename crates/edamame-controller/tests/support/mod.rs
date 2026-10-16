@@ -437,3 +437,103 @@ pub async fn wait_for_segment(client: &reqwest::Client, url: &str, expected: &[u
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+pub struct ControllerProcess {
+    pub child: tokio::process::Child,
+    pub addr: SocketAddr,
+    pub base_url: String,
+}
+
+pub fn available_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+pub async fn spawn_cluster_process(
+    addr: SocketAddr,
+    metric: u32,
+    seeds: &[String],
+    prefix: &str,
+) -> ControllerProcess {
+    let base_url = format!("http://{addr}{prefix}");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_edamame-controller"));
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("EDAMAME_")) {
+        command.env_remove(name);
+    }
+    let child = command
+        .args([
+            "--bind",
+            &addr.to_string(),
+            "--storage-capacity",
+            "16MiB",
+            "--playlist-segments",
+            "6",
+            "--sync-interval-ms",
+            "100",
+            "--sync-timeout-ms",
+            "1000",
+            "--publish-wait-ms",
+            "0",
+            "--auth-token",
+            "cluster-test-token",
+            "--cors-origin",
+            "*",
+            "--public-url",
+            &base_url,
+            "--metric",
+            &metric.to_string(),
+            "--seed",
+            &seeds.join(","),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let process = ControllerProcess {
+        child,
+        addr,
+        base_url,
+    };
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .get(format!("{}/health", process.base_url))
+            .send()
+            .await
+            .is_ok()
+        {
+            return process;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "controller が起動しなかった"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str, leader_url: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let health: serde_json::Value = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if health["role"] == role && health["leader_url"] == leader_url {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "役割が切り替わらなかった: {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
