@@ -23,7 +23,7 @@ async fn reads_configuration_from_environment() {
         .env("EDAMAME_PLAYLIST_SEGMENTS", "5")
         // CORS は未指定にする
         .env_remove("EDAMAME_CORS_ORIGIN")
-        .args(["--playlist-segments", "6"])
+        .args(["--playlist-segments", "6", "--metric", "30"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -59,8 +59,8 @@ async fn reads_configuration_from_environment() {
         "公開 URL が正規化されなかった: {cluster}"
     );
     assert!(
-        cluster.contains("metric=20"),
-        "環境変数の metric が反映されなかった: {cluster}"
+        cluster.contains("metric=30"),
+        "CLI の metric が優先されなかった: {cluster}"
     );
     assert!(
         cluster.contains("role=Follower"),
@@ -80,6 +80,8 @@ async fn rejects_empty_environment_variable() {
         .env("EDAMAME_SYNC_TIMEOUT_MS", "1000")
         .env("EDAMAME_PUBLISH_WAIT_MS", "2000")
         .env("EDAMAME_CORS_ORIGIN", "")
+        .env("EDAMAME_PUBLIC_URL", "http://127.0.0.1:9000")
+        .env("EDAMAME_AUTH_TOKEN", "example-token")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -98,9 +100,9 @@ async fn rejects_empty_environment_variable() {
     );
 }
 
-/// seed を指定しても token がなければ警告を出して単独 leader になる。
+/// seed と metric を省略しても、公開 URL と token があれば 1 台で選出する。
 #[tokio::test]
-async fn disables_cluster_with_warning_without_auth_token() {
+async fn elects_self_without_seeds_and_defaults_metric_to_100() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -114,24 +116,14 @@ async fn disables_cluster_with_warning_without_auth_token() {
         .env("EDAMAME_PUBLISH_WAIT_MS", "0")
         .env("EDAMAME_CORS_ORIGIN", "none")
         .env("EDAMAME_PUBLIC_URL", &base)
-        .env("EDAMAME_METRIC", "42")
-        .env("EDAMAME_SEED", "http://127.0.0.1:1")
-        .env_remove("EDAMAME_AUTH_TOKEN")
+        .env("EDAMAME_AUTH_TOKEN", "example-token")
+        .env_remove("EDAMAME_METRIC")
+        .env_remove("EDAMAME_SEED")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-    let warning = tokio::time::timeout(Duration::from_secs(10), stderr.next_line())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(
-        warning.contains("cluster is disabled") && warning.contains("--auth-token"),
-        "無効化の警告が出なかった: {warning}"
-    );
     let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
     tokio::time::timeout(Duration::from_secs(10), stdout.next_line())
         .await
@@ -139,23 +131,89 @@ async fn disables_cluster_with_warning_without_auth_token() {
         .unwrap()
         .unwrap();
     let client = reqwest::Client::new();
-    let health: serde_json::Value = client
-        .get(format!("{base}/health"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(health["role"], "leader");
-    assert_eq!(health["leader_url"], base);
-    assert_eq!(health["metric"], 42);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let health: serde_json::Value = client
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["public_url"], base);
+        assert_eq!(health["metric"], 100);
+        if health["role"] == "leader" {
+            assert_eq!(health["leader_url"], base);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "1 台構成の選出が完了しなかった"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let url = format!("{base}/internal/cluster/heartbeat");
+    assert_eq!(
+        client
+            .post(&url)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    // seed がなくても、認証を通過した heartbeat を拒否しない。
     let response = client
-        .post(format!("{base}/internal/cluster/heartbeat"))
-        .json(&serde_json::json!({}))
+        .post(&url)
+        .bearer_auth("example-token")
+        .json(&serde_json::json!({"public_url":base,"metric":100,"members":[]}))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     child.kill().await.unwrap();
+}
+
+/// token または公開 URL がない場合は、単独動作へ退避せず起動を失敗させる。
+#[tokio::test]
+async fn rejects_missing_required_environment_variables() {
+    for missing in ["EDAMAME_AUTH_TOKEN", "EDAMAME_PUBLIC_URL"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_edamame-controller"));
+        command
+            .env("EDAMAME_BIND", "127.0.0.1:0")
+            .env("EDAMAME_STORAGE_CAPACITY", "1MiB")
+            .env("EDAMAME_PLAYLIST_SEGMENTS", "6")
+            .env("EDAMAME_SYNC_INTERVAL_MS", "100")
+            .env("EDAMAME_SYNC_TIMEOUT_MS", "1000")
+            .env("EDAMAME_AUTH_TOKEN", "example-token")
+            .env("EDAMAME_PUBLIC_URL", "http://a.test")
+            .env_remove(missing)
+            .env_remove("EDAMAME_SEED")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "必須設定なしで起動した: {missing}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(if missing == "EDAMAME_AUTH_TOKEN" {
+                "--auth-token"
+            } else {
+                "--public-url"
+            }),
+            "想定と違うエラー: {stderr}"
+        );
+        assert!(
+            !stderr.contains("cluster is disabled"),
+            "無効化して起動してはいけない"
+        );
+    }
 }

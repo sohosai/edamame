@@ -47,7 +47,7 @@ pub struct Heartbeat {
 #[derive(Debug, Serialize)]
 pub struct Health {
     pub role: Role,
-    pub public_url: Option<String>,
+    pub public_url: String,
     pub metric: u32,
     pub leader_url: Option<String>,
 }
@@ -72,10 +72,9 @@ pub(crate) struct ClusterInner {
 
 /// HTTP 層が選出結果を参照できるよう、peer の監視状態を共有する。
 pub struct ClusterState {
-    public_url: Option<String>,
+    public_url: String,
     metric: u32,
-    enabled: bool,
-    auth_token: Option<String>,
+    pub(crate) auth_token: Arc<str>,
     pub(crate) inner: RwLock<ClusterInner>,
     pub(crate) client: reqwest::Client,
     pub(crate) refresh: Notify,
@@ -83,72 +82,38 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
-    /// seed と token がある場合だけ、初回の生存確認待ちで開始する。
+    /// peer がいない場合も同じ選出処理を使い、初回の生存確認待ちで開始する。
     pub fn new(
         config: &ControllerConfig,
         controller: Arc<ControllerState>,
     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let enabled = config.cluster_enabled();
-        let public_url = config
-            .public_url
-            .as_deref()
-            .map(normalize_public_url)
-            .transpose()?;
-        Self::build(
-            public_url,
-            config.metric.unwrap_or(0),
-            config.auth_token.clone(),
-            enabled.then(|| config.cluster_seeds()).transpose()?,
-            controller,
-        )
-    }
-
-    /// cluster を指定しない HTTP API でも、共通の役割判定を使えるようにする。
-    pub(crate) fn standalone(controller: Arc<ControllerState>) -> Arc<Self> {
-        Self::build(None, 0, None, None, controller).expect("HTTP client can be built")
-    }
-
-    /// seeds が None なら単独構成、空のリストでも Some なら選出待ちで開始する。
-    fn build(
-        public_url: Option<String>,
-        metric: u32,
-        auth_token: Option<String>,
-        seeds: Option<Vec<String>>,
-        controller: Arc<ControllerState>,
-    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let enabled = seeds.is_some();
+        config.validate()?;
+        let public_url = normalize_public_url(&config.public_url)?;
         let mut members = BTreeMap::new();
-        if let Some(seeds) = seeds {
-            for public_url in seeds {
-                eprintln!("cluster member added: {public_url}");
-                members.insert(
-                    public_url.clone(),
-                    PeerState {
-                        member: Peer {
-                            public_url,
-                            metric: 0,
-                            role: Role::Follower,
-                        },
-                        last_success: None,
-                        dead: false,
+        for public_url in config.cluster_seeds()? {
+            eprintln!("cluster member added: {public_url}");
+            members.insert(
+                public_url.clone(),
+                PeerState {
+                    member: Peer {
+                        public_url,
+                        metric: 0,
+                        role: Role::Follower,
                     },
-                );
-            }
+                    last_success: None,
+                    dead: false,
+                },
+            );
         }
         Ok(Arc::new(Self {
-            public_url: public_url.clone(),
-            metric,
-            enabled,
-            auth_token,
+            public_url,
+            metric: config.metric,
+            auth_token: Arc::from(config.auth_token.as_str()),
             inner: RwLock::new(ClusterInner {
-                role: if enabled {
-                    Role::Follower
-                } else {
-                    Role::Leader
-                },
-                leader_url: if enabled { None } else { public_url },
+                role: Role::Follower,
+                leader_url: None,
                 members,
-                initialized: !enabled,
+                initialized: false,
             }),
             // peer が別の follower を指しても、認証付き PUT を redirect で送らない。
             client: reqwest::Client::builder()
@@ -162,16 +127,11 @@ impl ClusterState {
 
     /// API の配置と転送先の組み立てに使う、公開 URL の path 接頭辞。
     pub(crate) fn path_prefix(&self) -> String {
-        self.public_url
-            .as_deref()
-            .map(|url| {
-                reqwest::Url::parse(url)
-                    .expect("validated public URL")
-                    .path()
-                    .trim_end_matches('/')
-                    .to_owned()
-            })
-            .unwrap_or_default()
+        reqwest::Url::parse(&self.public_url)
+            .expect("validated public URL")
+            .path()
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     pub async fn health(&self) -> Health {
@@ -187,7 +147,7 @@ impl ClusterState {
     /// 生存時刻を peer 間で混同しないよう、共有する情報だけを送信用に切り出す。
     fn snapshot(&self, inner: &ClusterInner) -> Heartbeat {
         Heartbeat {
-            public_url: self.public_url.clone().expect("cluster has public URL"),
+            public_url: self.public_url.clone(),
             metric: self.metric,
             role: inner.role,
             leader_url: inner.leader_url.clone(),
@@ -201,9 +161,6 @@ impl ClusterState {
 
     /// 送信元の生存確認と選出を反映し、更新後の状態を heartbeat の応答にする。
     pub async fn receive(&self, heartbeat: Heartbeat) -> Result<Heartbeat, EdamameError> {
-        if !self.enabled {
-            return Err(EdamameError::Unavailable("cluster is disabled".to_owned()));
-        }
         let mut inner = self.inner.write().await;
         self.merge(&mut inner, heartbeat, Instant::now())?;
         self.elect(&mut inner, Instant::now()).await;
@@ -229,7 +186,7 @@ impl ClusterState {
         for member in members {
             self.add_member(inner, member);
         }
-        if Some(&public_url) != self.public_url.as_ref() {
+        if public_url != self.public_url {
             self.add_member(
                 inner,
                 Peer {
@@ -255,9 +212,7 @@ impl ClusterState {
 
     /// 自分と既知の URL を除いて登録し、直接疎通するまでは選出対象にしない。
     fn add_member(&self, inner: &mut ClusterInner, member: Peer) {
-        if Some(&member.public_url) == self.public_url.as_ref()
-            || inner.members.contains_key(&member.public_url)
-        {
+        if member.public_url == self.public_url || inner.members.contains_key(&member.public_url) {
             return;
         }
         eprintln!("cluster member added: {}", member.public_url);
@@ -285,7 +240,7 @@ impl ClusterState {
         if !inner.initialized {
             return;
         }
-        let own_url = self.public_url.as_deref().expect("cluster has public URL");
+        let own_url = self.public_url.as_str();
         let leader = select_leader(
             own_url,
             self.metric,
@@ -319,9 +274,6 @@ impl ClusterState {
 
     /// 1 秒ごと、または中継失敗の通知時に全 peer を確認して選び直す。
     pub async fn run(self: Arc<Self>) {
-        if !self.enabled {
-            return;
-        }
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -340,11 +292,11 @@ impl ClusterState {
             for url in urls {
                 let client = self.client.clone();
                 let heartbeat = heartbeat.clone();
-                let token = self.auth_token.clone().expect("cluster has token");
+                let token = self.auth_token.clone();
                 requests.spawn(async move {
                     let response = client
                         .post(format!("{url}/internal/cluster/heartbeat"))
-                        .bearer_auth(token)
+                        .bearer_auth(token.as_ref())
                         .json(&heartbeat)
                         .timeout(HEARTBEAT_INTERVAL)
                         .send()
@@ -396,14 +348,21 @@ mod tests {
     #[tokio::test]
     async fn merges_members_without_gossip_extending_liveness() {
         let controller = ControllerState::new(crate::CanonicalStore::new(1024), 6, 100, 1000, 0, 1);
-        let cluster = ClusterState::build(
-            Some("http://a.test".to_owned()),
-            10,
-            Some("token".to_owned()),
-            Some(vec![]),
-            controller,
-        )
-        .unwrap();
+        let config = ControllerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            storage_capacity: 1024,
+            playlist_segments: 6,
+            sync_interval_ms: 100,
+            sync_timeout_ms: 1000,
+            publish_wait_ms: Some(0),
+            external_min_percent: 1,
+            cors_origin: vec![],
+            public_url: "http://a.test".to_owned(),
+            metric: 10,
+            auth_token: "token".to_owned(),
+            seed: vec![],
+        };
+        let cluster = ClusterState::new(&config, controller).unwrap();
         let now = Instant::now();
         let mut inner = cluster.inner.write().await;
         let peer = |url: &str, metric| Peer {

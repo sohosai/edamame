@@ -36,17 +36,10 @@ const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// 外部配信の登録に使う JSON ボディの上限
 const EXTERNAL_BODY_LIMIT: usize = 64 * 1024;
 
-/// cluster を指定しない利用でも、単独 leader として共通の役割判定を使う。
-pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins, auth_token: Option<&str>) -> Router {
-    let cluster = ClusterState::standalone(state.clone());
-    router_with_cluster(state, cors, auth_token, cluster)
-}
-
 /// 認証と CORS を転送処理の外側に置き、health と heartbeat は各機で処理する。
-pub fn router_with_cluster(
+pub fn router(
     state: Arc<ControllerState>,
     cors: &CorsOrigins,
-    auth_token: Option<&str>,
     cluster: Arc<ClusterState>,
 ) -> Router {
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
@@ -82,14 +75,10 @@ pub fn router_with_cluster(
         cluster.clone(),
         route_cluster,
     ));
-    // 認証は書き込み系の PUT だけに要求し、読み取りと sync には要求しない
-    let write = match auth_token {
-        Some(token) => write.layer(middleware::from_fn_with_state(
-            Arc::<str>::from(token),
-            authorize_put,
-        )),
-        None => write,
-    };
+    let write = write.layer(middleware::from_fn_with_state(
+        cluster.auth_token.clone(),
+        authorize_bearer,
+    ));
     let sync = Router::new().route(
         "/workers/{worker_id}/sync",
         post(post_sync).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
@@ -101,10 +90,9 @@ pub fn router_with_cluster(
     let internal = Router::new()
         .route("/internal/cluster/heartbeat", post(cluster_heartbeat))
         .layer(DefaultBodyLimit::max(REGISTER_BODY_LIMIT));
-    // cluster の無効時も内部 API を匿名では使わせない。
     let internal = internal.layer(middleware::from_fn_with_state(
-        auth_token.map(Arc::<str>::from),
-        authorize_heartbeat,
+        cluster.auth_token.clone(),
+        authorize_bearer,
     ));
     let prefix = cluster.path_prefix();
     let control = internal
@@ -131,23 +119,6 @@ async fn cluster_heartbeat(
     ValidatedJson(heartbeat): ValidatedJson<Heartbeat>,
 ) -> Result<Json<Heartbeat>, HttpError> {
     Ok(Json(cluster.receive(heartbeat).await?))
-}
-
-/// token 未設定時は認証を省略せず、内部 API を常に拒否する。
-async fn authorize_heartbeat(
-    State(expected): State<Option<Arc<str>>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if let Some(expected) = expected {
-        return authorize_put(State(expected), request, next).await;
-    }
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        "unauthorized",
-    )
-        .into_response()
 }
 
 /// leader 未確定や中継失敗の際に、1 秒後の再試行を促す応答。
@@ -254,8 +225,12 @@ async fn route_cluster(
     }
 }
 
-/// PUT の Authorization ヘッダーを検証する
-async fn authorize_put(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
+/// PUT と heartbeat を同じ Bearer token で認証する
+async fn authorize_bearer(
+    State(expected): State<Arc<str>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let authorized =
         bearer_token(request.headers()).is_some_and(|provided| tokens_match(provided, &expected));
     if authorized {
@@ -584,7 +559,7 @@ mod cluster_tests {
         let state = ControllerState::new(crate::CanonicalStore::new(1024), 6, 100, 1000, 0, 1);
         let cluster = ClusterState::new(&config, state.clone()).unwrap();
         // 実際の初期状態を使い、heartbeat を開始する前の応答を確認する。
-        let app = router_with_cluster(state.clone(), &CorsOrigins::Any, Some("token"), cluster);
+        let app = router(state.clone(), &CorsOrigins::Any, cluster);
         for (method, path) in [
             (Method::GET, "/segments/live/720p/0.ts"),
             (Method::PUT, "/workers/a"),

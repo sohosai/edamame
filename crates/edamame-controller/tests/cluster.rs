@@ -40,11 +40,12 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
     let high_addr = available_addr();
     let low_url = format!("http://{low_addr}");
     let high_url = format!("http://{high_addr}");
-    let low = spawn_cluster_process(low_addr, 10, std::slice::from_ref(&high_url), "").await;
+    // seed なしの機体でも、後から接触した peer を選出に取り込む。
+    let low = spawn_cluster_process(low_addr, 100, &[], "").await;
     wait_for_role(&client, &low_url, "leader", &low_url).await;
     assert_eq!(publish(&client, &low_url, "before-0", "old-0").await, 0);
     assert_eq!(publish(&client, &low_url, "before-1", "old-1").await, 1);
-    let mut high = spawn_cluster_process(high_addr, 20, std::slice::from_ref(&low_url), "").await;
+    let mut high = spawn_cluster_process(high_addr, 200, std::slice::from_ref(&low_url), "").await;
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     let health: Value = client
@@ -56,7 +57,7 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
         .await
         .unwrap();
     assert_eq!(health["public_url"], low_url);
-    assert_eq!(health["metric"], 10);
+    assert_eq!(health["metric"], 100);
 
     // follower の認証を通過し、採番と保存は leader が行う。
     assert_eq!(publish(&client, &low_url, "first", "first-body").await, 0);
@@ -223,7 +224,7 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
     wait_for_playlist(&following, &playlist_url).await;
 
     // 上位機の復帰で戻し、直前の採番と worker のキャッシュが失われる。
-    let mut high = spawn_cluster_process(high_addr, 20, std::slice::from_ref(&low_url), "").await;
+    let mut high = spawn_cluster_process(high_addr, 200, std::slice::from_ref(&low_url), "").await;
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     let absent = following

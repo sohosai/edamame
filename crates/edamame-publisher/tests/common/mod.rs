@@ -13,7 +13,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-use edamame_controller::{CanonicalStore, ControllerState, router as controller_router};
+use edamame_controller::cluster::{ClusterState, Role};
+use edamame_controller::{
+    CanonicalStore, ControllerConfig, ControllerState, router as controller_router,
+};
 use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router as worker_router, run_sync_loop};
 
@@ -56,7 +59,8 @@ fn cors() -> CorsOrigins {
 }
 
 /// HTTP サーバーを別スレッドで起動し、待ち受け先の URL を返す
-fn serve(app: axum::Router) -> String {
+fn serve(state: Arc<ControllerState>, auth_token: &str) -> String {
+    let auth_token = auth_token.to_owned();
     let (sender, receiver) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -67,6 +71,28 @@ fn serve(app: axum::Router) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("待ち受けできません");
+            let addr = listener.local_addr().expect("アドレスを読めません");
+            let config = ControllerConfig {
+                bind: addr,
+                storage_capacity: 16 * 1024 * 1024,
+                playlist_segments: 6,
+                sync_interval_ms: 1000,
+                sync_timeout_ms: 10000,
+                publish_wait_ms: Some(0),
+                external_min_percent: 1,
+                cors_origin: vec![],
+                public_url: format!("http://{addr}"),
+                metric: 100,
+                auth_token,
+                seed: vec![],
+            };
+            let cluster = ClusterState::new(&config, state.clone()).expect("cluster を作れません");
+            tokio::spawn(cluster.clone().run());
+            // publisher が最初の PUT を送る前に、初回の選出を完了させる。
+            while cluster.health().await.role != Role::Leader {
+                tokio::task::yield_now().await;
+            }
+            let app = controller_router(state, &cors(), cluster);
             sender
                 .send(listener.local_addr().expect("アドレスを読めません"))
                 .expect("アドレスを渡せません");
@@ -108,7 +134,7 @@ impl Controller {
         // 外部配信へ振り分ける割合は controller のテストと同じ 1 % にし、外部配信は設定しない
         let store = CanonicalStore::new(16 * 1024 * 1024);
         let state = ControllerState::new(store, 6, 1000, 10000, 0, 1);
-        let base_url = serve(controller_router(state.clone(), &cors(), Some(auth_token)));
+        let base_url = serve(state.clone(), auth_token);
         Self { base_url, state }
     }
 

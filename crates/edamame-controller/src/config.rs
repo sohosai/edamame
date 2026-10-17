@@ -65,10 +65,9 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_PUBLISH_WAIT_MS")]
     pub publish_wait_ms: Option<u64>,
 
-    /// PUT の認証に使うトークン
-    /// 省略すると認証は無効になり、controller の起動時に警告を出す
+    /// PUT と heartbeat に共通の認証トークン
     #[arg(long, env = "EDAMAME_AUTH_TOKEN", hide_env_values = true)]
-    pub auth_token: Option<String>,
+    pub auth_token: String,
 
     /// ブラウザからの読み取りを許可する origin。`none` で無効、`*` ですべて許可
     #[arg(long, value_delimiter = ',', env = "EDAMAME_CORS_ORIGIN")]
@@ -76,11 +75,11 @@ pub struct ControllerConfig {
 
     /// peer、worker、client のすべてから到達できる URL
     #[arg(long, env = "EDAMAME_PUBLIC_URL", value_parser = normalize_public_url)]
-    pub public_url: Option<String>,
+    pub public_url: String,
 
     /// leader の優先度。大きい値を優先する
-    #[arg(long, env = "EDAMAME_METRIC")]
-    pub metric: Option<u32>,
+    #[arg(long, env = "EDAMAME_METRIC", default_value_t = 100)]
+    pub metric: u32,
 
     /// 最初に接触する controller の URL。カンマ区切りと繰り返しを許可する
     #[arg(long, env = "EDAMAME_SEED", value_delimiter = ',', value_parser = normalize_public_url)]
@@ -113,44 +112,26 @@ impl ControllerConfig {
                 "sync timeout must be positive".to_owned(),
             ));
         }
-        if let Some(token) = &self.auth_token {
-            validate_auth_token(token)?;
-        }
+        validate_auth_token(&self.auth_token)?;
         if self.external_min_percent > 100 {
             return Err(EdamameError::BadRequest(
                 "external min percent must be 100 or less".to_owned(),
             ));
         }
-        if !self.seed.is_empty() && (self.public_url.is_none() || self.metric.is_none()) {
-            return Err(EdamameError::BadRequest(
-                "--seed requires --public-url and --metric".to_owned(),
-            ));
-        }
-        if let Some(url) = &self.public_url {
-            normalize_public_url(url)?;
-        }
+        normalize_public_url(&self.public_url)?;
         for seed in &self.seed {
             normalize_public_url(seed)?;
         }
         Ok(())
     }
 
-    /// seed を指定しても、共通 token がなければ cluster を有効にしない。
-    pub fn cluster_enabled(&self) -> bool {
-        !self.seed.is_empty() && self.auth_token.is_some()
-    }
-
     /// 正規化した URL で重複と自分自身を除き、最初の接触先を返す。
     pub fn cluster_seeds(&self) -> Result<Vec<String>, EdamameError> {
-        let own = self
-            .public_url
-            .as_deref()
-            .map(normalize_public_url)
-            .transpose()?;
+        let own = normalize_public_url(&self.public_url)?;
         let mut seeds = Vec::new();
         for seed in &self.seed {
             let seed = normalize_public_url(seed)?;
-            if own.as_ref() != Some(&seed) && !seeds.contains(&seed) {
+            if own != seed && !seeds.contains(&seed) {
                 seeds.push(seed);
             }
         }
@@ -185,11 +166,11 @@ mod tests {
             sync_interval_ms: 1000,
             sync_timeout_ms: 10000,
             publish_wait_ms: None,
-            auth_token: None,
+            auth_token: "example-token".to_owned(),
             cors_origin: Vec::new(),
             external_min_percent: 1,
-            public_url: None,
-            metric: None,
+            public_url: "http://127.0.0.1:9000".to_owned(),
+            metric: 100,
             seed: Vec::new(),
         }
     }
@@ -264,23 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn treats_missing_auth_token_as_disabled() {
-        let mut config = config();
-        config.auth_token = None;
-        config.validate().unwrap();
-    }
-
-    #[test]
     fn accepts_auth_token() {
         let mut config = config();
-        config.auth_token = Some("example-token".to_owned());
+        config.auth_token = "example-token".to_owned();
         config.validate().unwrap();
     }
 
     #[test]
     fn rejects_empty_auth_token() {
         let mut config = config();
-        config.auth_token = Some(String::new());
+        config.auth_token = String::new();
         assert!(config.validate().is_err());
     }
 
@@ -312,35 +286,59 @@ mod tests {
         assert_eq!(delimiter, Some(','));
     }
 
+    const CLI_ARGS: &[&str] = &[
+        "controller",
+        "--bind",
+        "127.0.0.1:0",
+        "--storage-capacity",
+        "1MiB",
+        "--playlist-segments",
+        "6",
+        "--sync-interval-ms",
+        "100",
+        "--sync-timeout-ms",
+        "1000",
+        "--public-url",
+        "http://a.test",
+        "--auth-token",
+        "example-token",
+    ];
+
     #[test]
-    fn validates_cluster_option_combinations() {
-        for public_url in [None, Some("https://a.test/base".to_owned())] {
-            for metric in [None, Some(0), Some(u32::MAX)] {
-                for token in [None, Some("token".to_owned())] {
-                    let mut config = config();
-                    config.public_url = public_url.clone();
-                    config.metric = metric;
-                    config.auth_token = token;
-                    config.validate().unwrap();
-                    assert!(!config.cluster_enabled());
-                    config.seed = vec!["http://b.test".to_owned()];
-                    // token の有無にかかわらず、seed を指定したら URL と metric を揃える。
-                    assert_eq!(
-                        config.validate().is_ok(),
-                        public_url.is_some() && metric.is_some()
-                    );
-                    if config.validate().is_ok() {
-                        assert_eq!(config.cluster_enabled(), config.auth_token.is_some());
-                    }
-                }
-            }
+    fn requires_public_url_and_auth_token_without_seeds() {
+        for option in ["--public-url", "--auth-token"] {
+            let mut args = CLI_ARGS.to_vec();
+            let index = args.iter().position(|arg| *arg == option).unwrap();
+            args.drain(index..index + 2);
+            let error = ControllerConfig::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains(option));
+        }
+    }
+
+    #[test]
+    fn defaults_metric_to_100_and_accepts_explicit_boundaries() {
+        let config = ControllerConfig::try_parse_from(CLI_ARGS).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.metric, 100);
+        assert!(config.seed.is_empty());
+        for metric in ["0", "4294967295"] {
+            let config = ControllerConfig::try_parse_from(
+                CLI_ARGS.iter().copied().chain(["--metric", metric]),
+            )
+            .unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.metric, metric.parse::<u32>().unwrap());
         }
     }
 
     #[test]
     fn normalizes_cluster_urls_and_deduplicates_seeds() {
         let mut config = config();
-        config.public_url = Some("https://A.test/base/".to_owned());
+        config.public_url = "https://A.test/base/".to_owned();
         config.seed = vec![
             "https://a.test/base".to_owned(),
             "https://B.test/".to_owned(),
@@ -355,19 +353,6 @@ mod tests {
 
     #[test]
     fn rejects_invalid_cluster_urls_and_metric() {
-        let base = [
-            "controller",
-            "--bind",
-            "127.0.0.1:0",
-            "--storage-capacity",
-            "1MiB",
-            "--playlist-segments",
-            "6",
-            "--sync-interval-ms",
-            "100",
-            "--sync-timeout-ms",
-            "1000",
-        ];
         for option in ["--public-url", "--seed"] {
             for url in [
                 "/relative",
@@ -375,29 +360,35 @@ mod tests {
                 "http://a.test/?q=1",
                 "http://a.test/#fragment",
             ] {
-                assert!(
-                    ControllerConfig::try_parse_from(base.into_iter().chain([option, url]))
-                        .is_err()
-                );
+                let mut args = CLI_ARGS.to_vec();
+                if option == "--public-url" {
+                    let index = args.iter().position(|arg| *arg == option).unwrap();
+                    args[index + 1] = url;
+                } else {
+                    args.extend([option, url]);
+                }
+                let error = ControllerConfig::try_parse_from(args).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
             }
         }
         assert!(
-            ControllerConfig::try_parse_from(base.into_iter().chain(["--metric", "4294967296"]))
-                .is_err()
+            ControllerConfig::try_parse_from(
+                CLI_ARGS.iter().copied().chain(["--metric", "4294967296"])
+            )
+            .is_err()
         );
-        let config = ControllerConfig::try_parse_from(base.into_iter().chain([
-            "--public-url",
-            "https://A.test/base/",
-            "--metric",
-            "0",
+        let mut args = CLI_ARGS.to_vec();
+        let index = args.iter().position(|arg| *arg == "--public-url").unwrap();
+        args[index + 1] = "https://A.test/base/";
+        args.extend([
             "--seed",
             "https://b.test,http://c.test",
             "--seed",
             "http://d.test/",
-        ]))
-        .unwrap();
+        ]);
+        let config = ControllerConfig::try_parse_from(args).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.public_url.as_deref(), Some("https://a.test/base"));
+        assert_eq!(config.public_url, "https://a.test/base");
         assert_eq!(config.cluster_seeds().unwrap().len(), 3);
     }
 
