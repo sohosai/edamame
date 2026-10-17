@@ -1,45 +1,74 @@
 # HTTP API
 
-この文書は controller と worker が提供する HTTP API の仕様を定める。
-外部ソフトウェアは publisher と client としてこの API を使う。
+この文書では、`controller` と `worker` が提供する HTTP API の仕様を説明する。
+全体構成と用語の定義は [docs/README.md](./README.md) で説明する。
+
+## エンドポイント一覧
+
+| 提供元 | メソッドとパス | 呼び出し元 | 認証 | 用途 |
+| --- | --- | --- | --- | --- |
+| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（任意設定） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
+| controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（任意設定） | 外部配信のマスタープレイリスト URL の登録と解除 |
+| controller | `PUT /workers/{worker_id}` | worker | Bearer（任意設定） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
+| controller | `POST /workers/{worker_id}/sync` | worker | なし | キャッシュ状況の報告と不足セグメント（`fetch_segments`）の取得指示 |
+| controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | 正規セグメントファイルの取得（キャッシュ用） |
+| controller | `GET /channels/{channel_id}/master.m3u8` | client / publisher | なし | マスタープレイリストの取得（または外部配信への `302` リダイレクト） |
+| controller | `GET /channels/{channel_id}/{quality}.m3u8` | client / publisher | なし | 画質（`quality`）別のメディアプレイリストの取得 |
+| worker | `GET /segments/{channel_id}/{quality}/{filename}` | client | なし | キャッシュ済みセグメントファイルの配信 |
+
+以下の例では、`controller` の URL を `http://127.0.0.1:9000`、`worker` の `public_url` を `http://127.0.0.1:9001` とする。
+`controller` の `--bind` は待ち受けアドレスであり、`client` や `worker` が接続する URL ではない。
+`0.0.0.0` などで待ち受ける場合、`client` は `controller` に到達できる URL を基底 URL として使い、`worker` も同様に到達できる URL を `--controller-url` に指定する。
 
 ## 共通ルール
 
-- 例として controller の URL を `http://127.0.0.1:9000`、worker の `public_url` を `http://127.0.0.1:9001` とする
-- controller の `--bind` は待ち受けるアドレスであり、client や worker が接続する URL ではない。`0.0.0.0` などで待ち受ける場合、client は controller に到達できる URL を base URL として使い、worker は同様に到達できる URL を `--controller-url` に指定する
-- `channel_id`、`quality`、`worker_id` は `[A-Za-z0-9_-]` の 1 文字以上 64 文字以下とし、それ以外は 400 で拒否する
-- `quality` に `master` は使えず、使った場合は 400 で拒否する
-- セグメント識別子（`identifier`）は `[A-Za-z0-9_-]` の 1 文字以上 64 文字以下とし、それ以外は 400 で拒否する
-- `sequence` はセグメント番号を表し、10 進数の u64 として先頭に 0 を付けず、ファイル名は `{sequence}.ts` だけを許可する
-- JSON を送るリクエストの Content-Type は `application/json` とする
+### 識別子とファイル名の形式
+
+- `channel_id`、`quality`、`worker_id`、およびセグメント識別子（`identifier`）は `[A-Za-z0-9_-]` の 1 文字以上 64 文字以下とし、それ以外は `400 Bad Request` で拒否する
+- `quality` に `master` は使えず、指定した場合は `400 Bad Request` で拒否する
+- `sequence` はセグメント番号を表し、先頭に不要な `0` を付けない 10 進数の `u64` とする。セグメント取得時のファイル名は `{sequence}.ts` だけを許可する
+
+### リクエストとレスポンスの形式
+
+- JSON を送るリクエストの Content-Type は `application/json` とする。Content-Type の不一致、JSON の構文エラー、型の不一致、必須項目の欠落はすべて `400 Bad Request` を返す
+- リクエストボディのサイズ上限は、`PUT /segments/...` と `POST /workers/{worker_id}/sync` が 64 MiB、`PUT /workers/{worker_id}` が 4 MiB、`PUT /channels/{channel_id}/external` が 64 KiB とする。JSON エンドポイントで上限を超えた場合は `400 Bad Request`、`PUT /segments/...` で上限を超えた場合は `413 Payload Too Large` を返す
 - JSON を返すレスポンスの Content-Type は `application/json` とする
-- エラー本文は英語の plain text とし、Content-Type は `text/plain; charset=utf-8` とする
 - プレイリストの Content-Type は `application/vnd.apple.mpegurl`、セグメントファイルの Content-Type は `application/octet-stream` とする
-- controller は `--auth-token` を指定したときだけ PUT に `Authorization: Bearer {token}` を要求し、ヘッダーがない、またはトークンが一致しない場合は 401 を返す。GET と POST は認証を要求しない
-- ブラウザからは GET だけ cross-origin で読める。許可する origin は controller と worker の `--cors-origin` で指定し、省略すると CORS ヘッダを返さない
-- ステータスコードは 401、400、404、422、503 の順に判定し、認証がなければ 401、入力が不正なら 400、対象が存在しなければ 404、公開範囲のセグメントファイルが欠落していれば 422、公開範囲または配信先 worker がなければ 503 を返す
-- 予期しない内部エラーは 500 を返す
+- エラー応答の本文は英語の plain text とし、Content-Type は `text/plain; charset=utf-8` とする
+
+### 認証と CORS
+
+- `controller` は `--auth-token` を指定したときだけ、すべての `PUT` エンドポイントに `Authorization: Bearer {token}` を要求する。ヘッダがない場合やトークンが一致しない場合は、`WWW-Authenticate: Bearer` ヘッダを付けて `401 Unauthorized` を返す。`GET` と `POST` は認証を要求しない
+- ブラウザからは `GET` だけ cross-origin で読み取れる。許可する origin は `controller` と `worker` の `--cors-origin`（`*`、`none`、またはカンマ区切りの origin 一覧。`*` や `none` は他の値と混在不可）で指定し、省略または `none` を指定すると CORS ヘッダを返さない
+
+### ステータスコードの判定順
+
+- 基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
+- 予期しない内部エラーは `500 Internal Server Error` を返す
 
 ## controller の API
 
-### セグメントファイルを登録する
+### セグメントファイルを登録する（publisher 用）
 
 ```
 PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}&iv={iv}
 ```
 
-publisher が正規セグメントファイルを登録する。
-`identifier` はセグメントごとに publisher が付ける識別子であり、同じセグメントには quality をまたいで同じ値を使う。
-`duration_ms` と `bandwidth` は必須で、`resolution` と `key_uri` と `iv` は任意とする。
-`duration_ms` は 500 以上の整数、`bandwidth` は正の整数、`resolution` は `{width}x{height}` の形式にする。
-IV は query の `iv` で指定する。
-`iv` は 16 byte を表す 32 文字の hex とし、大文字小文字は問わない。
-controller は小文字にそろえて保存する。
-`iv` は `key_uri` と組で使い、`key_uri` を指定しない PUT に `iv` だけを付けても受け付けない。
-`key_uri` と `iv` は他の属性と異なり、変更しても競合として扱わない。
-同じ識別子の再 PUT では、最後に受け取った組でそのセグメントの指定を置き換える。
-省略した場合は暗号化なしに戻す。
-controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。
+`publisher` が正規セグメントファイルを登録する。
+`channel_id` と `quality` を事前に作成する専用の API はなく、最初のセグメントファイルを `PUT` した時点で自動的に作られる。
+`controller` が `--auth-token` を指定している場合は、`Authorization: Bearer {token}` ヘッダを付ける。
+
+`identifier` はセグメントごとに `publisher` が付ける識別子である。
+画質が複数あっても、同じ時間帯のセグメントには同じ識別子を使う。
+クエリパラメータのうち、`duration_ms` と `bandwidth` は必須であり、`resolution`、`key_uri`、`iv` は省略できる。
+`duration_ms` にはセグメント長をミリ秒で表す 500 以上の整数、`bandwidth` にはビットレートを bit/s で表す正の整数、`resolution` には解像度を表す `{width}x{height}` の形式を指定する。
+
+セグメントを暗号化する場合は、暗号鍵の取得先 URL を `key_uri` に指定し、必要に応じて初期化ベクトルを `iv` に指定する。
+`iv` は 16 バイトを表す 32 文字の 16 進数で指定し、大文字と小文字のどちらでもよい。
+`controller` は `iv` を小文字にそろえて保存する。
+`iv` は `key_uri` と組で使うため、`key_uri` を指定せずに `iv` だけを付けると `400 Bad Request` になる。
+`key_uri` と `iv` は他の属性と異なり、同じ識別子の再 `PUT` で値を変えても競合（`409 Conflict`）にはならない。
+最後に受け取った組でそのセグメントの暗号化指定を置き換え、省略した場合は暗号化なしに戻す。
 
 例：
 
@@ -50,7 +79,7 @@ curl -i -X PUT \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
 
-暗号化するセグメントは暗号鍵の URI と IV を付けて PUT する。
+暗号化するセグメントは暗号鍵の URI と IV を付けて `PUT` する。
 
 ```bash
 curl -i -X PUT \
@@ -67,49 +96,42 @@ curl -i -X PUT \
 }
 ```
 
-controller は新しい識別子に channel ごとの連番を割り当てる。
-連番は起動するたびに 0 から始める。
-同じ channel では、同じ識別子には quality が違っても同じ番号を割り当てる。
-同じ識別子の再 PUT には、割り当て済みの番号を返す。
+`controller` は新しい識別子に `channel` ごとの連番を割り当てる。
+連番は起動するたびに `0` から始める。
+同じ `channel` では、同じ識別子には `quality` が違っても同じ番号を割り当て、同じ識別子の再 `PUT` には割り当て済みの番号を返す。
 
 ステータス：
 
 - `201 Created`：新しいセグメントファイルを保存した
-- `200 OK`：同じ識別子、同じ quality、同じバイト列のセグメントファイルがすでにある
-- `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
+- `200 OK`：同じ識別子、同じ `quality`、同じバイト列のセグメントファイルがすでにある
+- `401 Unauthorized`：`Authorization` ヘッダがない、またはトークンが一致しない
 - `400 Bad Request`：識別子、`duration_ms`、`bandwidth`、`resolution`、`key_uri`、`iv` の形式が不正、`iv` を `key_uri` なしで指定した、または `duration_ms` が 500 未満
-- `409 Conflict`：保存されている同じ識別子で違うバイト列のセグメントファイルがある、同じ quality に異なる `bandwidth` や `resolution` がある、または同じ channel の他のセグメントファイルと違う `duration_ms` を指定した
-- `413 Payload Too Large`：セグメントファイルが `--storage-capacity` より大きい
+- `409 Conflict`：保存されている同じ識別子で違うバイト列のセグメントファイルがある、同じ `quality` に異なる `bandwidth` や `resolution` がある、または同じ `channel` の他のセグメントファイルと違う `duration_ms` を指定した
+- `413 Payload Too Large`：セグメントファイルが `--storage-capacity` またはリクエスト上限（64 MiB）より大きい
 - `500 Internal Server Error`：セグメント番号の上限に達した
 
-同じセグメントファイルの再 PUT では、`duration_ms` がすでに決まっている値と違う場合も 409 とする。
-`resolution` は省略できる。
-すでに決まっている値と違う値を指定した場合は 409 とする。
-`bandwidth` は quality ごとに 1 つの値に固定する。
-2 つ目以降のセグメントファイルで違う値を指定した場合は 409 とする。
+#### セグメント属性の一貫性と再登録の扱い
 
-同じ channel の全セグメントの `duration_ms` は同じ値でなければならない。
-最初に成功した PUT の `duration_ms` からセグメント長の基準値を決める。
-基準値は `duration_ms` を秒に直し、小数点以下を切り上げた整数（最低 1）とする。
-2 つ目以降の PUT で違う `duration_ms` を指定した場合は 409 とする。
+- `duration_ms`（`channel` 単位で固定）：同じ `channel` の全セグメントで同じ値でなければならない。最初に成功した `PUT` の `duration_ms` を秒に直して小数点以下を切り上げた整数（下限は 1）が、その `channel` の `#EXT-X-TARGETDURATION` の基準値になる。2 つ目以降の `PUT`（再 `PUT` を含む）で異なる `duration_ms` を指定した場合は `409 Conflict` を返す
+- `bandwidth`（`quality` 単位で固定）：`quality` の最初の `PUT` で決まり、2 つ目以降の `PUT` で異なる値を指定した場合は `409 Conflict` を返す
+- `resolution`（`quality` 単位で固定、省略可）：未設定の `quality` には後から指定でき、一度決まった後に省略した `PUT` は既存の値を維持する。すでに決まっている値と異なる値を指定した場合は `409 Conflict` を返す
 
-controller を再起動すると保存済みのセグメントファイルと識別子とセグメント番号の対応は失われ、セグメント番号は 0 から始まる。
-再起動後に同じ識別子を PUT すると、新しい番号を割り当てて保存する。
-容量超過で削除された識別子も、別の quality に同じ識別子が保存されていなければ、再 PUT には新しい番号を割り当てる。
+`controller` を再起動すると、保存済みのセグメントファイルおよび識別子とセグメント番号の対応は失われ、セグメント番号は `0` から始まる。
+再起動後に以前と同じ識別子を `PUT` すると、新しい番号を割り当てて保存する。
+容量超過で削除された識別子についても、別の `quality` に同じ識別子が残っていなければ、再 `PUT` には新しい番号を割り当てる。
 
-### channel の外部配信を登録する
+### channel の外部配信を登録する（publisher 用）
 
 ```
 PUT /channels/{channel_id}/external
 ```
 
-publisher が channel の外部配信の master m3u8 の URL を登録する。
-`external_m3u8` は host を持つ `http` または `https` の絶対 URL とする。
-fragment は含めず、query は含めてもよい。
-`null` を送ると登録を取り消す。
-controller は登録された URL を取得せず、client が外部配信から直接取得する。
-channel は最初のセグメントファイルを PUT したときに作られる。
-channel がまだない場合は 404 を返す。
+`publisher` が、別 CDN などで同じ番組を配信している外部配信のマスタープレイリスト URL を登録する。
+登録すると、`GET /channels/{channel_id}/master.m3u8` へのアクセスの一部または全部を `302 Found` でその URL へリダイレクトできるようになる。
+`external_m3u8` は host を持つ `http` または `https` の絶対 URL とし、fragment は含めず、query は含めてもよい。
+`null`（またはフィールドを省略した `{}`）を送ると登録を取り消す。
+`controller` は登録された URL を取得せず、`client` が外部配信から直接取得する。
+`channel` は最初のセグメントファイルを `PUT` したときに作られるため、`channel` がまだない場合は `404 Not Found` を返す。
 
 リクエスト：
 
@@ -133,68 +155,12 @@ curl -i -X PUT \
 
 ステータス：
 
-- `204 No Content`：登録した
+- `204 No Content`：登録または解除した
 - `400 Bad Request`：`channel_id` または `external_m3u8` の形式が不正である
 - `401 Unauthorized`：`--auth-token` を指定しているのにトークンがない、または一致しない
-- `404 Not Found`：channel が存在しない
+- `404 Not Found`：`channel` が存在しない
 
-### セグメントファイルを取得する
-
-```
-GET /segments/{channel_id}/{quality}/{filename}
-```
-
-worker が正規セグメントファイルを取得するときに使う。
-controller はメモリに保存しているセグメントファイルを返す。
-容量を超えて削除されたセグメントファイルと、controller の再起動で失われたセグメントファイルは 404 になる。
-
-ステータス：
-
-- `200 OK`：セグメントファイルのバイト列を返す
-- `400 Bad Request`：識別子またはファイル名が不正である
-- `404 Not Found`：セグメントファイルが存在しない
-
-### マスタープレイリストを取得する
-
-```
-GET /channels/{channel_id}/master.m3u8
-```
-
-出力は [HLS の出力](./hls.md) に従う。
-
-ステータス：
-
-- `200 OK`：マスタープレイリストを返す
-- `302 Found`：外部配信へ振り分ける。`Location` に登録された外部配信の master m3u8 の URL を返す
-- `400 Bad Request`：`channel_id` が不正である、または query の `external` に 1 と 0 以外の値を指定した
-- `404 Not Found`：channel が存在しない
-- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
-- `503 Service Unavailable`：配信できる quality がない
-
-quality 間で公開範囲が違ってもよい。
-query に `external=1` を付けると外部配信へ振り分け、`external=0` を付けると自前のマスタープレイリストを返す。
-省略時は、接続元の IP と channel から決まる値と、その時点の公開の遅れに応じた外部配信の割合とを比較し、リクエストごとに振り分けを判定する。
-割合が変われば、同じ接続元と channel でも判定結果が変わることがある。
-`external=0` は publisher が自前の採番を確認するために使う。
-外部配信が登録されていなければ 302 は返さず、`external=1` でも自前のマスタープレイリストを返す。
-
-### メディアプレイリストを取得する
-
-```
-GET /channels/{channel_id}/{quality}.m3u8
-```
-
-出力は [HLS の出力](./hls.md) に従う。
-
-ステータス：
-
-- `200 OK`：メディアプレイリストを返す
-- `400 Bad Request`：`channel_id` または `quality` が不正である
-- `404 Not Found`：channel または quality が存在しない
-- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
-- `503 Service Unavailable`：その quality の公開範囲または配信先 worker がない
-
-### worker を登録する
+### worker を登録する（worker 用）
 
 ```
 PUT /workers/{worker_id}
@@ -209,17 +175,16 @@ PUT /workers/{worker_id}
 }
 ```
 
-`public_url` は `http` または `https` で始まる絶対 URL とする。
-末尾の `/` は取り除いて保存する。
-query と fragment を含めない。
-パスを含めてもよい。
-その場合はパスの後ろに `/segments/...` を付けた URL をプレイリストに書く。
-`weight` は worker の重みを表す 1 以上の整数とする。
-controller は配信先の worker を選ぶときにこの値を使い、重みが大きい worker ほど多く選ばれる。
-worker は起動時に登録する。
-controller が `--auth-token` を指定している場合は `Authorization: Bearer {token}` を付ける。
-worker は `--auth-token` を指定すると、この PUT に同じトークンを付ける。
-controller に worker が登録されていない場合、worker は sync の 404 を受けて再登録する。
+`public_url` には、`client` がアクセスする `http` または `https` の絶対 URL を指定する。
+query と fragment は含めず、末尾に `/` がある場合は取り除いて保存する。
+URL にパスを含めた場合は、そのパスの後ろに `/segments/...` を続けた URL をメディアプレイリストに出力する。
+`weight` には、`worker` の重みを表す 1 以上の整数を指定する。
+`controller` は配信先の `worker` を選ぶときにこの値を使い、重みが大きい `worker` ほど高い割合で選ぶ。
+
+`worker` は起動時にこのエンドポイントを呼んで自身を登録する。
+`controller` が `--auth-token` を指定している場合は、`worker` 側にも同じ `--auth-token` を指定して `Authorization: Bearer {token}` を送る。
+`controller` の再起動などで登録が失われた場合、`worker` は `sync` の `404 Not Found` を受け取った時点で再登録を行う。
+`worker` は登録のたびに手元のキャッシュを捨てて取り直すため、`controller` も登録に合わせて報告済みのキャッシュを無効にする。
 
 レスポンス：
 
@@ -229,24 +194,37 @@ controller に worker が登録されていない場合、worker は sync の 40
 }
 ```
 
-worker は `sync_interval_ms` の間隔で sync を送る。
-`sync_interval_ms` は正の整数とし、worker は次に登録するまでこの値を使う。
-ステータスが 201 と 200 のどちらでも、レスポンスは同じ形式とする。
+`worker` は次に登録するまで、返された `sync_interval_ms`（正の整数）の間隔で `sync` を送る。
+ステータスが `201` と `200` のどちらでも、レスポンスは同じ形式になる。
 
 ステータス：
 
-- `201 Created`：新しい worker を登録し、タイムアウトの基準時刻を現在時刻にする
-- `200 OK`：登録済みの worker の `public_url` と `weight` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は変えず、sync だけで更新する
-- `401 Unauthorized`：`Authorization` ヘッダーがない、またはトークンが一致しない
-- `400 Bad Request`：`worker_id`、`public_url` または `weight` が不正である
+- `201 Created`：新しい `worker` を登録し、タイムアウトの基準時刻を現在時刻にする
+- `200 OK`：登録済みの `worker` の `public_url` と `weight` を更新し、報告済みのキャッシュを無効にする。タイムアウトの基準時刻は更新しないため、直後に `sync` を送らなければ `--sync-timeout-ms` の経過で配信候補から外れる
+- `401 Unauthorized`：`Authorization` ヘッダがない、またはトークンが一致しない
+- `400 Bad Request`：`worker_id`、`public_url`、または `weight` が不正である
 
-worker は登録のたびにキャッシュを捨てて取り直すため、controller も登録に合わせて報告済みのキャッシュを無効にする。
-sync が `--sync-timeout-ms` を超えて届かない worker は配信先の候補から外れる。
-
-### worker を同期する
+### worker を同期する（worker 用）
 
 ```
 POST /workers/{worker_id}/sync
+```
+
+`sync` は `worker` が開始する pull 方式の同期処理である。
+`controller` から `worker` へセグメントファイルのバイト列を直接 `PUT` することはない。
+
+```text
+worker                           controller
+  |                                       |
+  |-- POST /workers/{id}/sync ----------->|
+  |   cached_segments, fetching_segments  |
+  |                                       |  公開範囲を評価する
+  |<-- fetch_segments --------------------|
+  |                                       |
+  |-- GET /segments/... ----------------->|
+  |<-- bytes -----------------------------|
+  |                                       |
+  |   次の sync でキャッシュ内容を報告する |
 ```
 
 リクエスト：
@@ -272,71 +250,95 @@ POST /workers/{worker_id}/sync
 }
 ```
 
-worker は登録時に受け取った `sync_interval_ms` の間隔でこのエンドポイントを呼ぶ。
-リクエストのキャッシュ一覧（`cached_segments`）には、その時点でキャッシュしているセグメントファイルをすべて入れる。
-取得中の一覧（`fetching_segments`）には、その時点で取得しているセグメントを入れる。
-controller は同じセグメント番号に別のバイト列で保存し直したとき、この一覧とキャッシュ一覧を使って、古い内容を保持する worker に再取得を指示する。
-controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
-`fetch_segments` には、キャッシュ対象のうちキャッシュ一覧に含まれないセグメント（未キャッシュのセグメント）を入れる。
-同じセグメント番号に別のバイト列で保存し直したセグメントも `fetch_segments` に入る。worker は取得し直してキャッシュを上書きする。
-ここでキャッシュ対象とは、全 channel と全 quality の直近のセグメントの範囲に存在するセグメントの集合である。
-`fetch_segments` の各項目は `channel_id`、`quality`、`sequence` を持ち、worker は `{sequence}.ts` を取得する。
-controller は最初の未公開セグメントファイルを PUT した時刻から、`--publish-wait-ms` で指定した時間を公開待ちとする。
-追加の PUT では公開待ちを延長しない。
-公開待ちの間は、未公開セグメントを公開範囲の候補に含めない。
-公開待ちが終わった範囲について、sync が届いている worker が連続してキャッシュしている最新範囲を、その quality の公開範囲にする。
-公開範囲は quality ごとに独立して決める。
+各フィールドの役割は次のとおり。
 
-controller は sync が `--sync-timeout-ms` 以内に届いている worker だけを配信先の候補にする。
-応答に worker の状態は含めない。
+- `cached_segments`（リクエスト）：`worker` がその時点でメモリ上にキャッシュしている全セグメントの一覧
+- `fetching_segments`（リクエスト）：`worker` がその時点で `controller` からダウンロード中のセグメントの一覧
+- `fetch_segments`（レスポンス）：`worker` がこれから取得すべきセグメントの一覧。各項目は `channel_id`、`quality`、`sequence` を持ち、`worker` は `{controller_url}/segments/{channel_id}/{quality}/{sequence}.ts` を `GET` する
+
+`fetch_segments` には、すべての `channel` と `quality` のキャッシュ対象（各 `quality` の最新セグメント番号から `--playlist-segments` 個分の範囲）のうち、`cached_segments` に含まれていない未キャッシュのセグメントが入る。
+また、ある `quality` のセグメントが容量超過で削除されたものの別の `quality` に同じ識別子が残っている状態で、削除された `quality` に同じ識別子が再 `PUT` されると、以前と同じセグメント番号に保存し直される。
+このとき、`cached_segments` または `fetching_segments` にその番号を含む `worker` に対して再取得を指示するため、該当セグメントも `fetch_segments` に入る。
+`worker` は再取得したバイト列でキャッシュを上書きする。
+
+`controller` は `sync` を受け取るたびに、各 `quality` の公開範囲を再評価する。
+最初の未公開セグメントファイルが `PUT` された時刻から `--publish-wait-ms` の公開待ちが経過したセグメントを公開可能とし、`sync` が `--sync-timeout-ms` 以内に届いている `worker` が連続してキャッシュしている最新の公開可能範囲を、その `quality` の公開範囲にする。
 
 ステータス：
 
-- `200 OK`：sync を受け付けた
-- `400 Bad Request`：`worker_id`、キャッシュ一覧（`cached_segments`）、取得中の一覧（`fetching_segments`）の識別子が不正である
-- `404 Not Found`：worker が登録されていないため再登録する
+- `200 OK`：`sync` を受け付けた
+- `400 Bad Request`：`worker_id`、`cached_segments`、または `fetching_segments` の識別子が不正である
+- `404 Not Found`：`worker` が登録されていないため、`worker` は再登録を行う
 
-## worker の API
-
-### セグメントファイルを配信する
+### セグメントファイルを取得する（worker 用）
 
 ```
 GET /segments/{channel_id}/{quality}/{filename}
 ```
 
-worker がキャッシュしているセグメントファイルを client に返す。
-worker はキャッシュしていないセグメントファイルを controller から取得しない。
-取得は sync の `fetch_segments` に従って行う。
+`worker` が `sync` の `fetch_segments` に従って正規セグメントファイルを取得するときに使う。
+`controller` はメモリに保存しているセグメントファイルを返す。
+容量を超えて削除されたセグメントファイルと、`controller` の再起動で失われたセグメントファイルは `404 Not Found` になる。
 
 ステータス：
 
 - `200 OK`：セグメントファイルのバイト列を返す
 - `400 Bad Request`：識別子またはファイル名が不正である
-- `404 Not Found`：worker がセグメントファイルをキャッシュしていない
+- `404 Not Found`：セグメントファイルが存在しない
 
-## sync の流れ
-
-sync は worker が開始する pull 方式である。
-controller から worker へセグメントファイルのバイト列を PUT しない。
+### マスタープレイリストを取得する（client 用）
 
 ```
-worker                           controller
-  |                                       |
-  |-- POST /workers/{id}/sync ----------->|
-  |   cached_segments                     |
-  |                                       |  公開範囲を評価する
-  |<-- fetch_segments --------------------|
-  |                                       |
-  |-- GET /segments/... ----------------->|
-  |<-- bytes -----------------------------|
-  |                                       |
-  |   次の sync でキャッシュ内容を報告する |
+GET /channels/{channel_id}/master.m3u8
 ```
 
-手順は次のとおり。
+出力形式の詳細は [HLS の出力](./hls.md) で説明する。
+`200 OK` と `302 Found` のレスポンスには `Cache-Control: no-store` ヘッダが付く。
 
-1. worker は登録時に受け取った `sync_interval_ms` の間隔で sync を送る。
-2. controller は quality ごとの公開範囲を評価し、`fetch_segments` を返す。
-3. worker は `fetch_segments` の各項目を `{controller-url}/segments/{channel_id}/{quality}/{sequence}.ts` から GET する。
-4. worker は取得したセグメントファイルを保存し、次の sync でキャッシュ一覧に含めて報告する。
-5. controller は公開待ちが終わっていれば quality ごとに公開範囲を進め、次のプレイリストリクエストから新しい範囲を返す。
+ステータス：
+
+- `200 OK`：マスタープレイリストを返す
+- `302 Found`：外部配信へ振り分ける。`Location` に登録された外部配信のマスタープレイリスト URL を返す
+- `400 Bad Request`：`channel_id` が不正である、または query の `external` に `1` と `0` 以外の値を指定した
+- `404 Not Found`：`channel` が存在しない
+- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
+- `503 Service Unavailable`：配信できる `quality` がない
+
+クエリパラメータに `external=1` を付けると外部配信へ振り分け、`external=0` を付けると自前のマスタープレイリストを返す。
+`external=0` は、外部配信を登録している環境でもリダイレクトさせずに `controller` 自身のプレイリストを取得したい場合（`publisher` が再起動時に現在のセグメント番号を確認する場合や、運用者が直接動作確認する場合）に使う。
+外部配信が登録されていなければ `302` は返さず、`external=1` でも自前のマスタープレイリストを返す。
+
+クエリパラメータを省略した場合は、接続元の IP と `channel` から決まる値と、その時点の公開の遅れに応じた外部配信の割合とを比較し、リクエストごとに振り分けを判定する。
+
+### メディアプレイリストを取得する（client 用）
+
+```
+GET /channels/{channel_id}/{quality}.m3u8
+```
+
+出力形式の詳細は [HLS の出力](./hls.md) で説明する。
+
+ステータス：
+
+- `200 OK`：メディアプレイリストを返す
+- `400 Bad Request`：`channel_id` または `quality` が不正である
+- `404 Not Found`：`channel` または `quality` が存在しない
+- `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
+- `503 Service Unavailable`：その `quality` の公開範囲または配信先 `worker` がない
+
+## worker の API
+
+### セグメントファイルを配信する（client 用）
+
+```
+GET /segments/{channel_id}/{quality}/{filename}
+```
+
+`worker` がメモリ上にキャッシュしているセグメントファイルを `client` に返す。
+`worker` はキャッシュしていないセグメントファイルをその場で `controller` から取得することはせず、`404 Not Found` を返す（セグメントの取得はすべて `sync` の `fetch_segments` に従って非同期に行う）。
+
+ステータス：
+
+- `200 OK`：セグメントファイルのバイト列を返す
+- `400 Bad Request`：識別子またはファイル名が不正である
+- `404 Not Found`：`worker` がそのセグメントファイルをキャッシュしていない
