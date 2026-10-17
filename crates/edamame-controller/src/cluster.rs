@@ -23,7 +23,7 @@ pub enum Role {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Member {
+pub struct Peer {
     pub public_url: String,
     pub metric: u32,
     #[serde(default)]
@@ -37,7 +37,7 @@ pub struct Heartbeat {
     #[serde(default)]
     pub role: Role,
     pub leader_url: Option<String>,
-    pub members: Vec<Member>,
+    pub members: Vec<Peer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,8 +48,8 @@ pub struct Health {
     pub leader_url: Option<String>,
 }
 
-struct Peer {
-    member: Member,
+struct PeerState {
+    member: Peer,
     last_success: Option<Instant>,
     dead: bool,
 }
@@ -57,7 +57,7 @@ struct Peer {
 pub(crate) struct ClusterInner {
     pub role: Role,
     pub leader_url: Option<String>,
-    members: BTreeMap<String, Peer>,
+    members: BTreeMap<String, PeerState>,
     initialized: bool,
 }
 
@@ -110,8 +110,8 @@ impl ClusterState {
                 eprintln!("cluster member added: {public_url}");
                 members.insert(
                     public_url.clone(),
-                    Peer {
-                        member: Member {
+                    PeerState {
+                        member: Peer {
                             public_url,
                             metric: 0,
                             role: Role::Follower,
@@ -216,7 +216,7 @@ impl ClusterState {
         if Some(&public_url) != self.public_url.as_ref() {
             self.add_member(
                 inner,
-                Member {
+                Peer {
                     public_url: public_url.clone(),
                     metric: heartbeat.metric,
                     role: heartbeat.role,
@@ -237,7 +237,7 @@ impl ClusterState {
         Ok(())
     }
 
-    fn add_member(&self, inner: &mut ClusterInner, member: Member) {
+    fn add_member(&self, inner: &mut ClusterInner, member: Peer) {
         if Some(&member.public_url) == self.public_url.as_ref()
             || inner.members.contains_key(&member.public_url)
         {
@@ -246,7 +246,7 @@ impl ClusterState {
         eprintln!("cluster member added: {}", member.public_url);
         inner.members.insert(
             member.public_url.clone(),
-            Peer {
+            PeerState {
                 member,
                 last_success: None,
                 dead: false,
@@ -386,7 +386,7 @@ mod tests {
         .unwrap();
         let now = Instant::now();
         let mut inner = cluster.inner.write().await;
-        let peer = |url: &str, metric| Member {
+        let peer = |url: &str, metric| Peer {
             public_url: url.to_owned(),
             metric,
             role: Role::Leader,
