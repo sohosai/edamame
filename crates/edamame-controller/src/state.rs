@@ -151,6 +151,7 @@ impl ControllerState {
         })
     }
 
+    /// 次の昇格で古い採番や登録を使わないよう、セグメントを含む配信状態を全消去する。
     pub async fn clear(&self) {
         let mut inner = self.inner.lock().await;
         *inner = Inner::default();

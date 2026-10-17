@@ -11,6 +11,7 @@ use support::{
 
 const TOKEN: &str = "cluster-test-token";
 
+/// 中継後の採番をテストで比較できるよう、認証付き PUT のセグメント番号を返す。
 async fn publish(client: &Client, base: &str, identifier: &str, body: &str) -> u64 {
     let response = client
         .put(format!(

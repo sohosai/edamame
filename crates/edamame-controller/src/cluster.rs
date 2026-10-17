@@ -14,6 +14,7 @@ use crate::{ControllerConfig, ControllerState};
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const MEMBER_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// cluster の起動直後など、leader が未確定の間も follower として表す。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -22,6 +23,7 @@ pub enum Role {
     Follower,
 }
 
+/// heartbeat で交換する peer の情報。生存時刻は共有しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub public_url: String,
@@ -30,6 +32,7 @@ pub struct Peer {
     pub role: Role,
 }
 
+/// peer の発見と生存確認に使う、要求と応答に共通の情報。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub public_url: String,
@@ -40,6 +43,7 @@ pub struct Heartbeat {
     pub members: Vec<Peer>,
 }
 
+/// 監視先自身の状態。leader が未確定でも取得できる。
 #[derive(Debug, Serialize)]
 pub struct Health {
     pub role: Role,
@@ -48,19 +52,25 @@ pub struct Health {
     pub leader_url: Option<String>,
 }
 
+/// 直接の疎通結果を保存する監視状態。ほかの peer とは共有しない。
 struct PeerState {
     member: Peer,
+    /// 未接触の peer は選出対象にしないため、成功するまでは None にする。
     last_success: Option<Instant>,
+    /// 死亡ログの重複と復帰の検出に使い、生存判定は最終成功時刻で行う。
     dead: bool,
 }
 
+/// 役割の切り替えと HTTP 処理が競合しないよう、選出結果と peer 表をまとめて保護する。
 pub(crate) struct ClusterInner {
     pub role: Role,
     pub leader_url: Option<String>,
     members: BTreeMap<String, PeerState>,
+    /// 初回の heartbeat 送信が一巡するまで、自分を leader にしないためのフラグ。
     initialized: bool,
 }
 
+/// HTTP 層が選出結果を参照できるよう、peer の監視状態を共有する。
 pub struct ClusterState {
     public_url: Option<String>,
     metric: u32,
@@ -73,6 +83,7 @@ pub struct ClusterState {
 }
 
 impl ClusterState {
+    /// seed と token がある場合だけ、初回の生存確認待ちで開始する。
     pub fn new(
         config: &ControllerConfig,
         controller: Arc<ControllerState>,
@@ -92,10 +103,12 @@ impl ClusterState {
         )
     }
 
+    /// cluster を指定しない HTTP API でも、共通の役割判定を使えるようにする。
     pub(crate) fn standalone(controller: Arc<ControllerState>) -> Arc<Self> {
         Self::build(None, 0, None, None, controller).expect("HTTP client can be built")
     }
 
+    /// seeds が None なら単独構成、空のリストでも Some なら選出待ちで開始する。
     fn build(
         public_url: Option<String>,
         metric: u32,
@@ -147,6 +160,7 @@ impl ClusterState {
         }))
     }
 
+    /// API の配置と転送先の組み立てに使う、公開 URL の path 接頭辞。
     pub(crate) fn path_prefix(&self) -> String {
         self.public_url
             .as_deref()
@@ -170,6 +184,7 @@ impl ClusterState {
         }
     }
 
+    /// 生存時刻を peer 間で混同しないよう、共有する情報だけを送信用に切り出す。
     fn snapshot(&self, inner: &ClusterInner) -> Heartbeat {
         Heartbeat {
             public_url: self.public_url.clone().expect("cluster has public URL"),
@@ -184,6 +199,7 @@ impl ClusterState {
         }
     }
 
+    /// 送信元の生存確認と選出を反映し、更新後の状態を heartbeat の応答にする。
     pub async fn receive(&self, heartbeat: Heartbeat) -> Result<Heartbeat, EdamameError> {
         if !self.enabled {
             return Err(EdamameError::Unavailable("cluster is disabled".to_owned()));
@@ -194,6 +210,7 @@ impl ClusterState {
         Ok(self.snapshot(&inner))
     }
 
+    /// 間接的な報告で延命しないよう、送信元の生存情報と未登録の接触先だけを取り込む。
     fn merge(
         &self,
         inner: &mut ClusterInner,
@@ -201,7 +218,6 @@ impl ClusterState {
         now: Instant,
     ) -> Result<(), EdamameError> {
         let public_url = normalize_public_url(&heartbeat.public_url)?;
-        // 間接的な報告では生存時刻と優先度を更新せず、古い報告による延命を防ぐ。
         let members = heartbeat
             .members
             .into_iter()
@@ -237,6 +253,7 @@ impl ClusterState {
         Ok(())
     }
 
+    /// 自分と既知の URL を除いて登録し、直接疎通するまでは選出対象にしない。
     fn add_member(&self, inner: &mut ClusterInner, member: Peer) {
         if Some(&member.public_url) == self.public_url.as_ref()
             || inner.members.contains_key(&member.public_url)
@@ -254,6 +271,7 @@ impl ClusterState {
         );
     }
 
+    /// 初回の生存確認が済んだら役割を確定し、降格時は配信状態を捨てる。
     async fn elect(&self, inner: &mut ClusterInner, now: Instant) {
         for peer in inner.members.values_mut() {
             let dead = peer
@@ -299,6 +317,7 @@ impl ClusterState {
         inner.leader_url = Some(leader.to_owned());
     }
 
+    /// 1 秒ごと、または中継失敗の通知時に全 peer を確認して選び直す。
     pub async fn run(self: Arc<Self>) {
         if !self.enabled {
             return;
@@ -353,6 +372,7 @@ impl ClusterState {
     }
 }
 
+/// 直接疎通から 3 秒未満の peer と自分の中で、metric、URL の順に最大の機体を選ぶ。
 fn select_leader<'a>(
     own_url: &'a str,
     metric: u32,

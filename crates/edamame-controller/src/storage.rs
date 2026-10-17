@@ -38,6 +38,7 @@ impl CanonicalStore {
         }
     }
 
+    /// 降格時に古いセグメントが残らないよう、索引と使用量もまとめて初期化する。
     pub fn clear(&self) {
         *self.inner.lock().expect("store lock is not poisoned") = StoreInner::default();
     }

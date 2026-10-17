@@ -438,12 +438,14 @@ pub async fn wait_for_segment(client: &reqwest::Client, url: &str, expected: &[u
     }
 }
 
+/// 停止と同じアドレスでの再起動を試せるよう、実プロセスと接続先を保持する。
 pub struct ControllerProcess {
     pub child: tokio::process::Child,
     pub addr: SocketAddr,
     pub base_url: String,
 }
 
+/// 起動前の seed 指定に使うアドレスを返すが、ポートの予約は維持しない。
 pub fn available_addr() -> SocketAddr {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -451,6 +453,7 @@ pub fn available_addr() -> SocketAddr {
         .unwrap()
 }
 
+/// 外部の EDAMAME_ 設定を引き継がず実プロセスを起動し、health の応答まで待つ。
 pub async fn spawn_cluster_process(
     addr: SocketAddr,
     metric: u32,
@@ -516,6 +519,7 @@ pub async fn spawn_cluster_process(
     }
 }
 
+/// 選出の収束を確認するため、役割と leader URL の両方が一致するまで待つ。
 pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str, leader_url: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

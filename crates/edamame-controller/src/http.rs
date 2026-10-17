@@ -36,11 +36,13 @@ const SYNC_BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// 外部配信の登録に使う JSON ボディの上限
 const EXTERNAL_BODY_LIMIT: usize = 64 * 1024;
 
+/// cluster を指定しない利用でも、単独 leader として共通の役割判定を使う。
 pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins, auth_token: Option<&str>) -> Router {
     let cluster = ClusterState::standalone(state.clone());
     router_with_cluster(state, cors, auth_token, cluster)
 }
 
+/// 認証と CORS を転送処理の外側に置き、health と heartbeat は各機で処理する。
 pub fn router_with_cluster(
     state: Arc<ControllerState>,
     cors: &CorsOrigins,
@@ -131,6 +133,7 @@ async fn cluster_heartbeat(
     Ok(Json(cluster.receive(heartbeat).await?))
 }
 
+/// token 未設定時は認証を省略せず、内部 API を常に拒否する。
 async fn authorize_heartbeat(
     State(expected): State<Option<Arc<str>>>,
     request: Request,
@@ -147,6 +150,7 @@ async fn authorize_heartbeat(
         .into_response()
 }
 
+/// leader 未確定や中継失敗の際に、1 秒後の再試行を促す応答。
 fn unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -159,6 +163,7 @@ fn unavailable() -> Response {
         .into_response()
 }
 
+/// 受信側の接頭辞を除いた URI を受け取り、leader の公開 URL に連結する。
 fn leader_location(leader: &str, uri: &axum::http::Uri) -> String {
     format!(
         "{leader}{}",
@@ -166,6 +171,7 @@ fn leader_location(leader: &str, uri: &axum::http::Uri) -> String {
     )
 }
 
+/// leader は自分で処理し、follower は GET と sync を redirect、PUT を内部中継する。
 async fn route_cluster(
     State(cluster): State<Arc<ClusterState>>,
     mut request: Request,

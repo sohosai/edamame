@@ -135,10 +135,12 @@ impl ControllerConfig {
         Ok(())
     }
 
+    /// seed を指定しても、共通 token がなければ cluster を有効にしない。
     pub fn cluster_enabled(&self) -> bool {
         !self.seed.is_empty() && self.auth_token.is_some()
     }
 
+    /// 正規化した URL で重複と自分自身を除き、最初の接触先を返す。
     pub fn cluster_seeds(&self) -> Result<Vec<String>, EdamameError> {
         let own = self
             .public_url
