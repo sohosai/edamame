@@ -80,7 +80,7 @@ docker build --target publisher -t edamame-publisher .
 | --- | --- |
 | `--config` | TOML 設定ファイルのパス（必須） |
 | `--controller-url` | `controller` の接続先を表す `http` または `https` の絶対 URL（必須） |
-| `--auth-token` | `controller` の `--auth-token` と同じトークン。省略すると `PUT` に `Authorization` ヘッダを付けない |
+| `--auth-token` | `controller` の `--auth-token` と同じ token。CLI は省略を受け付けるが、PUT には必須であり、省略すると 401 になる |
 | `--work-dir` | 作業ディレクトリを作る親ディレクトリ。指定したディレクトリの配下に `edamame-publisher-<pid>` を作る。省略した場合は一時ディレクトリの配下に作る |
 | `--key-file` | 暗号鍵を読み書きするファイル。ファイルがあれば 16 byte の生データとして読み、なければ生成して権限 0600 で保存する。省略すると実行ごとに生成する |
 | `--stream-credentials-url` | 外部の配信管理および鍵配布サーバ（`live2025-server`）のベース URL。指定すると暗号鍵と `live_url` を登録する |
@@ -98,6 +98,7 @@ docker build --target publisher -t edamame-publisher .
 ```bash
 edamame-controller \
   --bind 0.0.0.0:9000 \
+  --public-url http://127.0.0.1:9000 \
   --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \

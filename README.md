@@ -45,6 +45,7 @@ cargo build --workspace
 ```bash
 cargo run -p edamame-controller -- \
   --bind 127.0.0.1:9000 \
+  --public-url http://127.0.0.1:9000 \
   --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
@@ -71,10 +72,11 @@ cargo run -p edamame-worker -- \
 
 `controller` のオプションは次のとおりである。
 
-- 必須：`--bind`、`--storage-capacity`、`--playlist-segments`（直近 6 セグメント以上）、`--sync-interval-ms`、`--sync-timeout-ms`
+- 必須：`--bind`、`--public-url`、`--auth-token`、`--storage-capacity`、`--playlist-segments`（直近 6 セグメント以上）、`--sync-interval-ms`、`--sync-timeout-ms`
 - 任意：
   - `--publish-wait-ms`：新しいセグメントをプレイリストに載せる前の待ち時間。省略すると `2000`（ミリ秒）を使い、起動時に警告を出す
-  - `--auth-token`：`PUT` と heartbeat の認証トークン。省略すると `PUT` を認証せず、起動時に警告を出す
+  - `--metric`：leader の優先度。省略すると `100` になる
+  - `--seed`：最初に接触する controller の URL。省略した機体も後からの参加を受け付ける
   - `--cors-origin`：ブラウザからの `GET` を許可する origin。省略すると CORS ヘッダを返さず、起動時に警告を出す
   - `--external-min-percent`：外部配信を登録したときに振り分ける最小の割合（%）。省略すると `1` になる
 
@@ -83,7 +85,7 @@ cargo run -p edamame-worker -- \
 - 必須：`--worker-id`、`--bind`、`--public-url`（プレイリストに載せる `client` 向けの公開 URL）、`--controller-url`、`--cache-limit`
 - 任意：
   - `--weight`：複数 `worker` 間の配信比率。省略すると `1` になる
-  - `--auth-token`：`controller` に登録するときの認証トークン
+  - `--auth-token`：CLI は省略を受け付けるが、`controller` への登録には必須の token
   - `--cors-origin`：ブラウザからの `GET` を許可する origin
   - `--tls-cert` / `--tls-key`、または `--acme` 系オプション：`worker` 自身で TLS を終端する場合に指定する
 
@@ -91,10 +93,13 @@ cargo run -p edamame-worker -- \
 環境変数の名前は、オプション名の `-` を `_` に変えて先頭に `EDAMAME_` を付けたものにする（例：`--bind` は `EDAMAME_BIND`）。
 コマンドライン引数と環境変数の両方を指定した場合は、コマンドライン引数を優先する。
 
-`--auth-token` を使う場合は、`controller`、`worker`、`publisher` に同じトークンを設定する。
+`controller` の `--auth-token` は必須であり、`worker` と `publisher` にも同じ token を設定する。
+`--public-url` には、peer、worker、client のすべてから到達できる機体固有の URL を指定する。
+cluster の処理は常に有効であり、seed を省略した場合は自分 1 台で始まる。
 全オプションの詳細と TLS の設定手順は [運用](./docs/operations.md) で説明する。
 
-同じ token を持つ controller を複数起動する場合は、`--public-url`、`--metric`、`--seed` を指定する。
+複数台に増やすときは、参加する機体の `--seed` に起動済みの controller の URL を指定する。
+leader の優先度を変える場合は `--metric` を指定する。
 DNS の共有名から各機へ到達させる起動例は [運用](./docs/operations.md#controller-を冗長化する)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
 
 ## publisher
@@ -116,6 +121,13 @@ cargo run --release -p edamame-publisher -- \
 ## Docker での起動
 
 `controller` と `worker` を Docker Compose で動かす最小構成（`compose.yaml`）の例を示す。
+同じ公開 URL にホストとコンテナから到達できるよう、この例ではホストの `/etc/hosts` に次の行を設定する。
+
+```text
+127.0.0.1 edamame.local
+```
+
+コンテナ側では `extra_hosts` により、この名前を Docker ホストの gateway に対応させる。
 
 ```yaml
 services:
@@ -123,6 +135,7 @@ services:
     image: ghcr.io/sohosai/edamame-controller:latest
     environment:
       EDAMAME_BIND: 0.0.0.0:9000
+      EDAMAME_PUBLIC_URL: http://edamame.local:9000
       EDAMAME_STORAGE_CAPACITY: "512MiB"
       EDAMAME_PLAYLIST_SEGMENTS: 6
       EDAMAME_SYNC_INTERVAL_MS: 1000
@@ -130,6 +143,8 @@ services:
       EDAMAME_PUBLISH_WAIT_MS: 2000
       EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
+    extra_hosts:
+      - "edamame.local:host-gateway"
     ports:
       - "9000:9000"
 
@@ -140,11 +155,13 @@ services:
     environment:
       EDAMAME_WORKER_ID: worker-a
       EDAMAME_BIND: 0.0.0.0:9001
-      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
-      EDAMAME_CONTROLLER_URL: http://controller:9000
+      EDAMAME_PUBLIC_URL: http://edamame.local:9001
+      EDAMAME_CONTROLLER_URL: http://edamame.local:9000
       EDAMAME_CACHE_LIMIT: 12
       EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
+    extra_hosts:
+      - "edamame.local:host-gateway"
     ports:
       - "9001:9001"
 ```

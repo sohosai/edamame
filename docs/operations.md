@@ -34,12 +34,12 @@ client    ── GET セグメントファイル (.ts) ────────�
 | `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | `worker` に指示する `sync` の間隔をミリ秒で指定する（1 以上の整数） |
 | `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | `sync` が届かない `worker` を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
 | `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に `worker` の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は `2000` を使い警告を出す） |
-| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | `PUT` と heartbeat の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると `PUT` を認証せず警告を出す） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 必須 | PUT と heartbeat に共通の token。空白と制御文字を除く表示可能 ASCII を使い、全 peer、worker、publisher で同じ値にする |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの `GET` を許可する origin（`*`、`none`、またはカンマ区切りの origin 一覧。省略すると CORS ヘッダを付けず警告を出す） |
 | `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 外部配信が登録されているときに外部配信へ流す最低の割合（%、0 以上 100 以下、省略時は `1`。公開の遅れが増えると最大 100% まで上昇する） |
-| `--public-url` | `EDAMAME_PUBLIC_URL` | seed 指定時に必須 | peer、worker、client のすべてから到達できる、このインスタンス固有の HTTP または HTTPS の絶対 URL。query と fragment は不可、path の接頭辞は許可する |
-| `--metric` | `EDAMAME_METRIC` | seed 指定時に必須 | leader の優先度。0 以上 4294967295 以下で、大きい値を優先する |
-| `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の URL。カンマ区切りと繰り返しを許可し、重複と自分の URL を除く。省略時は単独 leader |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | peer、worker、client のすべてから到達できる、このインスタンス固有の HTTP または HTTPS の絶対 URL。query と fragment は不可、path の接頭辞は許可する |
+| `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下で、大きい値を優先する。省略時は 100 |
+| `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の URL。カンマ区切りと繰り返しを許可し、重複と自分の URL を除く。省略すると自分 1 台で始まり、後からの参加も受け付ける |
 
 ### worker の設定
 
@@ -61,6 +61,8 @@ client    ── GET セグメントファイル (.ts) ────────�
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの `GET` を許可する origin（`*`、`none`、またはカンマ区切りの origin 一覧。省略すると CORS ヘッダを付けず警告を出す） |
 
 `--worker-id`、`--bind`、`--public-url`、`--controller-url`、`--cache-limit` の 5 つは必須であり、既定値はない。
+worker の CLI は `--auth-token` の省略を受け付けるが、controller への登録には同じ token が必要になる。
+省略した場合は登録が 401 になり、worker は 1 秒後に再試行する。
 `--public-url` はプレイリスト内のセグメント URL に書き込まれる公開 URL であり、`--bind` の値からは自動生成しない。
 `0.0.0.0` など `client` から直接到達できないアドレスで待ち受ける場合でも、`--public-url` には `client` から到達できる URL を指定する。
 URL にパスを含めた場合（例：`https://edge.example.test/worker-a`）は、`worker` 側もそのパスを接頭辞とした `{path}/segments/...` でリクエストを待ち受ける。
@@ -71,8 +73,9 @@ URL にパスを含めた場合（例：`https://edge.example.test/worker-a`）�
 ## controller を冗長化する
 
 全 controller に同じ `--auth-token` と、異なる `--public-url` を指定する。
-`--seed` を指定する場合は `--public-url` と `--metric` も必須にする。
-token がなければ cluster を無効化して警告を出し、単独 leader として起動する。
+`--public-url` と `--auth-token` は、1 台だけで起動する場合も必須になる。
+metric の既定値は `100` とし、seed は最初に接触する相手がある場合だけ指定する。
+seed を省略した機体にも、別の機体から接触して参加できる。
 
 2 台をローカルで確認する最小例を示す。
 それぞれ別のターミナルで起動する。
@@ -186,7 +189,7 @@ TLS 配信を有効にした `worker` は、公開ルート CA で検証でき�
 
 ### セキュリティと信頼境界
 
-- `controller` は `--auth-token` を指定すると `PUT` と heartbeat に Bearer トークンを要求する。省略すると警告を出して `PUT` を認証せず、cluster は無効、heartbeat は 401 にする
+- `controller` は `--auth-token` を必須とし、PUT と heartbeat に常に Bearer 認証を要求する。token がない場合や一致しない場合は 401 を返す
 - `GET` と `POST /workers/{worker_id}/sync` には認証がないため、`controller` の待ち受けポートへは信頼できるネットワークからか、reverse proxy 経由でのみアクセスできるようにする
 - `publisher` が送るセグメント識別子は文字種を限定し、`controller` と `worker` は識別子をメモリ上の索引にだけ使う
 - `worker` は `--controller-url` から GET と sync を送り、follower が返す leader の URL への redirect に追従する。cluster の token を持つ peer は転送先を宣言できるため、信頼できる controller だけに token を渡す
@@ -210,6 +213,7 @@ TLS 配信を有効にした `worker` は、公開ルート CA で検証でき�
 ```bash
 edamame-controller \
   --bind 127.0.0.1:9000 \
+  --public-url http://127.0.0.1:9000 \
   --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \

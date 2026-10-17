@@ -79,7 +79,7 @@ ffmpeg は実行ごとに素材の先頭から読み直し、セグメントの�
 | `--bandwidth` | 必須 | controller に宣言する `bandwidth`（bit/s）。素材の実ビットレートに合わせる |
 | `--segment-duration-ms` | 必須 | セグメント長（500 以上の整数、ミリ秒）。素材の 1 フレーム以上にし、キーフレーム間隔と長さに合わせる |
 | `--resolution` | 任意 | controller に宣言する解像度（`WIDTHxHEIGHT`）。素材の解像度に合わせる |
-| `--auth-token` | 任意 | controller の `--auth-token` と同じトークン（空白と制御文字を除く表示可能 ASCII、省略すると `Authorization` ヘッダーを送らない） |
+| `--auth-token` | 任意 | controller の `--auth-token` と同じトークン（空白と制御文字を除く表示可能 ASCII、CLI は省略を受け付けるが、PUT には必須であり、省略すると 401 になる） |
 | `--external-m3u8` | 任意 | channel の外部配信の master m3u8 の URL。指定すると、最初のセグメントを公開した後に controller へ登録する |
 
 ### 注意

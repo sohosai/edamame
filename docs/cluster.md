@@ -2,10 +2,13 @@
 
 ## 役割と保存する状態
 
-同じ `--auth-token` を持つ controller を 2 台以上起動し、各 controller に固有の `--public-url`、`--metric`、接触先の `--seed` を指定する。
+controller は台数によらず常に cluster の選出処理を使う。
+各 controller には固有の `--public-url` と、peer 間で共通の `--auth-token` を必ず指定する。
+`--metric` の既定値は `100` とし、複数台で起動する場合は必要に応じて優先度を変える。
 起動例と DNS の設定は [運用](./operations.md#controller-を冗長化する) を参照する。
-seed を指定しない場合は単独の leader になる。
-seed を指定しても token がなければ警告を出して cluster を無効にする。
+seed を指定しない場合は自分 1 台で始まり、最初の選出で自分が leader になる。
+公開 URL または token がなければ起動に失敗する。
+seed がなくても認証済みの heartbeat を受け付け、後から参加した peer と選出を続ける。
 
 leader はセグメントファイル、採番、channel と quality のメタデータ、暗号化の指定、外部配信の登録、worker の登録とキャッシュ報告をメモリに保存する。
 follower はこれらを保存せず、leader への転送だけを行う。
@@ -32,11 +35,13 @@ heartbeat の送受信で既知の member を交換し、発見した URL にも
 
 自分と生存している member の中で、`(metric, public_url)` が最大のものを leader にする。
 metric は u32 で、大きい値を優先する。
+省略時は `100`、明示的に指定できる範囲は `0` 以上 `4294967295` 以下とする。
 metric が同じ場合は、正規化後の public URL の文字列を比較して大きい方を選ぶ。
 各 controller は同じ URL を自分と同じインスタンスとして扱うため、public URL を共有しない。
 
 cluster の起動直後は follower とし、最初の heartbeat の送信が 1 回分完了するまで leader URL を確定しない。
 この間の業務 API は `503 Service Unavailable` と `Retry-After: 1` を返す。
+接触先が空なら追加の待ち時間は設けず、最初の選出で自分を leader にする。
 seed がすべて停止していても、初回の送信が完了すれば自分を leader にできる。
 
 上位機が停止すると、その member の最終成功から 3 秒以上経過した後の判定で、生存している最大の metric の機体が leader になる。

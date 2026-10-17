@@ -9,9 +9,9 @@
 | --- | --- | --- | --- | --- |
 | controller | `GET /health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
 | controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
-| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（任意設定） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
-| controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（任意設定） | 外部配信のマスタープレイリスト URL の登録と解除 |
-| controller | `PUT /workers/{worker_id}` | worker | Bearer（任意設定） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
+| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
+| controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（必須） | 外部配信のマスタープレイリスト URL の登録と解除 |
+| controller | `PUT /workers/{worker_id}` | worker | Bearer（必須） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
 | controller | `POST /workers/{worker_id}/sync` | worker | なし | キャッシュ状況の報告と不足セグメント（`fetch_segments`）の取得指示 |
 | controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | 正規セグメントファイルの取得（キャッシュ用） |
 | controller | `GET /channels/{channel_id}/master.m3u8` | client / publisher | なし | マスタープレイリストの取得（または外部配信への `302` リダイレクト） |
@@ -40,7 +40,7 @@
 
 ### 認証と CORS
 
-- `controller` は `--auth-token` を指定したときだけ、すべての `PUT` エンドポイントに `Authorization: Bearer {token}` を要求する。ヘッダがない場合やトークンが一致しない場合は、`WWW-Authenticate: Bearer` ヘッダを付けて `401 Unauthorized` を返す。`GET` と sync の `POST` は認証を要求せず、heartbeat の `POST` は常に Bearer 認証を要求する
+- `controller` はすべての `PUT` エンドポイントに `Authorization: Bearer {token}` を要求する。ヘッダがない場合やトークンが一致しない場合は、`WWW-Authenticate: Bearer` ヘッダを付けて `401 Unauthorized` を返す。`GET` と sync の `POST` は認証を要求せず、heartbeat の `POST` は常に Bearer 認証を要求する
 - ブラウザからは `GET` だけ cross-origin で読み取れる。許可する origin は `controller` と `worker` の `--cors-origin`（`*`、`none`、またはカンマ区切りの origin 一覧。`*` や `none` は他の値と混在不可）で指定し、省略または `none` を指定すると CORS ヘッダを返さない
 
 ### ステータスコードの判定順
@@ -70,7 +70,8 @@ leader に転送しない。
 
 `role` は `leader` または `follower` とする。
 cluster の起動直後は `follower` と `leader_url: null` を返す。
-public URL を省略した単独構成では `public_url` と `leader_url` は `null`、metric を省略した場合は 0 になる。
+`public_url` は必ず自分自身の公開 URL を文字列で返す。
+metric を省略した場合は `100` になる。
 200 はインスタンス自身が応答できることを示し、leader の確定や配信可能なプレイリストの存在を保証しない。
 
 ### peer と heartbeat を交換する
@@ -112,9 +113,8 @@ JSON body の上限は 4 MiB とする。
 | status | 条件 |
 | --- | --- |
 | 200 | heartbeat を受け付けた |
-| 401 | token が未設定、Authorization がない、または token が一致しない |
+| 401 | Authorization がない、または token が一致しない |
 | 400 | JSON または URL が不正、または body が上限を超えている |
-| 503 | token は一致するが cluster が無効になっている |
 
 ### follower の転送と leader 未確定時の応答
 
@@ -158,7 +158,7 @@ PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&band
 
 `publisher` が正規セグメントファイルを登録する。
 `channel_id` と `quality` を事前に作成する専用の API はなく、最初のセグメントファイルを `PUT` した時点で自動的に作られる。
-`controller` が `--auth-token` を指定している場合は、`Authorization: Bearer {token}` ヘッダを付ける。
+`Authorization: Bearer {token}` ヘッダに、`controller` と同じ token を必ず付ける。
 
 `identifier` はセグメントごとに `publisher` が付ける識別子である。
 画質が複数あっても、同じ時間帯のセグメントには同じ識別子を使う。
@@ -259,7 +259,7 @@ curl -i -X PUT \
 
 - `204 No Content`：登録または解除した
 - `400 Bad Request`：`channel_id` または `external_m3u8` の形式が不正である
-- `401 Unauthorized`：`--auth-token` を指定しているのにトークンがない、または一致しない
+- `401 Unauthorized`：Authorization がない、または token が一致しない
 - `404 Not Found`：`channel` が存在しない
 
 ### worker を登録する（worker 用）
@@ -284,7 +284,7 @@ URL にパスを含めた場合は、そのパスの後ろに `/segments/...` �
 `controller` は配信先の `worker` を選ぶときにこの値を使い、重みが大きい `worker` ほど高い割合で選ぶ。
 
 `worker` は起動時にこのエンドポイントを呼んで自身を登録する。
-`controller` が `--auth-token` を指定している場合は、`worker` 側にも同じ `--auth-token` を指定して `Authorization: Bearer {token}` を送る。
+`worker` 側にも `controller` と同じ `--auth-token` を指定して `Authorization: Bearer {token}` を送る。
 `controller` の再起動などで登録が失われた場合、`worker` は `sync` の `404 Not Found` を受け取った時点で再登録を行う。
 `worker` は登録のたびに手元のキャッシュを捨てて取り直すため、`controller` も登録に合わせて報告済みのキャッシュを無効にする。
 
