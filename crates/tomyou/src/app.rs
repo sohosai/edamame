@@ -530,7 +530,9 @@ impl TomyouApp {
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
                         self.save_config();
-                        close_requested = true;
+                        if self.error.is_none() {
+                            close_requested = true;
+                        }
                     }
                     if ui.button("設定ファイルを再読込").clicked() {
                         match Config::load(&self.config_path) {
