@@ -756,61 +756,39 @@ fn validate_first_set(context: &ChannelContext, files: &[SegmentFile]) -> Result
             }
         }
 
-        // コピーと upscale は、セグメントの映像が設定どおりかを確かめる
-        match rendition.mode {
-            RenditionMode::Copy => {
-                check_video_stream(context, file, rendition, &streams, "copied")?
+        if rendition.mode == RenditionMode::Copy {
+            let video = streams
+                .iter()
+                .find(|stream| stream.codec_type == "video")
+                .ok_or_else(|| format!("video stream is missing: quality {}", file.quality))?;
+            if video.codec_name != "h264" {
+                return Err(format!(
+                    "copied video codec must be h264 but is {}: quality {}",
+                    video.codec_name, file.quality
+                ));
             }
-            RenditionMode::Upscale => {
-                check_video_stream(context, file, rendition, &streams, "upscaled")?
+            let resolution = rendition.resolution;
+            if video.width != Some(resolution.width) || video.height != Some(resolution.height) {
+                return Err(format!(
+                    "copied video resolution must be {} but is {}x{}: quality {}",
+                    resolution.text(),
+                    video.width.unwrap_or(0),
+                    video.height.unwrap_or(0),
+                    file.quality
+                ));
             }
-            RenditionMode::Encode => {}
+            if let Some(field_order) = &video.field_order
+                && field_order != "progressive"
+                && field_order != "unknown"
+            {
+                println!(
+                    "channel={} warning: copied video is {}: quality {}",
+                    context.channel_id(),
+                    field_order,
+                    file.quality
+                );
+            }
         }
-    }
-    Ok(())
-}
-
-/// コピーまたは upscale した映像が設定どおりか確かめる。
-///
-/// upscale は入力の 2 倍の解像度になるため、入力が想定と違えばここで気づける。
-/// `kind` はログに出す作り方の名前
-fn check_video_stream(
-    context: &ChannelContext,
-    file: &SegmentFile,
-    rendition: &RenditionSettings,
-    streams: &[ffmpeg::StreamInfo],
-    kind: &str,
-) -> Result<(), String> {
-    let video = streams
-        .iter()
-        .find(|stream| stream.codec_type == "video")
-        .ok_or_else(|| format!("video stream is missing: quality {}", file.quality))?;
-    if video.codec_name != "h264" {
-        return Err(format!(
-            "{kind} video codec must be h264 but is {}: quality {}",
-            video.codec_name, file.quality
-        ));
-    }
-    let resolution = rendition.resolution;
-    if video.width != Some(resolution.width) || video.height != Some(resolution.height) {
-        return Err(format!(
-            "{kind} video resolution must be {} but is {}x{}: quality {}",
-            resolution.text(),
-            video.width.unwrap_or(0),
-            video.height.unwrap_or(0),
-            file.quality
-        ));
-    }
-    if let Some(field_order) = &video.field_order
-        && field_order != "progressive"
-        && field_order != "unknown"
-    {
-        println!(
-            "channel={} warning: {kind} video is {}: quality {}",
-            context.channel_id(),
-            field_order,
-            file.quality
-        );
     }
     Ok(())
 }

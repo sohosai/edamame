@@ -100,13 +100,3 @@ quality = "480p"
 resolution = "854x480"
 bandwidth = 1400000
 video_bitrate = 1200000
-
-# Intel の GPU (QSV) では、raisr で 4K へ超解像する quality を作れる。
-# mode = "upscale" は h264_qsv のときだけ使え、入力のちょうど 2 倍の解像度を指定する。
-# 1080p の入力から 4K を作る場合は、encoder.codec を h264_qsv にして次の rendition を足す。
-# [[input.rendition]]
-# quality = "2160p"
-# mode = "upscale"
-# resolution = "3840x2160"
-# bandwidth = 22000000
-# video_bitrate = 20000000

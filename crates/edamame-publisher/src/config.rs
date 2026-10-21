@@ -120,8 +120,6 @@ pub enum RenditionMode {
     /// 指定したエンコーダで作り直す
     #[default]
     Encode,
-    /// Intel VSR (raisr) で 2 倍に拡大してから作り直す。h264_qsv 専用
-    Upscale,
 }
 
 /// 映像の解像度
@@ -295,21 +293,6 @@ impl PublisherSettings {
                             ));
                         }
                     }
-                    RenditionMode::Upscale => {
-                        // raisr の OpenCL 実行は Intel GPU を前提にするため、QSV 以外では受け付けない
-                        if !self.encoder.codec.ends_with("_qsv") {
-                            return Err(format!(
-                                "encoder.codec must be a qsv codec when mode is upscale: channel {} quality {}",
-                                input.channel_id, rendition.quality
-                            ));
-                        }
-                        if rendition.video_bitrate.unwrap_or(0) == 0 {
-                            return Err(format!(
-                                "video_bitrate must be positive when mode is upscale: channel {} quality {}",
-                                input.channel_id, rendition.quality
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -478,45 +461,6 @@ mod tests {
     fn rejects_encode_without_video_bitrate() {
         let mut target = settings();
         target.inputs[0].renditions[0].mode = RenditionMode::Encode;
-        assert!(target.validate().is_err());
-    }
-
-    /// テストで使う upscale の rendition
-    fn upscale_rendition() -> RenditionSettings {
-        RenditionSettings {
-            quality: "2160p".to_owned(),
-            mode: RenditionMode::Upscale,
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            bandwidth: 22_000_000,
-            video_bitrate: Some(20_000_000),
-        }
-    }
-
-    #[test]
-    fn accepts_upscale_with_qsv() {
-        let mut target = settings();
-        target.encoder.codec = "h264_qsv".to_owned();
-        target.inputs[0].renditions.push(upscale_rendition());
-        target.validate().unwrap();
-    }
-
-    #[test]
-    fn rejects_upscale_with_non_qsv_encoder() {
-        let mut target = settings();
-        target.inputs[0].renditions.push(upscale_rendition());
-        assert!(target.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_upscale_without_video_bitrate() {
-        let mut target = settings();
-        target.encoder.codec = "h264_qsv".to_owned();
-        let mut rendition = upscale_rendition();
-        rendition.video_bitrate = None;
-        target.inputs[0].renditions.push(rendition);
         assert!(target.validate().is_err());
     }
 
