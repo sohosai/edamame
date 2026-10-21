@@ -1,0 +1,12 @@
+[package]
+name = "edamame-telemetry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

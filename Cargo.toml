@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/edamame-domain",
+  "crates/edamame-telemetry",
   "crates/edamame-controller",
   "crates/edamame-worker",
   "crates/edamame-publisher",
@@ -20,6 +21,9 @@ cbc = { version = "0.1", features = ["alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
 getrandom = "0.3"
 libc = "0.2"
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "rt-tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "tokio", "ring", "tls12", "webpki-roots"] }

@@ -8,9 +8,11 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
+edamame-telemetry = { path = "../edamame-telemetry" }
+opentelemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tower-http.workspace = true
 
 [dev-dependencies]

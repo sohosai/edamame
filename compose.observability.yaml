@@ -1,0 +1,21 @@
+# Edamame の OpenTelemetry Collector（ローカル開発用）
+#
+# 既存の Prometheus から host.docker.internal:8889 を scrape する。
+# Edamame の各プロセスは 127.0.0.1:4317 に OTLP/gRPC を送る。
+#
+#   docker compose -f compose.observability.yaml up -d
+#
+# Grafana と Prometheus は既存のものを使うため、このファイルでは起動しない。
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: edamame-otel-collector
+    restart: unless-stopped
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      # ホストの 127.0.0.1 にだけ公開する
+      - "127.0.0.1:4317:4317" # OTLP/gRPC
+      - "127.0.0.1:4318:4318" # OTLP/HTTP
+      - "127.0.0.1:8889:8889" # Prometheus exporter
