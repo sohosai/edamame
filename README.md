@@ -121,13 +121,8 @@ cargo run --release -p edamame-publisher -- \
 ## Docker での起動
 
 `controller` と `worker` を Docker Compose で動かす最小構成（`compose.yaml`）の例を示す。
-同じ公開 URL にホストとコンテナから到達できるよう、この例ではホストの `/etc/hosts` に次の行を設定する。
-
-```text
-127.0.0.1 edamame.local
-```
-
-コンテナ側では `extra_hosts` により、この名前を Docker ホストの gateway に対応させる。
+ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使う。
+コンテナ間の通信には Compose のサービス名を使う。
 
 ```yaml
 services:
@@ -135,7 +130,7 @@ services:
     image: ghcr.io/sohosai/edamame-controller:latest
     environment:
       EDAMAME_BIND: 0.0.0.0:9000
-      EDAMAME_PUBLIC_URL: http://edamame.local:9000
+      EDAMAME_PUBLIC_URL: http://127.0.0.1:9000
       EDAMAME_STORAGE_CAPACITY: "512MiB"
       EDAMAME_PLAYLIST_SEGMENTS: 6
       EDAMAME_SYNC_INTERVAL_MS: 1000
@@ -143,8 +138,6 @@ services:
       EDAMAME_PUBLISH_WAIT_MS: 2000
       EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
-    extra_hosts:
-      - "edamame.local:host-gateway"
     ports:
       - "9000:9000"
 
@@ -155,18 +148,17 @@ services:
     environment:
       EDAMAME_WORKER_ID: worker-a
       EDAMAME_BIND: 0.0.0.0:9001
-      EDAMAME_PUBLIC_URL: http://edamame.local:9001
-      EDAMAME_CONTROLLER_URL: http://edamame.local:9000
+      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
+      EDAMAME_CONTROLLER_URL: http://controller:9000
       EDAMAME_CACHE_LIMIT: 12
       EDAMAME_AUTH_TOKEN: example-token
       EDAMAME_CORS_ORIGIN: "*"
-    extra_hosts:
-      - "edamame.local:host-gateway"
     ports:
       - "9001:9001"
 ```
 
 別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更する。
+`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[運用](./docs/operations.md#controller-を冗長化する)）。
 
 `publisher` のコンテナイメージには `ffmpeg` と Intel の GPU ドライバが含まれるため、Dockerfile の `publisher` ターゲットを指定してビルドする。
 NVIDIA の GPU は NVIDIA Container Toolkit（`--gpus all`）で、Intel の GPU は `--device /dev/dri:/dev/dri` でコンテナに割り当てる。
