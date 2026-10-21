@@ -437,6 +437,7 @@ impl TomyouApp {
             return;
         }
         let mut open = self.show_settings;
+        let mut close_requested = false;
         egui::Window::new("設定")
             .open(&mut open)
             .default_width(720.0)
@@ -529,7 +530,7 @@ impl TomyouApp {
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
                         self.save_config();
-                        self.show_settings = false;
+                        close_requested = true;
                     }
                     if ui.button("設定ファイルを再読込").clicked() {
                         match Config::load(&self.config_path) {
@@ -549,13 +550,13 @@ impl TomyouApp {
                         }
                     }
                     if ui.button("閉じる").clicked() {
-                        self.show_settings = false;
+                        close_requested = true;
                     }
                 });
                 ui.add_space(4.0);
                 ui.label("配信中は接続先の変更を反映しません。停止してから保存してください。");
             });
-        self.show_settings = open;
+        self.show_settings = open && !close_requested;
     }
 
     fn license_window(&mut self, ctx: &egui::Context) {
