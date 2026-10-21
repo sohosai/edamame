@@ -298,7 +298,14 @@ async fn prepare_imageflux(
             &config.imageflux.event_webhook_url,
         )
         .await?;
-    let whip = whip_url(&created.sora_url, &created.channel_id)?;
+    let whip = match whip_url(&created.sora_url, &created.channel_id) {
+        Ok(whip) => whip,
+        Err(error) => {
+            // Sora URL が不正でもチャンネルを作ったままにしない
+            let _ = client.delete_channel(&created.channel_id).await;
+            return Err(error);
+        }
+    };
     let _ = ui.send(SessionEvent::ImageFluxChannel {
         channel_id: created.channel_id.clone(),
         playlist_url: created.playlist_url.clone(),
