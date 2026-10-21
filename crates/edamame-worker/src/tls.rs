@@ -1,5 +1,6 @@
 //! worker の TLS 配信
 
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -17,6 +18,9 @@ use tokio_stream::StreamExt;
 /// 視聴者ごとに接続が作られるため、既定の 256 では同時接続数を下回る。保持できなかった
 /// 接続は毎回ハンドシェイクの署名と鍵交換を行うことになる
 const SESSION_CACHE_SIZE: usize = 16384;
+
+/// 終了時に既存の接続を待つ時間
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 /// TLS の暗号実装をプロセスに 1 度だけ登録する
 fn install_crypto_provider() {
@@ -104,11 +108,33 @@ pub async fn serve_static(
     app: Router,
     config: RustlsConfig,
 ) -> Result<(), EdamameError> {
-    axum_server::from_tcp_rustls(listener, config)
+    serve_static_until(listener, app, config, std::future::pending()).await
+}
+
+/// 読み込み済みの証明書で TLS 配信し、`shutdown` が完了したら終了する
+pub async fn serve_static_until<F>(
+    listener: TcpListener,
+    app: Router,
+    config: RustlsConfig,
+    shutdown: F,
+) -> Result<(), EdamameError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let handle = axum_server::Handle::new();
+    let server = axum_server::from_tcp_rustls(listener, config)
         .map_err(|error| EdamameError::Internal(format!("tls listener failed: {error}")))?
-        .serve(app.into_make_service())
-        .await
-        .map_err(|error| EdamameError::Internal(format!("tls server failed: {error}")))
+        .handle(handle.clone())
+        .serve(app.into_make_service());
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown => {
+            handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+            (&mut server).await
+        }
+    };
+    result.map_err(|error| EdamameError::Internal(format!("tls server failed: {error}")))
 }
 
 /// ACME で証明書を取得して TLS 配信する
@@ -123,6 +149,34 @@ pub async fn serve_acme(
     contact: Option<&str>,
     valid: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), EdamameError> {
+    serve_acme_until(
+        listener,
+        app,
+        domain,
+        directory,
+        cache_dir,
+        contact,
+        valid,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// ACME で証明書を取得して TLS 配信し、`shutdown` が完了したら終了する
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_acme_until<F>(
+    listener: TcpListener,
+    app: Router,
+    domain: &str,
+    directory: &str,
+    cache_dir: PathBuf,
+    contact: Option<&str>,
+    valid: tokio::sync::watch::Sender<bool>,
+    shutdown: F,
+) -> Result<(), EdamameError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     install_crypto_provider();
     let addr = listener
         .local_addr()
@@ -189,12 +243,21 @@ pub async fn serve_acme(
             }
         });
     }
-    axum_server::from_tcp(listener)
+    let handle = axum_server::Handle::new();
+    let server = axum_server::from_tcp(listener)
         .map_err(|error| EdamameError::Internal(format!("tls listener failed: {error}")))?
+        .handle(handle.clone())
         .acceptor(acceptor)
-        .serve(app.into_make_service())
-        .await
-        .map_err(|error| EdamameError::Internal(format!("tls server failed: {error}")))
+        .serve(app.into_make_service());
+    tokio::pin!(server);
+    let result = tokio::select! {
+        result = &mut server => result,
+        _ = shutdown => {
+            handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
+            (&mut server).await
+        }
+    };
+    result.map_err(|error| EdamameError::Internal(format!("tls server failed: {error}")))
 }
 
 /// 配信中の証明書を、client と同じ検証で確かめる

@@ -1,0 +1,38 @@
+# Edamame の OpenTelemetry Collector 設定（ローカル開発用）
+#
+# アプリから OTLP で受け取り、Prometheus が scrape できる形で 8889 に公開する。
+# 既存の Prometheus には job "edamame" として host.docker.internal:8889 を登録済み。
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 15
+  batch:
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # scope 情報の空ラベルを出さない
+    without_scope_info: true
+    # service.name などの resource 属性を Prometheus のラベルとして出す
+    resource_constant_labels:
+      included:
+        - "service.name"
+        - "service.instance.id"
+        - "service.version"
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

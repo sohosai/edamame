@@ -1,7 +1,7 @@
 //! `edamame-worker` の起動処理
 
 use clap::Parser;
-use edamame_domain::{normalize_http_url, normalize_public_url};
+use edamame_domain::{normalize_http_url, normalize_public_url, now_ms};
 use edamame_worker::cache::Cache;
 use edamame_worker::config::{TlsMode, WorkerConfig};
 use edamame_worker::http::{WorkerState, router};
@@ -23,6 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --acme-contact is not specified; certificate problem notices cannot be sent"
         );
     }
+    let mut telemetry = edamame_telemetry::init("edamame-worker", &config.worker_id);
+    if telemetry.is_enabled() {
+        println!(
+            "OpenTelemetry metrics enabled (worker: {})",
+            config.worker_id
+        );
+    }
     // client へは TLS 終端の reverse proxy 越しに配信することがあるため、https も許可する
     let public_url = normalize_public_url(&config.public_url)?;
     // worker は TLS を使わないため、controller へは http で接続する
@@ -42,70 +49,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let auth_token = auth_token.clone();
         tokio::spawn(run_sync_loop(state, auth_token))
     };
+    let metrics_task = telemetry.is_enabled().then(|| state.spawn_metrics_loop());
     println!("edamame-worker {} listening on {}", config.worker_id, bind);
-    match tls {
-        TlsMode::Plain => {
-            // 待ち受けに成功してから controller に登録する
-            let listener = tokio::net::TcpListener::bind(bind).await?;
-            run_sync(state.clone());
-            axum::serve(listener, app).await?;
-        }
-        TlsMode::Static { cert, key } => {
-            // 証明書を読み込んでから controller に登録する
-            let config = edamame_worker::tls::static_config(cert, key).await?;
-            let listener = bind_std_listener(bind)?;
-            run_sync(state.clone());
-            edamame_worker::tls::serve_static(listener, app, config).await?;
-        }
-        TlsMode::Acme {
-            domain,
-            directory,
-            cache_dir,
-            contact,
-        } => {
-            let listener = bind_std_listener(bind)?;
-            let (valid_sender, mut valid_receiver) = tokio::sync::watch::channel(false);
-            let server = tokio::spawn(async move {
-                edamame_worker::tls::serve_acme(
-                    listener,
-                    app,
-                    &domain,
-                    &directory,
-                    cache_dir,
-                    contact.as_deref(),
-                    valid_sender,
-                )
-                .await
-            });
-            // 証明書が有効な間だけ controller に登録する
-            let monitor_state = state.clone();
-            let monitor_token = config.auth_token.clone();
-            tokio::spawn(async move {
-                let mut sync_task: Option<tokio::task::JoinHandle<()>> = None;
-                let mut shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
-                while valid_receiver.changed().await.is_ok() {
-                    let valid = *valid_receiver.borrow();
-                    if valid && sync_task.is_none() {
-                        let (sender, receiver) = tokio::sync::watch::channel(false);
-                        shutdown = Some(sender);
-                        let state = monitor_state.clone();
-                        let token = monitor_token.clone();
-                        sync_task = Some(tokio::spawn(async move {
-                            edamame_worker::sync::run_sync_loop_until(state, token, receiver).await;
-                        }));
-                    } else if !valid && let Some(sender) = shutdown.take() {
-                        let _ = sender.send(true);
-                        // 取得中のタスクの停止を待ってから再開できるようにする
-                        if let Some(task) = sync_task.take() {
-                            let _ = task.await;
+
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        match tls {
+            TlsMode::Plain => {
+                // 待ち受けに成功してから controller に登録する
+                let listener = tokio::net::TcpListener::bind(bind).await?;
+                run_sync(state.clone());
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await?;
+            }
+            TlsMode::Static { cert, key } => {
+                // 証明書を読み込んでから controller に登録する
+                let config = edamame_worker::tls::static_config(cert, key).await?;
+                let listener = bind_std_listener(bind)?;
+                run_sync(state.clone());
+                edamame_worker::tls::serve_static_until(listener, app, config, shutdown_signal())
+                    .await?;
+            }
+            TlsMode::Acme {
+                domain,
+                directory,
+                cache_dir,
+                contact,
+            } => {
+                let listener = bind_std_listener(bind)?;
+                let (valid_sender, mut valid_receiver) = tokio::sync::watch::channel(false);
+                let server = tokio::spawn(async move {
+                    edamame_worker::tls::serve_acme_until(
+                        listener,
+                        app,
+                        &domain,
+                        &directory,
+                        cache_dir,
+                        contact.as_deref(),
+                        valid_sender,
+                        shutdown_signal(),
+                    )
+                    .await
+                });
+                // 証明書が有効な間だけ controller に登録する
+                let monitor_state = state.clone();
+                let monitor_token = config.auth_token.clone();
+                tokio::spawn(async move {
+                    let mut sync_task: Option<tokio::task::JoinHandle<()>> = None;
+                    let mut shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+                    while valid_receiver.changed().await.is_ok() {
+                        let valid = *valid_receiver.borrow();
+                        if valid && sync_task.is_none() {
+                            let (sender, receiver) = tokio::sync::watch::channel(false);
+                            shutdown = Some(sender);
+                            let state = monitor_state.clone();
+                            let token = monitor_token.clone();
+                            sync_task = Some(tokio::spawn(async move {
+                                edamame_worker::sync::run_sync_loop_until(state, token, receiver)
+                                    .await;
+                            }));
+                        } else if !valid && let Some(sender) = shutdown.take() {
+                            let _ = sender.send(true);
+                            // 取得中のタスクの停止を待ってから再開できるようにする
+                            if let Some(task) = sync_task.take() {
+                                let _ = task.await;
+                            }
                         }
                     }
-                }
-            });
-            server.await??;
+                });
+                server.await??;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    .await;
+
+    if let Some(task) = metrics_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if telemetry.is_enabled() {
+        state.record_metrics(now_ms()).await;
+    }
+    telemetry.shutdown();
+    result
 }
 
 /// 待ち受けを先に確保し、失敗を早く返す
@@ -123,4 +150,30 @@ fn bind_std_listener(bind: std::net::SocketAddr) -> std::io::Result<std::net::Tc
     let listener: std::net::TcpListener = listener.into();
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("warning: failed to install SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("warning: failed to install Ctrl-C handler: {error}");
+        }
+    }
 }

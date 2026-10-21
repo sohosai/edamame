@@ -1,10 +1,13 @@
 //! `edamame-controller` の起動処理
 
+use std::sync::Arc;
+
 use clap::Parser;
 use edamame_controller::config::{ControllerConfig, DEFAULT_PUBLISH_WAIT_MS};
 use edamame_controller::http::router;
 use edamame_controller::state::ControllerState;
 use edamame_controller::storage::CanonicalStore;
+use edamame_domain::now_ms;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,6 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "warning: --cors-origin is not specified; cross-origin browser access is disabled"
         );
     }
+    let instance_id = instance_id();
+    let mut telemetry = edamame_telemetry::init("edamame-controller", &instance_id);
+    if telemetry.is_enabled() {
+        println!("OpenTelemetry metrics enabled (instance: {instance_id})");
+    }
     let store = CanonicalStore::new(config.storage_capacity);
     let state = ControllerState::new(
         store,
@@ -36,14 +44,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.publish_wait_ms(),
         config.external_min_percent,
     );
-    let app = router(state, &cors, config.auth_token.as_deref());
+    let app = router(Arc::clone(&state), &cors, config.auth_token.as_deref());
+    let metrics_task = telemetry.is_enabled().then(|| state.spawn_metrics_loop());
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("edamame-controller listening on {}", config.bind);
     // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
+    if let Some(task) = metrics_task {
+        task.abort();
+        let _ = task.await;
+    }
+    if telemetry.is_enabled() {
+        state.record_metrics(now_ms()).await;
+    }
+    telemetry.shutdown();
+    serve_result?;
     Ok(())
+}
+
+fn instance_id() -> String {
+    std::env::var("EDAMAME_INSTANCE_ID")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "controller".to_owned())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("warning: failed to install SIGTERM handler: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("warning: failed to install Ctrl-C handler: {error}");
+        }
+    }
 }
