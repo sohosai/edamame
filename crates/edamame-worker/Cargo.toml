@@ -9,6 +9,8 @@ axum-server.workspace = true
 bytes.workspace = true
 clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
+edamame-telemetry = { path = "../edamame-telemetry" }
+opentelemetry.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 rustls-acme.workspace = true
@@ -16,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 # listen backlog を OS の既定 (128) より広げるために使う
 socket2 = { version = "0.6", features = ["all"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tower-http.workspace = true

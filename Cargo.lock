@@ -650,6 +650,8 @@ dependencies = [
  "bytes",
  "clap",
  "edamame-domain",
+ "edamame-telemetry",
+ "opentelemetry",
  "rcgen",
  "reqwest",
  "rustls",

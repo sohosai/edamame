@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use edamame_domain::{
-    EdamameError, RegisterRequest, RegisterResponse, SegmentKey, SyncRequest, SyncResponse,
+    EdamameError, RegisterRequest, RegisterResponse, SegmentKey, SyncRequest, SyncResponse, now_ms,
 };
 
 use crate::http::WorkerState;
@@ -47,6 +47,7 @@ pub async fn run_sync_loop_until(
                     discard_cache(&state).await;
                 }
                 Err(error) => {
+                    state.metrics.record_error("register");
                     eprintln!("registration failed: {error}");
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     continue;
@@ -77,7 +78,10 @@ pub async fn run_sync_loop_until(
                 registered = false;
                 continue;
             }
-            Err(error) => eprintln!("sync failed: {error}"),
+            Err(error) => {
+                state.metrics.record_error("sync");
+                eprintln!("sync failed: {error}");
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
@@ -136,6 +140,7 @@ async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, 
             "sync_interval_ms must be positive".to_owned(),
         ));
     }
+    state.record_controller_success(now_ms());
     Ok(body.sync_interval_ms)
 }
 
@@ -171,6 +176,7 @@ async fn sync_once(
         .json()
         .await
         .map_err(|error| EdamameError::Internal(format!("sync response is invalid: {error}")))?;
+    state.record_controller_success(now_ms());
     Ok(SyncOutcome::Known(body.fetch_segments))
 }
 
@@ -188,6 +194,7 @@ async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKe
                         match cache.put(&item.channel_id, &item.quality, item.sequence, bytes) {
                             Ok(removed) => removed,
                             Err(error) => {
+                                state.metrics.record_error("download");
                                 eprintln!(
                                     "failed to index cached segment {}/{}/{}: {error}",
                                     item.channel_id, item.quality, item.sequence
@@ -196,6 +203,9 @@ async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKe
                             }
                         }
                     };
+                    state
+                        .metrics
+                        .record_downloaded(&item.channel_id, &item.quality);
                     // 保存したセグメント自身が上限を超えて削除されたときは、索引がそのセグメントより新しい番号で埋まっている。
                     // 同じ channel と quality の索引を捨て、取得対象を取り直せるようにする。
                     let removed_self = removed.iter().any(|key| {
@@ -208,22 +218,31 @@ async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKe
                         cache.clear(&item.channel_id, &item.quality);
                     }
                 }
-                Err(error) => eprintln!(
-                    "failed to read segment body {}/{}/{}: {error}",
-                    item.channel_id, item.quality, item.sequence
-                ),
+                Err(error) => {
+                    state.metrics.record_error("download");
+                    eprintln!(
+                        "failed to read segment body {}/{}/{}: {error}",
+                        item.channel_id, item.quality, item.sequence
+                    );
+                }
             },
-            Ok(response) => eprintln!(
-                "segment fetch returned status {} for {}/{}/{}",
-                response.status(),
-                item.channel_id,
-                item.quality,
-                item.sequence
-            ),
-            Err(error) => eprintln!(
-                "segment fetch failed for {}/{}/{}: {error}",
-                item.channel_id, item.quality, item.sequence
-            ),
+            Ok(response) => {
+                state.metrics.record_error("download");
+                eprintln!(
+                    "segment fetch returned status {} for {}/{}/{}",
+                    response.status(),
+                    item.channel_id,
+                    item.quality,
+                    item.sequence
+                );
+            }
+            Err(error) => {
+                state.metrics.record_error("download");
+                eprintln!(
+                    "segment fetch failed for {}/{}/{}: {error}",
+                    item.channel_id, item.quality, item.sequence
+                );
+            }
         }
     }
 }
