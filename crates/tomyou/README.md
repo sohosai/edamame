@@ -32,7 +32,7 @@ Linux でビルドする場合は、egui と資格情報ストアの開発パッ
 sudo apt-get install \
   pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
   libgl1-mesa-dev libegl1-mesa-dev libssl-dev \
-  libdbus-1-dev libsecret-1-dev
+  libxkbcommon-x11-0 libdbus-1-dev libsecret-1-dev
 ```
 
 ## ビルドと起動
