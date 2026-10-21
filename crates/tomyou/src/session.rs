@@ -133,10 +133,19 @@ async fn run(
     let _ = ui.send(SessionEvent::ObsStreaming);
 
     let state_path = State::default_path().ok();
-    let mut state = state_path
-        .as_ref()
-        .and_then(|path| State::load(path).ok())
-        .unwrap_or_default();
+    let mut state = match state_path.as_ref() {
+        Some(path) => match State::load(path) {
+            Ok(state) => state,
+            Err(error) => {
+                warn!("failed to load state: {error:#}");
+                let _ = ui.send(SessionEvent::Log(format!(
+                    "状態ファイルを読めません。残存チャンネルの追跡を省略します: {error:#}"
+                )));
+                State::default()
+            }
+        },
+        None => State::default(),
+    };
 
     let imageflux_client = if config.imageflux_enabled() {
         match ImageFluxClient::new(config.imageflux.token.clone()) {
