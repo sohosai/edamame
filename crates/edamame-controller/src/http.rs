@@ -38,6 +38,7 @@ pub fn router(state: Arc<ControllerState>, cors: &CorsOrigins, auth_token: Optio
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
     // セグメントのパスの第 3 要素は、PUT ではセグメント識別子、GET ではセグメント番号のファイル名として扱う
     let read = Router::new()
+        .route("/health", get(health))
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
             get(get_segment),
@@ -163,6 +164,11 @@ impl IntoResponse for HttpError {
             StatusCode::from_u16(self.0.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, self.0.message().to_owned()).into_response()
     }
+}
+
+/// プロセスが HTTP を受け付けられることを示す死活監視用の応答
+async fn health() -> (StatusCode, &'static str) {
+    (StatusCode::OK, "ok")
 }
 
 #[derive(Debug, Deserialize)]
