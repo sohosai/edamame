@@ -1,0 +1,77 @@
+# tomyou の設定例
+# 秘密情報はこのファイルに保存されず、OS の資格情報ストアへ保存される。
+# 初回は GUI の「設定」から入力し、「保存」を押す。
+
+# live2025-server が認識する固定のチャンネル名
+channel_id = "uni"
+
+[obs]
+host = "127.0.0.1"
+port = 4455
+# password は資格情報ストアへ保存する
+
+[publisher]
+# edamame-publisher が待ち受ける RTMP URL
+rtmp_url = "rtmp://publisher.example.test:1935/live/uni"
+
+[imageflux]
+# token は資格情報ストアへ保存する
+# 例: https://live-api-dev.sohosai.com/key/uni
+encrypt-key-uri = ""
+event_webhook_url = ""
+
+# whip-script の example.toml と同じ HLS 設定
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 1920
+height = 1080
+fps = 60
+bps = 15000000
+
+[imageflux.hls.audio]
+bps = 320000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 1280
+height = 720
+fps = 60
+bps = 2500000
+
+[imageflux.hls.audio]
+bps = 128000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 854
+height = 480
+fps = 24
+bps = 950000
+
+[imageflux.hls.audio]
+bps = 96000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[relay]
+bind = "127.0.0.1:1935"
+
+[ffmpeg]
+# 空欄なら PATH、環境変数 TOMYOU_FFMPEG、標準的なインストール先から探す。
+# path = "/usr/local/bin/ffmpeg"

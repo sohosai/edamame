@@ -22,7 +22,7 @@ client    ─── GET セグメント (.ts) ───────────�
 
 ## 必要な環境
 
-- Rust 1.85 以降（edition 2024）
+- Rust 1.93 以降（edition 2024。`tomyou` が eframe と shiguredo_rtmp を使うため）
 - ネットワークの到達性：
   - `publisher` と `worker` から、`controller` の HTTP アドレスへ到達できること
   - `client` から、`controller` のアドレス（プレイリスト取得用）へ到達できること
@@ -117,6 +117,19 @@ cargo run --release -p edamame-publisher -- \
 
 設定ファイルの書き方、暗号化と鍵登録の仕組み、失敗時の扱いは [publisher](./docs/publisher.md) で説明する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
+
+## tomyou
+
+`crates/tomyou` は、拠点の OBS から Edamame と ImageFlux へ同時に映像を送る GUI アプリである。
+OBS の配信先をローカルの RTMP サーバへ変更し、Edamame 向けの RTMP と ImageFlux 向けの WHIP を別プロセスで送る。
+
+```bash
+cargo run --release -p tomyou
+```
+
+設定、OBS の条件、ffmpeg の必要機能、ImageFlux の扱い、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
+この版では ImageFlux のプレイリストを live2025-server へ登録しない。
+Edamame の URL と鍵の登録は、既存の `publisher` の設定を使う。
 
 ## Docker での起動
 
