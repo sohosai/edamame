@@ -4,6 +4,7 @@ pub mod cluster;
 pub mod config;
 mod external;
 pub mod http;
+mod metrics;
 pub mod state;
 pub mod storage;
 

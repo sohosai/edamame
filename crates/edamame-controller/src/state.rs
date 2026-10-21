@@ -13,6 +13,7 @@ use edamame_domain::{
 use tokio::sync::Mutex;
 
 use crate::external;
+use crate::metrics::ControllerMetrics;
 use crate::storage::CanonicalStore;
 
 /// controller の共有状態
@@ -24,6 +25,7 @@ pub struct ControllerState {
     pub publish_wait_ms: u64,
     /// 外部配信へ流す最低の割合（%）
     pub external_min_percent: u8,
+    pub(crate) metrics: ControllerMetrics,
     pub inner: Mutex<Inner>,
 }
 
@@ -41,6 +43,8 @@ pub struct Inner {
 /// channel のメタデータ
 pub struct ChannelState {
     pub segment_duration_ms: u64,
+    /// 最後に新しいセグメントを保存した時刻
+    pub last_ingest_ms: u64,
     pub qualities: BTreeMap<String, QualityState>,
     /// 外部配信の master m3u8 の URL。publisher が PUT で宣言する
     pub external_m3u8: Option<String>,
@@ -60,6 +64,7 @@ impl ChannelState {
     fn new(segment_duration_ms: u64, next_sequence: u64) -> Self {
         Self {
             segment_duration_ms,
+            last_ingest_ms: 0,
             qualities: BTreeMap::new(),
             external_m3u8: None,
             identifiers: BTreeMap::new(),
@@ -147,6 +152,7 @@ impl ControllerState {
             sync_timeout_ms,
             publish_wait_ms,
             external_min_percent,
+            metrics: ControllerMetrics::new(),
             inner: Mutex::new(Inner::default()),
         })
     }
@@ -295,6 +301,9 @@ impl ControllerState {
             .channels
             .entry(channel_id.to_owned())
             .or_insert_with(|| ChannelState::new(duration_ms, 1));
+        if matches!(outcome, IngestOutcome::Created { .. }) {
+            channel.last_ingest_ms = committed_at_ms;
+        }
         let identifier_state = channel
             .identifiers
             .entry(identifier.to_owned())
@@ -420,7 +429,7 @@ impl ControllerState {
             worker.fetching = fetching;
         }
         // 公開範囲は GET では変えず、worker の sync 報告を受けた時だけ更新する
-        {
+        let advances = {
             let Inner {
                 channels, workers, ..
             } = &mut *inner;
@@ -430,7 +439,11 @@ impl ControllerState {
                 self.playlist_segments,
                 self.sync_timeout_ms,
                 now_ms,
-            );
+            )
+        };
+        for advance in advances {
+            self.metrics
+                .record_published(&advance.channel_id, &advance.quality, advance.segments);
         }
         let target = cache_target(&inner.channels, self.playlist_segments);
         // 同じ番号で保存し直したセグメントは、キャッシュの報告に関わらず取得を指示する。
@@ -641,6 +654,40 @@ impl ControllerState {
         let entries = plan_master_playlist(&inputs, segment_duration_ms, self.playlist_segments)?;
         Ok(MasterResponse::Local(render_master_playlist(&entries)))
     }
+
+    /// 現在の状態をメトリクスに記録する
+    pub async fn record_metrics(&self, now_ms: u64) {
+        let inner = self.inner.lock().await;
+        self.metrics.record_up();
+        for (worker_id, worker) in &inner.workers {
+            self.metrics.record_worker(
+                worker_id,
+                age_seconds(now_ms, worker.last_sync_ms),
+                worker.weight,
+            );
+        }
+        for (channel_id, channel) in &inner.channels {
+            self.metrics.record_channel(
+                channel_id,
+                age_seconds(now_ms, channel.last_ingest_ms),
+                milliseconds_to_seconds(channel.segment_duration_ms),
+                published_lag_seconds(channel, now_ms),
+            );
+        }
+    }
+
+    /// 5 秒ごとに状態をメトリクスへ記録するタスクを起動する
+    #[must_use = "終了時に abort するため、JoinHandle を保持すること"]
+    pub fn spawn_metrics_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                state.record_metrics(now_ms()).await;
+            }
+        })
+    }
 }
 
 /// `master.m3u8` を外部配信へ振り分けるかどうかの指定
@@ -699,6 +746,44 @@ fn validate_segment_metadata(
 /// 期限内に sync した worker か
 fn is_alive(worker: &WorkerState, now_ms: u64, sync_timeout_ms: u64) -> bool {
     now_ms.saturating_sub(worker.last_sync_ms) <= sync_timeout_ms
+}
+
+fn age_seconds(now_ms: u64, then_ms: u64) -> f64 {
+    milliseconds_to_seconds(now_ms.saturating_sub(then_ms))
+}
+
+fn milliseconds_to_seconds(milliseconds: u64) -> f64 {
+    milliseconds as f64 / 1000.0
+}
+
+/// 最後のセグメント到着から、公開済みの末尾までの遅れを秒で返す
+///
+/// まだ何も公開していない quality は、保持している先頭セグメントの 1 つ前まで
+/// 公開済みとみなし、未公開のセグメント数を遅れに含める。
+fn published_lag_seconds(channel: &ChannelState, now_ms: u64) -> f64 {
+    let mut max_unpublished = 0;
+    for quality_state in channel.qualities.values() {
+        let Some(latest) = quality_state.segments.iter().next_back().copied() else {
+            continue;
+        };
+        let published_tail = quality_state
+            .published
+            .iter()
+            .next_back()
+            .copied()
+            .unwrap_or_else(|| {
+                quality_state
+                    .segments
+                    .iter()
+                    .next()
+                    .copied()
+                    .unwrap_or(latest)
+                    .saturating_sub(1)
+            });
+        max_unpublished = max_unpublished.max(latest.saturating_sub(published_tail));
+    }
+    age_seconds(now_ms, channel.last_ingest_ms)
+        + milliseconds_to_seconds(max_unpublished.saturating_mul(channel.segment_duration_ms))
 }
 
 /// 全 quality について、重み付きの選択に使う現在値をリセットする
@@ -785,16 +870,25 @@ fn holds_segments(
     })
 }
 
-/// 各 quality の公開範囲を独立に進める
+/// 公開範囲が進んだセグメント
+struct PublishedAdvance {
+    channel_id: String,
+    quality: String,
+    segments: u64,
+}
+
+/// 各 quality の公開範囲を独立に進め、新しく公開したセグメントを返す
 fn advance_published(
     channels: &mut BTreeMap<String, ChannelState>,
     workers: &BTreeMap<String, WorkerState>,
     playlist_segments: u64,
     sync_timeout_ms: u64,
     now_ms: u64,
-) {
+) -> Vec<PublishedAdvance> {
+    let mut advances = Vec::new();
     for (channel_id, channel) in channels.iter_mut() {
         for (quality, quality_state) in channel.qualities.iter_mut() {
+            let before = quality_state.published.clone();
             advance_quality_published(
                 channel_id,
                 quality,
@@ -804,8 +898,17 @@ fn advance_published(
                 sync_timeout_ms,
                 now_ms,
             );
+            let newly_published = quality_state.published.difference(&before).count();
+            if newly_published > 0 {
+                advances.push(PublishedAdvance {
+                    channel_id: channel_id.clone(),
+                    quality: quality.clone(),
+                    segments: u64::try_from(newly_published).unwrap_or(u64::MAX),
+                });
+            }
         }
     }
+    advances
 }
 
 /// 1 つの quality の公開範囲を、保持している worker の最新範囲に合わせる
@@ -1160,6 +1263,63 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn published_lag_includes_ingest_age_and_unpublished_segments() {
+        let mut channel = channel_with_quality(&[0, 1, 2, 3, 4, 5], &[0, 1, 2], None, Some(5), &[]);
+        channel.last_ingest_ms = 1_000;
+
+        let lag = published_lag_seconds(&channel, 4_000);
+
+        assert_eq!(lag, 3.0 + 3.0 * 6.0);
+    }
+
+    #[test]
+    fn published_lag_counts_all_retained_segments_when_nothing_is_published() {
+        let mut channel = channel_with_quality(&[2, 3, 4], &[], None, Some(4), &[]);
+        channel.last_ingest_ms = 2_000;
+
+        let lag = published_lag_seconds(&channel, 5_000);
+
+        // 保持している 2, 3, 4 がすべて未公開なので、3 セグメント分を含める
+        assert_eq!(lag, 3.0 + 3.0 * 6.0);
+    }
+
+    #[test]
+    fn advance_published_reports_newly_published_segments() {
+        let mut channels = BTreeMap::from([(
+            "live".to_owned(),
+            channel_with_quality(&[0, 1, 2], &[], None, Some(2), &[]),
+        )]);
+        let workers = BTreeMap::from([(
+            "worker-a".to_owned(),
+            worker_with_cached("live", "720p", &[0, 1, 2]),
+        )]);
+
+        let advances = advance_published(&mut channels, &workers, 6, 10_000, 5_000);
+
+        assert_eq!(advances.len(), 1);
+        assert_eq!(advances[0].channel_id, "live");
+        assert_eq!(advances[0].quality, "720p");
+        assert_eq!(advances[0].segments, 3);
+    }
+
+    #[tokio::test]
+    async fn last_ingest_advances_only_for_new_segments() {
+        let state = ControllerState::new(CanonicalStore::new(1_000), 6, 1_000, 10_000, 0, 1);
+        ingest_encrypted_segment(&state, 0).await;
+        let first = state.inner.lock().await.channels["live"].last_ingest_ms;
+        assert!(first > 0);
+
+        // 同じ識別子・同じバイト列の再 PUT では最終到着時刻を進めない
+        {
+            let mut inner = state.inner.lock().await;
+            inner.channels.get_mut("live").unwrap().last_ingest_ms = 1;
+        }
+        ingest_encrypted_segment(&state, 0).await;
+
+        assert_eq!(state.inner.lock().await.channels["live"].last_ingest_ms, 1);
     }
 
     /// 保存されているセグメントの暗号化の指定は、メタデータの window から外れても残す

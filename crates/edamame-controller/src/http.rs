@@ -344,7 +344,7 @@ async fn put_segment(
     Query(query): Query<SegmentQuery>,
     body: Bytes,
 ) -> Result<Response, HttpError> {
-    let outcome = state
+    let outcome = match state
         .ingest_segment(SegmentIngest {
             channel_id: &channel_id,
             quality: &quality,
@@ -356,9 +356,19 @@ async fn put_segment(
             iv: query.iv.as_deref(),
             bytes: &body,
         })
-        .await?;
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.metrics.record_error("ingest");
+            return Err(error.into());
+        }
+    };
     let (status, sequence) = match outcome {
-        IngestOutcome::Created { sequence } => (StatusCode::CREATED, sequence),
+        IngestOutcome::Created { sequence } => {
+            state.metrics.record_ingested(&channel_id, &quality);
+            (StatusCode::CREATED, sequence)
+        }
         IngestOutcome::AlreadyExists { sequence } => (StatusCode::OK, sequence),
     };
     Ok((status, Json(SegmentPutResponse { sequence })).into_response())
@@ -470,10 +480,16 @@ async fn put_channel_external(
     Path(channel_id): Path<String>,
     ValidatedJson(request): ValidatedJson<ExternalM3u8Request>,
 ) -> Result<Response, HttpError> {
-    state
+    match state
         .set_external_m3u8(&channel_id, request.external_m3u8.as_deref())
-        .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Err(error) => {
+            state.metrics.record_error("external");
+            Err(error.into())
+        }
+    }
 }
 
 async fn put_worker(
@@ -481,9 +497,16 @@ async fn put_worker(
     Path(worker_id): Path<String>,
     ValidatedJson(request): ValidatedJson<RegisterRequest>,
 ) -> Result<Response, HttpError> {
-    let created = state
+    let created = match state
         .register_worker(&worker_id, &request.public_url, request.weight, now_ms())
-        .await?;
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => {
+            state.metrics.record_error("register");
+            return Err(error.into());
+        }
+    };
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -503,14 +526,21 @@ async fn post_sync(
     Path(worker_id): Path<String>,
     ValidatedJson(request): ValidatedJson<SyncRequest>,
 ) -> Result<Json<SyncResponse>, HttpError> {
-    let response = state
+    let response = match state
         .sync_worker(
             &worker_id,
             request.cached_segments,
             request.fetching_segments,
             now_ms(),
         )
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            state.metrics.record_error("sync");
+            return Err(error.into());
+        }
+    };
     Ok(Json(response))
 }
 

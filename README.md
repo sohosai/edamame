@@ -30,6 +30,7 @@ client    ─── GET セグメント (.ts) ───────────�
 - `edamame-publisher` を動かす場合は、SRT と RTMP に対応した `ffmpeg` と `ffprobe`、およびエンコーダに応じた GPU 環境：
   - NVEnc（`h264_nvenc`）を使う場合：NVIDIA の GPU とドライバ
   - QSV（`h264_qsv`）を使う場合：Intel の GPU、VA-API ドライバ、oneVPL の GPU ランタイム
+  - 4K の超解像（`mode = "upscale"`）を使う場合：Intel VSR（raisr）を組み込んだ `ffmpeg` と OpenCL ランタイム（publisher の Docker イメージには同梱される）
   - ソフトウェアエンコード（`libx264`）や映像コピー（`copy`）だけで動かす場合は GPU 不要
 
 ## ビルド
@@ -106,6 +107,7 @@ DNS の共有名から各機へ到達させる起動例は [運用](./docs/opera
 
 `crates/edamame-publisher` は、SRT または RTMP で受け取ったライブ映像を処理するプロセスである。
 `ffmpeg` で複数画質（`quality`）の MPEG-TS セグメントに変換し、AES-128-CBC で暗号化して `controller` へ `PUT` し続ける。
+QSV を使う場合は、Intel VSR（raisr）で 2 倍に拡大する `mode = "upscale"` も使える。
 GPU と `ffmpeg` を使うため、通常は `controller` や `worker` とは別のホストで動かす。
 
 ```bash
@@ -159,7 +161,7 @@ services:
 別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更する。
 `controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[運用](./docs/operations.md#controller-を冗長化する)）。
 
-`publisher` のコンテナイメージには `ffmpeg` と Intel の GPU ドライバが含まれるため、Dockerfile の `publisher` ターゲットを指定してビルドする。
+`publisher` のコンテナイメージは raisr 入りの `ffmpeg` と Intel のドライバを含むため、Dockerfile の `publisher` ターゲットを指定してビルドする（ビルドに時間がかかる）。
 NVIDIA の GPU は NVIDIA Container Toolkit（`--gpus all`）で、Intel の GPU は `--device /dev/dri:/dev/dri` でコンテナに割り当てる。
 
 ```bash

@@ -1,6 +1,7 @@
 //! worker の HTTP API
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -10,12 +11,14 @@ use axum::http::{HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use edamame_domain::{
-    CorsOrigins, EdamameError, parse_sequence_filename, validate_identifier, validate_quality,
+    CorsOrigins, EdamameError, now_ms, parse_sequence_filename, validate_identifier,
+    validate_quality,
 };
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::cache::Cache;
+use crate::metrics::WorkerMetrics;
 
 /// worker の共有状態
 pub struct WorkerState {
@@ -26,6 +29,8 @@ pub struct WorkerState {
     pub path_prefix: String,
     pub cache: Mutex<Cache>,
     pub client: reqwest::Client,
+    pub(crate) metrics: WorkerMetrics,
+    last_controller_success_ms: AtomicU64,
 }
 
 impl WorkerState {
@@ -54,8 +59,58 @@ impl WorkerState {
             path_prefix,
             cache: Mutex::new(cache),
             client,
+            metrics: WorkerMetrics::new(),
+            last_controller_success_ms: AtomicU64::new(now_ms()),
         }))
     }
+
+    /// controller への登録または sync に成功した時刻を記録する
+    pub(crate) fn record_controller_success(&self, at_ms: u64) {
+        self.last_controller_success_ms
+            .store(at_ms, Ordering::Relaxed);
+    }
+
+    fn controller_last_success_ms(&self) -> u64 {
+        self.last_controller_success_ms.load(Ordering::Relaxed)
+    }
+
+    /// 現在の状態をメトリクスに記録する
+    pub async fn record_metrics(&self, now_ms: u64) {
+        let stats = {
+            let cache = self.cache.lock().await;
+            cache.stats()
+        };
+        self.metrics.record_up();
+        self.metrics.record_controller_last_success_age(age_seconds(
+            now_ms,
+            self.controller_last_success_ms(),
+        ));
+        for stat in stats {
+            self.metrics.record_cache(
+                &stat.channel_id,
+                &stat.quality,
+                stat.head_sequence,
+                u64::try_from(stat.segments).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    /// 5 秒ごとに状態をメトリクスへ記録するタスクを起動する
+    #[must_use = "終了時に abort するため、JoinHandle を保持すること"]
+    pub fn spawn_metrics_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                state.record_metrics(now_ms()).await;
+            }
+        })
+    }
+}
+
+fn age_seconds(now_ms: u64, then_ms: u64) -> f64 {
+    now_ms.saturating_sub(then_ms) as f64 / 1000.0
 }
 
 /// worker のルーター
@@ -120,7 +175,10 @@ async fn get_segment(
         cache.get(&channel_id, &quality, sequence)
     };
     match bytes {
-        Some(bytes) => Ok(segment_response(bytes)),
+        Some(bytes) => {
+            state.metrics.record_served(&channel_id, &quality);
+            Ok(segment_response(bytes))
+        }
         None => Err(EdamameError::NotFound("segment is not cached".to_owned()).into()),
     }
 }

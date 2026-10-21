@@ -14,6 +14,15 @@ pub struct Cache {
     entries: BTreeMap<(String, String), BTreeMap<u64, Bytes>>,
 }
 
+/// キャッシュしているセグメントの集計値
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheStats {
+    pub channel_id: String,
+    pub quality: String,
+    pub segments: usize,
+    pub head_sequence: u64,
+}
+
 impl Cache {
     /// 空のキャッシュを作る
     pub fn new(limit: u64) -> Result<Self, EdamameError> {
@@ -124,6 +133,23 @@ impl Cache {
         }
         ids
     }
+
+    /// `(channel_id, quality)` ごとのセグメント数と最新 sequence を返す
+    #[must_use]
+    pub fn stats(&self) -> Vec<CacheStats> {
+        self.entries
+            .iter()
+            .filter_map(|((channel_id, quality), segments)| {
+                let head_sequence = *segments.keys().next_back()?;
+                Some(CacheStats {
+                    channel_id: channel_id.clone(),
+                    quality: quality.clone(),
+                    segments: segments.len(),
+                    head_sequence,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +249,39 @@ mod tests {
         cache.clear_all();
         assert!(cache.keys().is_empty());
         assert!(cache.cached_ids().is_empty());
+    }
+
+    #[test]
+    fn stats_reports_segment_count_and_head_sequence_per_quality() {
+        let mut cache = cache(2);
+        for sequence in [101, 102] {
+            cache
+                .put("live", "720p", sequence, Bytes::from_static(b"720p"))
+                .unwrap();
+        }
+        cache
+            .put("live", "1080p", 201, Bytes::from_static(b"1080p"))
+            .unwrap();
+
+        let mut stats = cache.stats();
+        stats.sort_by(|left, right| left.quality.cmp(&right.quality));
+
+        assert_eq!(
+            stats,
+            vec![
+                CacheStats {
+                    channel_id: "live".to_owned(),
+                    quality: "1080p".to_owned(),
+                    segments: 1,
+                    head_sequence: 201,
+                },
+                CacheStats {
+                    channel_id: "live".to_owned(),
+                    quality: "720p".to_owned(),
+                    segments: 2,
+                    head_sequence: 102,
+                },
+            ]
+        );
     }
 }

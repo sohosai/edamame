@@ -14,7 +14,8 @@ MP4 ファイルを無限ループさせてテスト配信を行うスクリプ�
 
 - NVIDIA の GPU とドライバ（NVEnc を使う場合）。同時に使える NVEnc セッション数は、ドライバ 550.54.14 以降では 8 までである
 - Intel の GPU と VA-API のドライバ、oneVPL の GPU ランタイム（QSV を使う場合）。Ubuntu 26.04 では `intel-media-va-driver-non-free` と `libmfx-gen1.2` を入れる（oneVPL の本体は `ffmpeg` が依存する `libvpl2` で入る）
-- SRT と RTMP に対応した `ffmpeg` と `ffprobe`（Ubuntu の `ffmpeg` パッケージは両方を満たす）
+- OpenCL のランタイム（`mode = "upscale"` の超解像を使う場合）。Ubuntu 26.04 では `intel-opencl-icd` を入れ、実行時にホストの `/dev/dri` を渡す
+- SRT と RTMP に対応した `ffmpeg` と `ffprobe`（Ubuntu の `ffmpeg` パッケージは両方を満たす）。超解像を使う場合は Intel VSR（raisr）を組み込んだ `ffmpeg` が必要で、publisher の Docker イメージには同梱される
 - 起動済みの Edamame `controller`（プレイリストの取得と再生まで確認する場合は `worker` も起動しておく）
 - SRT または RTMP を送ってくる映像送信側
 
@@ -62,7 +63,7 @@ docker build --target publisher -t edamame-publisher .
 | `input.live_url` | `controller` の公開マスタープレイリストの HTTPS URL。`--stream-credentials-url` で鍵と一緒に登録する場合は必須 |
 | `input.key_uri` | メディアプレイリストに出力する暗号鍵の URI。指定すると `PUT` に `key_uri` と `iv` を付ける |
 | `rendition.quality` | `quality` の識別子。同じ `channel` 内で同じ値は重複させない。`master` は予約されているため使えない |
-| `rendition.mode` | `copy` は入力の映像ストリームをそのままコピーする。省略時（`encode`）は指定したエンコーダで再エンコードする。音声はどちらのモードでも再エンコードせずコピーする（`-c:a copy`）ため、入力音声は AAC である必要がある |
+| `rendition.mode` | `copy` は入力の映像ストリームをそのままコピーする。`upscale` は Intel VSR（raisr）で 2 倍に拡大してから作り直す（`h264_qsv` 専用）。省略時（`encode`）は指定したエンコーダで再エンコードする。音声はどちらのモードでも再エンコードせずコピーする（`-c:a copy`）ため、入力音声は AAC である必要がある |
 | `rendition.resolution` | `WIDTHxHEIGHT`（幅と高さはどちらも偶数）。再エンコード時はこの解像度へリサイズし、`copy` のときは入力映像の解像度と一致するかを検証する |
 | `rendition.bandwidth` | `controller` へ宣言するビットレート。音声と多重化を含めた値にする |
 | `rendition.video_bitrate` | エンコーダの目標ビットレート。`mode = "copy"` のときは指定しない |
@@ -71,6 +72,16 @@ docker build --target publisher -t edamame-publisher .
 たとえばセグメント長が 6 秒なら、1 秒、2 秒、3 秒、6 秒の間隔が使える。
 `ffmpeg` の HLS muxer は実行の先頭からセグメント長の倍数の位置で区切るため、割り切れないと長いセグメントと短いセグメントが混ざる。
 確定したセグメント長が指定値から 100 ms を超えてずれた場合は `publisher` が警告を出すため、送信側のキーフレーム間隔を直す。
+
+`upscale` を使う `quality` では、入力のちょうど 2 倍の解像度を指定する。
+1080p の入力から 4K を作る場合は `resolution = "3840x2160"` と書く。
+拡大は Intel VSR（raisr）が行い、倍率は 2 倍固定である。
+`upscale` は `encoder.codec` が `h264_qsv` のときだけ使える。
+エンコードの設定は他の `quality` と同じで、`encoder.preset` と `video_bitrate` を使う。
+
+raisr は Intel GPU の OpenCL で動く。
+publisher の Docker イメージには OpenCL のランタイムとフィルタデータが入っているため、ホストの `/dev/dri` を渡せば動く。
+入力は 8 bit の H.264 にする。
 
 ### CLI オプション
 
@@ -187,6 +198,15 @@ ffprobe plain.ts
 `$IV` には、対象セグメントの `#EXT-X-KEY` にある `IV` 属性から先頭の `0x` を除いた値を設定する。
 `input.key_uri` を指定していない場合はプレイリストに `IV` 属性が出ないため、全ゼロの IV を使う。
 
+超解像を使う場合は、先に raisr が動くことを確かめる。
+publisher のイメージで次のコマンドを実行し、`fps` が入力のフレームレートに追いついているかを見る。
+
+```bash
+docker run --rm --device /dev/dri:/dev/dri --entrypoint ffmpeg ghcr.io/sohosai/edamame-publisher:latest \
+  -hide_banner -f lavfi -i testsrc2=size=1920x1080:rate=30 -t 10 \
+  -vf raisr=filterfolder=/usr/local/share/raisr/filters_2x/filters_highres:asm=opencl -f null -
+```
+
 `--stream-credentials-url` を使っている場合は、鍵と配信 URL の登録を確かめる。
 `GET /channel/:channel_id` の `live_url` と、`GET /key/:channel_id` が返す鍵を確認する。
 鍵のエンドポイントはセッション cookie を要求するため、実際の確認は `client` と同じ経路で行う。
@@ -269,6 +289,8 @@ curl -i -b 'session=<session>' 'https://live.example.test/key/uni' | xxd
 | 鍵の登録時の 400、401 | 設定の誤りとみなし、ログを出して登録を打ち切る。配信は続ける |
 | 未送信セットが `segment_duration_ms` × `backlog_limit` の時間を過ぎる | そのセットを捨てる |
 | AAC 以外の音声、`copy` の前提を満たさない入力 | その channel を止める。待ち時間を置いて起動し直し、他の channel は続ける |
+| `upscale` のセグメントが設定した解像度と違う | その channel を止め、待ち時間を置いて起動し直す（入力の解像度が想定と違う設定の誤り） |
+| OpenCL が使えず raisr を初期化できない | ffmpeg が終了する。ffmpeg の終了と同じ扱いとする |
 | SIGINT、SIGTERM | 全 ffmpeg を止めて終了する |
 
 `channel` が止まった場合、`publisher` はその `channel` の `ffmpeg` と送信処理を終わらせ、他の `channel` の配信を続ける。
@@ -283,3 +305,5 @@ curl -i -b 'session=<session>' 'https://live.example.test/key/uni' | xxd
 - `copy` の `quality` は、入力のキーフレーム間隔がセグメント長を割り切る場合だけセグメントの長さが揃う
 - `h264_qsv` では入力の映像コーデックを QSV がデコードできる必要がある。デコードできない入力では `ffmpeg` が起動に失敗し、ソフトウェアデコードへは切り替わらない
 - `h264_nvenc` と `libx264` では入力の映像をソフトウェアでデコードする。CPU が足りない場合は NVDEC の利用を検討する
+- `upscale` は OpenCL が使える Intel GPU が必須で、拡大の倍率は 2 倍固定である。1080p から 2160p のリアルタイム変換は GPU の性能に依存する
+- `upscale` の入力は 8 bit の H.264 を前提にする。入力の解像度が `resolution` の半分でない場合、最初のセットの検査で channel が止まる

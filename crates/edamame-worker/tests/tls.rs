@@ -81,6 +81,48 @@ async fn serves_segments_over_static_tls() {
 }
 
 #[tokio::test]
+async fn static_server_stops_when_shutdown_fires() {
+    let dir = temp_dir("shutdown");
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, certified.key_pair.serialize_pem()).unwrap();
+
+    let state = WorkerState::new(
+        "worker-a".to_owned(),
+        "http://127.0.0.1:9000".to_owned(),
+        "https://localhost".to_owned(),
+        1,
+        Cache::new(12).unwrap(),
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = edamame_worker::tls::static_config(cert, key).await.unwrap();
+    let app = router(state, &CorsOrigins::Disabled);
+    let (shutdown, wait_shutdown) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        edamame_worker::tls::serve_static_until(listener, app, config, async {
+            let _ = wait_shutdown.await;
+        })
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shutdown.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("TLS サーバーが終了しませんでした")
+        .expect("TLS サーバーのタスクが panic しました");
+    assert!(
+        result.is_ok(),
+        "TLS サーバーがエラーで終了しました: {result:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn resumes_previous_session() {
     let dir = temp_dir("resumption");
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
