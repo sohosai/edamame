@@ -122,7 +122,6 @@ cargo run --release -p edamame-publisher -- \
 
 `controller` と `worker` を Docker Compose で動かす最小構成（`compose.yaml`）の例を示す。
 ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使う。
-コンテナ間の通信には Compose のサービス名を使う。
 
 ```yaml
 services:
