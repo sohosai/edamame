@@ -267,6 +267,9 @@ curl -s 'http://iromono:9090/api/v1/label/__name__/values' | jq -r '.data[] | se
 - `OTEL_SDK_DISABLED=true` になっていないか
 - metrics はアプリの既定で 10 秒間隔。確認中は `OTEL_METRIC_EXPORT_INTERVAL=5000` などで短くする
 - Prometheus の `edamame` target が UP か確認する
+- health probe を使う場合は、`edamame-health` target が UP か、`probe_success{job="edamame-health"}` が 1 か確認する
+- blackbox_exporter から target の URL に到達できるか確認する。`targets/edamame-health.yml` の URL は blackbox_exporter のコンテナから解決できる必要がある
+- 自己署名証明書の場合は `http_2xx_insecure` を明示する。通常の `http_2xx` では証明書エラーになる
 - Collector の Prometheus exporter が `otel-collector:8889` で動いているか確認する
 - Grafana の時間範囲を広げる
 - collector の metric expiration は既定の 5 分。プロセス停止直後は最後の値が残ることがある
@@ -275,7 +278,38 @@ curl -s 'http://iromono:9090/api/v1/label/__name__/values' | jq -r '.data[] | se
 
 ## Phase 2
 
-- publisher の metrics 計装（Linux / WSL でのビルド・検証が必要）
-- traces の収集（Tempo と Collector の traces pipeline）
-- controller / worker の `/health` と blackbox HTTP probe
-- 必要に応じてダッシュボードとアラートの閾値調整
+Phase 2 では、publisher を含む End-to-End の可観測性と traces を追加します。
+
+### 1. Publisher metrics
+
+- `edamame-publisher` に `edamame-telemetry` を組み込み、controller / worker と同じ Collector へ OTLP metrics を送る
+- channel / quality / input ごとに以下を計装する
+  - publisher の稼働状態と最終 publish 成功からの経過時間
+  - encode したセグメント数、encode 時間、encode エラー
+  - ffmpeg プロセスの起動回数、異常終了、再接続
+  - controller への upload 時間、upload エラー、再試行
+  - 内部 queue の深さ、未送信セグメント数
+- publisher 用のダッシュボードとアラートを追加する
+  - publisher down、publish stale、encode error rate、upload error rate、queue backlog
+- Windows では publisher のビルド・実行が難しいため、Linux / WSL で検証する
+
+### 2. Traces
+
+- OTel Collector に traces pipeline を追加し、Tempo へ送る
+- Grafana に Tempo datasource を追加する
+- controller / worker / publisher に span を追加する
+  - controller: segment ingest、storage write、playlist publish、worker register / sync
+  - worker: controller sync、segment download、cache put、client への segment 配信
+  - publisher: encode、segment upload、playlist 更新
+- HTTP リクエスト間で W3C Trace Context を伝播する
+- サンプリング方針（通常時と障害時）を決める
+- metrics から traces へ移動できるよう exemplar / trace ID を連携する
+- 遅延・エラーを trace で調査できるダッシュボードを追加する
+
+### 3. 運用と検証
+
+- 実際の channel で End-to-End の負荷試験・長時間試験を行う
+- Phase 1 のアラート閾値を実データで調整する
+- publisher を含む通知の意図した発火テストを行う
+- 障害時の調査手順を runbook として docs に追加する
+- Phase 1 の health probe target を本番・検証環境の URL に更新する
