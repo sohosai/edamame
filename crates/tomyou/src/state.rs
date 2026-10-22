@@ -73,11 +73,13 @@ mod tests {
 
     #[test]
     fn round_trips_state() {
-        let path = std::env::temp_dir().join(format!(
-            "tomyou-state-{}-{}.json",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        // スレッド名には `::` が含まれ、Windows ではファイル名に使えない
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("現在時刻を取得できる")
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("tomyou-state-{}-{suffix}.json", std::process::id()));
         let state = State {
             imageflux_channel_ids: vec!["channel".to_owned()],
         };
