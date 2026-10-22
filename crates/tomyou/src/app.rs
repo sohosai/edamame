@@ -54,6 +54,7 @@ impl Status {
 pub struct TomyouApp {
     config: Config,
     config_path: PathBuf,
+    config_path_draft: String,
     runtime: tokio::runtime::Runtime,
     events_tx: Sender<SessionEvent>,
     events_rx: Receiver<SessionEvent>,
@@ -83,6 +84,7 @@ impl TomyouApp {
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
         let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let config_path_draft = config_path.display().to_string();
         let ffmpeg_path_draft = config
             .ffmpeg
             .path
@@ -92,6 +94,7 @@ impl TomyouApp {
         Self {
             config,
             config_path,
+            config_path_draft,
             runtime,
             events_tx,
             events_rx,
@@ -244,23 +247,61 @@ impl TomyouApp {
         }
     }
 
+    fn config_path_from_draft(&self) -> PathBuf {
+        let path = self.config_path_draft.trim();
+        if path.is_empty() {
+            self.config_path.clone()
+        } else {
+            PathBuf::from(path)
+        }
+    }
+
     fn save_config(&mut self) {
         self.config.ffmpeg.path = if self.ffmpeg_path_draft.trim().is_empty() {
             None
         } else {
             Some(PathBuf::from(self.ffmpeg_path_draft.trim()))
         };
-        match self.config.save(&self.config_path) {
+        let path = self.config_path_from_draft();
+        match self.config.save(&path) {
             Ok(()) => {
-                self.log(format!(
-                    "設定を保存しました: {}",
-                    self.config_path.display()
-                ));
+                self.config_path = path.clone();
+                self.config_path_draft = path.display().to_string();
+                self.startup_error = None;
                 self.error = None;
+                self.log(format!("設定を保存しました: {}", path.display()));
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
                 self.log(format!("設定を保存できません: {error:#}"));
+            }
+        }
+    }
+
+    fn load_config_from_draft(&mut self) {
+        let path = self.config_path_from_draft();
+        if path.as_os_str().is_empty() {
+            self.error = Some("設定ファイルのパスが空です".to_owned());
+            return;
+        }
+        match Config::load(&path) {
+            Ok(config) => {
+                self.ffmpeg_path_draft = config
+                    .ffmpeg
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                self.config = config;
+                self.config_path = path.clone();
+                self.config_path_draft = path.display().to_string();
+                self.startup_error = None;
+                self.error = None;
+                self.log(format!("設定ファイルを読み込みました: {}", path.display()));
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                self.log(format!("設定を読み込めません: {error:#}"));
             }
         }
     }
@@ -438,10 +479,23 @@ impl TomyouApp {
         }
         let mut open = self.show_settings;
         let mut close_requested = false;
+        let mut load_requested = false;
+        let mut save_requested = false;
         egui::Window::new("設定")
             .open(&mut open)
             .default_width(720.0)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("設定ファイル").strong());
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.config_path_draft);
+                    if ui.button("読み込む").clicked() {
+                        load_requested = true;
+                    }
+                });
+                ui.label(
+                    "保存もこのパスへ書き込みます。空欄の場合は現在の設定ファイルを使います。",
+                );
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("接続").strong());
                 egui::Grid::new("settings-connection")
                     .num_columns(2)
@@ -529,27 +583,10 @@ impl TomyouApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
-                        self.save_config();
-                        if self.error.is_none() {
-                            close_requested = true;
-                        }
+                        save_requested = true;
                     }
-                    if ui.button("設定ファイルを再読込").clicked() {
-                        match Config::load(&self.config_path) {
-                            Ok(config) => {
-                                self.ffmpeg_path_draft = config
-                                    .ffmpeg
-                                    .path
-                                    .as_ref()
-                                    .map(|path| path.display().to_string())
-                                    .unwrap_or_default();
-                                self.config = config;
-                                self.log("設定ファイルを再読込しました");
-                            }
-                            Err(error) => {
-                                self.log(format!("設定を再読込できません: {error:#}"));
-                            }
-                        }
+                    if ui.button("再読込").clicked() {
+                        load_requested = true;
                     }
                     if ui.button("閉じる").clicked() {
                         close_requested = true;
@@ -559,6 +596,15 @@ impl TomyouApp {
                 ui.label("配信中は接続先の変更を反映しません。停止してから保存してください。");
             });
         self.show_settings = open && !close_requested;
+        if load_requested {
+            self.load_config_from_draft();
+        }
+        if save_requested {
+            self.save_config();
+            if self.error.is_none() {
+                self.show_settings = false;
+            }
+        }
     }
 
     fn license_window(&mut self, ctx: &egui::Context) {

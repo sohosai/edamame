@@ -39,11 +39,18 @@ sudo apt-get install \
 
 ```bash
 cargo build --release -p tomyou
+
+# OS 標準の設定ファイルを使う
 cargo run -p tomyou
+
+# 特定の設定ファイルを読み込む
+cargo run -p tomyou -- --config /path/to/config.toml
 ```
 
 設定は `%APPDATA%\tomyou\config.toml`、`~/Library/Application Support/tomyou/config.toml`、
 `~/.config/tomyou/config.toml` のいずれかへ保存される。
+`--config` を指定した場合は、そのパスを読み込み、保存先にも使う。
+GUI の「設定」でも設定ファイルのパスを指定して読み込み・保存できる。
 初回は GUI の「設定」から OBS、publisher、ImageFlux を入力する。
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。

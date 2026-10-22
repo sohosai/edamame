@@ -125,6 +125,7 @@ OBS の配信先をローカルの RTMP サーバへ変更し、Edamame 向け�
 
 ```bash
 cargo run --release -p tomyou
+cargo run --release -p tomyou -- --config /path/to/config.toml
 ```
 
 設定、OBS の条件、ffmpeg の必要機能、ImageFlux の扱い、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。

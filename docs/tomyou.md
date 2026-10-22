@@ -112,6 +112,10 @@ ImageFlux と Edamame の出力は別プロセスなので、片方の停止が�
 - macOS: `~/Library/Application Support/tomyou/config.toml`
 - Linux: `~/.config/tomyou/config.toml`
 
+起動時に `--config <FILE>` を指定すると、そのファイルを読み込み、保存先にも使う。
+GUI の「設定」にある「設定ファイル」でも、任意のパスを指定して読み込み・保存できる。
+指定したファイルを読めない場合も GUI は初期値で起動し、設定画面でパスを直せる。
+
 OBS のパスワードと ImageFlux の API トークンは、OS の資格情報ストアへ保存する。
 
 - Windows: Credential Manager
