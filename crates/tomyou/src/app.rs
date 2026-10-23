@@ -626,8 +626,9 @@ impl TomyouApp {
                 ui.label("ffmpeg: ビルド内容に応じた LGPL / GPL。配布物の LICENSE を参照");
                 ui.separator();
                 ui.label(
-                    "ImageFlux の API トークンと OBS のパスワードは OS の資格情報ストアへ保存します。",
+                    "ImageFlux の API トークンと OBS のパスワードは設定ファイルへ保存します。",
                 );
+                ui.label("秘密情報を含むため、設定ファイルの権限と配布先に注意してください。");
                 ui.label("ログと画面には秘密情報を表示しません。");
             });
         self.show_license = open;

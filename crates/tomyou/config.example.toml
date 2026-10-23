@@ -1,5 +1,6 @@
 # tomyou の設定例
-# 秘密情報はこのファイルに保存されず、OS の資格情報ストアへ保存される。
+# OBS のパスワードと ImageFlux の API トークンもこのファイルへ保存される。
+# 秘密情報を含むため、ファイルの権限と配布先に注意する。
 # 初回は GUI の「設定」から入力し、「保存」を押す。
 
 # live2025-server が認識する固定のチャンネル名
@@ -8,14 +9,14 @@ channel_id = "uni"
 [obs]
 host = "127.0.0.1"
 port = 4455
-# password は資格情報ストアへ保存する
+# password もこのファイルへ保存される
 
 [publisher]
 # edamame-publisher が待ち受ける RTMP URL
 rtmp_url = "rtmp://publisher.example.test:1935/live/uni"
 
 [imageflux]
-# token は資格情報ストアへ保存する
+# token もこのファイルへ保存される
 # 例: https://live-api-dev.sohosai.com/key/uni
 encrypt-key-uri = ""
 event_webhook_url = ""

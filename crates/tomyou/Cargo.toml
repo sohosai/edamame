@@ -18,7 +18,6 @@ clap.workspace = true
 directories = "6"
 eframe.workspace = true
 egui.workspace = true
-keyring.workspace = true
 obws.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true

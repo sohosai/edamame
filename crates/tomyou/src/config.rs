@@ -1,4 +1,4 @@
-//! tomyou の設定ファイルと秘密情報の扱い
+//! tomyou の設定ファイル
 
 use std::{
     fs,
@@ -7,7 +7,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 /// 配信できるチャンネル
 pub const CHANNELS: [&str; 3] = ["uni", "1A", "kaikan"];
@@ -36,8 +35,8 @@ pub struct ObsConfig {
     pub host: String,
     #[serde(default = "default_obs_port")]
     pub port: u16,
-    /// 秘密情報のため設定ファイルには保存しない
-    #[serde(default, skip_serializing)]
+    /// 設定ファイルに保存する
+    #[serde(default)]
     pub password: String,
 }
 
@@ -52,8 +51,8 @@ pub struct PublisherConfig {
 /// ImageFlux の API と HLS 出力設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageFluxConfig {
-    /// 秘密情報のため設定ファイルには保存しない
-    #[serde(default, skip_serializing)]
+    /// 設定ファイルに保存する
+    #[serde(default)]
     pub token: String,
     #[serde(
         default,
@@ -232,19 +231,18 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
-    /// 設定ファイルを読み、秘密情報を資格情報ストアから補う
+    /// 設定ファイルを読む
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("設定ファイルを読めません: {}", path.display()))?;
         let mut config: Self = toml::from_str(&text)
             .with_context(|| format!("設定ファイルの形式が不正です: {}", path.display()))?;
         config.normalize_channel_id();
-        config.apply_secrets();
         config.validate()?;
         Ok(config)
     }
 
-    /// 秘密情報を除いて保存し、秘密情報は資格情報ストアへ保存する
+    /// パスワードと API トークンも含めて設定ファイルへ保存する
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         if let Some(parent) = path.parent() {
@@ -254,8 +252,14 @@ impl Config {
         let text = toml::to_string_pretty(self).context("設定を TOML にできません")?;
         fs::write(path, text)
             .with_context(|| format!("設定ファイルを書けません: {}", path.display()))?;
-        self.store_secrets()
-            .context("設定ファイルは保存しましたが、秘密情報を資格情報ストアへ保存できません")?;
+        // 秘密情報を含むため、Unix では所有者だけが読める権限にする
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+                format!("設定ファイルの権限を変えられません: {}", path.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -316,29 +320,6 @@ impl Config {
         Ok(())
     }
 
-    /// 設定の秘密情報を資格情報ストアから読む。失敗しても起動は妨げない。
-    fn apply_secrets(&mut self) {
-        match secret::load(secret::OBS_PASSWORD) {
-            Ok(Some(value)) => self.obs.password = value,
-            Ok(None) => {}
-            Err(error) => warn!("failed to load OBS password from keyring: {error}"),
-        }
-        match secret::load(secret::IMAGEFLUX_TOKEN) {
-            Ok(Some(value)) => self.imageflux.token = value,
-            Ok(None) => {}
-            Err(error) => warn!("failed to load ImageFlux token from keyring: {error}"),
-        }
-    }
-
-    /// 秘密情報を資格情報ストアへ書く。
-    fn store_secrets(&self) -> Result<()> {
-        secret::store(secret::OBS_PASSWORD, &self.obs.password)
-            .context("OBS のパスワードを資格情報ストアへ保存できません")?;
-        secret::store(secret::IMAGEFLUX_TOKEN, &self.imageflux.token)
-            .context("ImageFlux のトークンを資格情報ストアへ保存できません")?;
-        Ok(())
-    }
-
     /// ImageFlux を使う設定か
     pub fn imageflux_enabled(&self) -> bool {
         !self.imageflux.token.trim().is_empty()
@@ -350,38 +331,6 @@ impl Config {
     }
 }
 
-/// OS の資格情報ストアを使う。使えない環境ではエラーを返し、呼び出し側が警告する。
-mod secret {
-    use anyhow::{Context, Result};
-
-    const SERVICE: &str = "tomyou";
-    pub const OBS_PASSWORD: &str = "obs-password";
-    pub const IMAGEFLUX_TOKEN: &str = "imageflux-token";
-
-    pub fn load(name: &str) -> Result<Option<String>> {
-        let entry = keyring::Entry::new(SERVICE, name).context("資格情報ストアを開けません")?;
-        match entry.get_password() {
-            Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context("資格情報を読めません"),
-        }
-    }
-
-    pub fn store(name: &str, value: &str) -> Result<()> {
-        let entry = keyring::Entry::new(SERVICE, name).context("資格情報ストアを開けません")?;
-        if value.is_empty() {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(error) => Err(error).context("資格情報を削除できません"),
-            }
-        } else {
-            entry
-                .set_password(value)
-                .context("資格情報を保存できません")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +338,44 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().expect("既定値は有効");
+    }
+
+    #[test]
+    fn saves_config_file_with_secrets() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("現在時刻を取得できる")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tomyou-config-{}-{suffix}.toml",
+            std::process::id()
+        ));
+        let config = Config {
+            obs: ObsConfig {
+                password: "obs-secret".to_owned(),
+                ..ObsConfig::default()
+            },
+            imageflux: ImageFluxConfig {
+                token: "imageflux-secret".to_owned(),
+                ..ImageFluxConfig::default()
+            },
+            ..Config::default()
+        };
+        config.save(&path).expect("設定を保存できる");
+        let text = fs::read_to_string(&path).expect("保存した設定を読める");
+        assert!(text.contains("obs-secret"));
+        assert!(text.contains("imageflux-secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path)
+                .expect("設定ファイルの情報を取得できる")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        fs::remove_file(&path).expect("設定ファイルを消せる");
     }
 
     #[test]

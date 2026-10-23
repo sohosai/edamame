@@ -26,13 +26,13 @@ OBS ── RTMP / H.264 + AAC ──> tomyou の RTMP サーバ
 - OBS の入力は H.264、B フレームなし、AAC 音声を前提とする。
 - OBS のキーフレーム間隔は 2 秒を推奨する。publisher の 6 秒セグメントと両立する。
 
-Linux でビルドする場合は、egui と資格情報ストアの開発パッケージを入れる。
+Linux でビルドする場合は、egui の開発パッケージを入れる。
 
 ```bash
 sudo apt-get install \
   pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
   libgl1-mesa-dev libegl1-mesa-dev libssl-dev \
-  libxkbcommon-x11-0 libdbus-1-dev libsecret-1-dev
+  libxkbcommon-x11-0
 ```
 
 ## ビルドと起動
@@ -51,6 +51,8 @@ cargo run -p tomyou -- --config /path/to/config.toml
 `~/.config/tomyou/config.toml` のいずれかへ保存される。
 `--config` を指定した場合は、そのパスを読み込み、保存先にも使う。
 GUI の「設定」でも設定ファイルのパスを指定して読み込み・保存できる。
+OBS のパスワードと ImageFlux の API トークンも設定ファイルへ保存する。
+Unix では設定ファイルを所有者だけが読める 0600 で保存する。
 初回は GUI の「設定」から OBS、publisher、ImageFlux を入力する。
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
