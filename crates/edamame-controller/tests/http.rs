@@ -3368,3 +3368,79 @@ async fn rejects_invalid_external_query() {
     assert_eq!(response.status().as_u16(), 400);
     controller.shutdown().await;
 }
+
+/// PUT が止まると playlist を 503 にし、再開後は停止前の範囲を戻さない
+#[tokio::test]
+async fn playlist_disappears_after_publisher_stops_and_resumes_after_floor() {
+    let _tmp = TempDir::new("stale-publication");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
+    let _worker = spawn_worker("worker-a", &controller.base_url, 12, true).await;
+    let client = authenticated_client();
+    let base = &controller.base_url;
+
+    for index in 0..6 {
+        let identifier = format!("seg-{index}");
+        let body = format!("segment-{index}");
+        let response = publish(
+            &client,
+            PublishInput {
+                base_url: base,
+                quality: "720p",
+                identifier: &identifier,
+                duration_ms: 500,
+                bandwidth: 3_000_000,
+                resolution: "1280x720",
+                body: body.as_bytes(),
+            },
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201);
+    }
+    let media_url = format!("{base}/channels/live/720p.m3u8");
+    wait_for_playlist(&client, &media_url).await;
+
+    // 500 ms * 6 = 3000 ms の猶予を超えて PUT を止める
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let stopped = client.get(&media_url).send().await.unwrap();
+    assert_eq!(stopped.status().as_u16(), 503);
+    assert_eq!(
+        stopped.headers()[reqwest::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
+    let master = client
+        .get(format!("{base}/channels/live/master.m3u8"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(master.status().as_u16(), 503);
+    assert_eq!(
+        master.headers()[reqwest::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap(),
+        "no-store"
+    );
+
+    let response = publish(
+        &client,
+        PublishInput {
+            base_url: base,
+            quality: "720p",
+            identifier: "seg-6",
+            duration_ms: 500,
+            bandwidth: 3_000_000,
+            resolution: "1280x720",
+            body: b"segment-6",
+        },
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 201);
+
+    let resumed = wait_for_playlist(&client, &media_url).await;
+    assert!(resumed.contains("/720p/6.ts"), "{resumed}");
+    assert!(!resumed.contains("/720p/0.ts"), "{resumed}");
+    assert!(!resumed.contains("/720p/5.ts"), "{resumed}");
+    controller.shutdown().await;
+}

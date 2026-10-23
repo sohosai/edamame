@@ -96,6 +96,12 @@ pub struct QualityState {
     pub pending: BTreeSet<u64>,
     /// メタデータ上に残っている直近のセグメント番号
     pub segments: BTreeSet<u64>,
+    /// 最後に新しいセグメントを保存した時刻
+    pub last_ingest_ms: Option<u64>,
+    /// 保存に成功したセグメント番号の最大値
+    pub highest_ingested_sequence: Option<u64>,
+    /// 停止後に再公開しないセグメント番号の上限
+    pub publish_floor: Option<u64>,
 }
 
 /// worker の登録内容と最後の報告
@@ -297,13 +303,15 @@ impl ControllerState {
 
         // controller の保存が終わる前に公開待ちを始めると、worker が取得に使える時間が短くなる
         let committed_at_ms = now_ms();
+        let created = matches!(outcome, IngestOutcome::Created { .. });
         let channel = inner
             .channels
             .entry(channel_id.to_owned())
             .or_insert_with(|| ChannelState::new(duration_ms, 1));
-        if matches!(outcome, IngestOutcome::Created { .. }) {
+        if created {
             channel.last_ingest_ms = committed_at_ms;
         }
+        let segment_duration_ms = channel.segment_duration_ms;
         let identifier_state = channel
             .identifiers
             .entry(identifier.to_owned())
@@ -329,7 +337,39 @@ impl ControllerState {
                 allowed_through: None,
                 pending: BTreeSet::new(),
                 segments: BTreeSet::new(),
+                last_ingest_ms: None,
+                highest_ingested_sequence: None,
+                publish_floor: None,
             });
+        if created {
+            let stale = quality_state.last_ingest_ms.is_some_and(|last| {
+                committed_at_ms.saturating_sub(last)
+                    > stale_after_ms(
+                        segment_duration_ms,
+                        self.playlist_segments,
+                        self.publish_wait_ms,
+                    )
+            });
+            if stale {
+                if let Some(highest) = quality_state.highest_ingested_sequence {
+                    quality_state.publish_floor = Some(
+                        quality_state
+                            .publish_floor
+                            .map_or(highest, |floor| floor.max(highest)),
+                    );
+                }
+                quality_state.published.clear();
+                quality_state.current_weights.clear();
+                quality_state.publish_due_ms = None;
+                quality_state.pending.clear();
+            }
+            quality_state.last_ingest_ms = Some(committed_at_ms);
+            quality_state.highest_ingested_sequence = Some(
+                quality_state
+                    .highest_ingested_sequence
+                    .map_or(sequence, |highest| highest.max(sequence)),
+            );
+        }
         if quality_state.resolution.is_none() {
             quality_state.resolution = resolution;
         }
@@ -483,10 +523,22 @@ impl ControllerState {
             let channel = channels
                 .get_mut(channel_id)
                 .ok_or_else(|| EdamameError::NotFound("channel not found".to_owned()))?;
+            let segment_duration_ms = channel.segment_duration_ms;
             let quality_state = channel
                 .qualities
                 .get_mut(quality)
                 .ok_or_else(|| EdamameError::NotFound("quality not found".to_owned()))?;
+            if is_stale(
+                quality_state,
+                segment_duration_ms,
+                self.playlist_segments,
+                self.publish_wait_ms,
+                now_ms,
+            ) {
+                return Err(EdamameError::Unavailable(
+                    "publishing is stopped".to_owned(),
+                ));
+            }
             if quality_state.published.is_empty() {
                 return Err(EdamameError::Unavailable(
                     "playlist is not published yet".to_owned(),
@@ -502,7 +554,7 @@ impl ControllerState {
                 self.sync_timeout_ms,
             );
             (
-                channel.segment_duration_ms,
+                segment_duration_ms,
                 quality_state.published.clone(),
                 // 表は公開に使う範囲と worker のキャッシュの範囲に間引いてあるため、そのまま複製する
                 quality_state.encryption.clone(),
@@ -555,6 +607,15 @@ impl ControllerState {
             let mut external_percent = 0;
             for (quality, quality_state) in &channel.qualities {
                 if quality_state.published.is_empty() {
+                    continue;
+                }
+                if is_stale(
+                    quality_state,
+                    channel.segment_duration_ms,
+                    self.playlist_segments,
+                    self.publish_wait_ms,
+                    now_ms,
+                ) {
                     continue;
                 }
                 let served = workers.values().any(|worker| {
@@ -746,6 +807,28 @@ fn validate_segment_metadata(
 /// 期限内に sync した worker か
 fn is_alive(worker: &WorkerState, now_ms: u64, sync_timeout_ms: u64) -> bool {
     now_ms.saturating_sub(worker.last_sync_ms) <= sync_timeout_ms
+}
+
+/// 新しいセグメントが届かなくなってから、公開を停止するまでの猶予
+fn stale_after_ms(segment_duration_ms: u64, playlist_segments: u64, publish_wait_ms: u64) -> u64 {
+    segment_duration_ms
+        .saturating_mul(playlist_segments)
+        .saturating_add(publish_wait_ms)
+}
+
+/// 最後の新規セグメントから猶予を超えて公開が止まっているか
+fn is_stale(
+    quality: &QualityState,
+    segment_duration_ms: u64,
+    playlist_segments: u64,
+    publish_wait_ms: u64,
+    now_ms: u64,
+) -> bool {
+    let Some(last_ingest_ms) = quality.last_ingest_ms else {
+        return false;
+    };
+    now_ms.saturating_sub(last_ingest_ms)
+        > stale_after_ms(segment_duration_ms, playlist_segments, publish_wait_ms)
 }
 
 fn age_seconds(now_ms: u64, then_ms: u64) -> f64 {
@@ -1027,6 +1110,7 @@ fn held_candidates(
             &worker.cached,
             quality_state.allowed_through,
             &quality_state.pending,
+            quality_state.publish_floor,
         ) {
             let start = first.max(last.saturating_sub(playlist_segments.saturating_sub(1)));
             ranges.push((start, last));
@@ -1047,6 +1131,7 @@ fn worker_held_ranges(
     cached: &BTreeSet<SegmentId>,
     allowed_through: Option<u64>,
     pending: &BTreeSet<u64>,
+    publish_floor: Option<u64>,
 ) -> Vec<(u64, u64)> {
     let mut ranges = Vec::new();
     let mut first = None;
@@ -1055,6 +1140,7 @@ fn worker_held_ranges(
         if id.channel_id.as_str() != channel_id
             || id.quality.as_str() != quality
             || !is_allowed(allowed_through, pending, id.sequence)
+            || publish_floor.is_some_and(|floor| id.sequence <= floor)
         {
             continue;
         }
@@ -1150,7 +1236,13 @@ fn cache_target(
             let Some(latest) = quality_state.segments.iter().next_back().copied() else {
                 continue;
             };
-            let start = latest.saturating_sub(playlist_segments.saturating_sub(1));
+            let start = latest
+                .saturating_sub(playlist_segments.saturating_sub(1))
+                .max(
+                    quality_state
+                        .publish_floor
+                        .map_or(0, |floor| floor.saturating_add(1)),
+                );
             for sequence in quality_state.segments.range(start..=latest) {
                 target.insert(SegmentId {
                     channel_id: channel_id.clone(),
@@ -1209,6 +1301,9 @@ mod tests {
                 allowed_through,
                 pending: pending.iter().copied().collect(),
                 segments: segments.iter().copied().collect(),
+                last_ingest_ms: Some(0),
+                highest_ingested_sequence: None,
+                publish_floor: None,
             },
         );
     }
@@ -1987,7 +2082,159 @@ mod tests {
     #[test]
     fn splits_cached_runs_at_gaps() {
         let cached = worker_with_cached("live", "720p", &[0, 1, 2, 3, 4, 5, 7, 8]).cached;
-        let ranges = worker_held_ranges("live", "720p", &cached, Some(8), &BTreeSet::new());
+        let ranges = worker_held_ranges("live", "720p", &cached, Some(8), &BTreeSet::new(), None);
         assert_eq!(ranges, vec![(7, 8), (0, 5)]);
+    }
+
+    #[test]
+    fn detects_stale_publication_at_the_grace_boundary() {
+        let mut channel =
+            channel_with_quality(&[0, 1, 2, 3, 4, 5], &[0, 1, 2, 3, 4, 5], None, Some(5), &[]);
+        let quality = channel.qualities.get_mut("720p").unwrap();
+        quality.last_ingest_ms = Some(10_000);
+
+        // 6000 ms * 6 + 2000 ms = 38000 ms
+        assert!(!is_stale(quality, 6000, 6, 2000, 48_000));
+        assert!(is_stale(quality, 6000, 6, 2000, 48_001));
+        // 時計が戻った場合は失効させない
+        assert!(!is_stale(quality, 6000, 6, 2000, 9_000));
+    }
+
+    #[tokio::test]
+    async fn media_playlist_returns_unavailable_when_stale() {
+        let state = ControllerState::new(CanonicalStore::new(1_000), 6, 1_000, 10_000, 0, 1);
+        {
+            let mut inner = state.inner.lock().await;
+            let mut channel =
+                channel_with_quality(&[0, 1, 2, 3, 4, 5], &[0, 1, 2, 3, 4, 5], None, Some(5), &[]);
+            channel.qualities.get_mut("720p").unwrap().last_ingest_ms = Some(1);
+            inner.channels.insert("live".to_owned(), channel);
+        }
+
+        let error = state
+            .media_playlist("live", "720p", 36_002)
+            .await
+            .expect_err("停止中はプレイリストを返さない");
+        assert!(matches!(error, EdamameError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn master_playlist_excludes_only_stale_quality() {
+        let state = ControllerState::new(CanonicalStore::new(1_000), 6, 1_000, 10_000, 0, 1);
+        let mut channel =
+            channel_with_quality(&[0, 1, 2, 3, 4, 5], &[0, 1, 2, 3, 4, 5], None, Some(5), &[]);
+        channel.qualities.get_mut("720p").unwrap().last_ingest_ms = Some(40_000);
+        add_quality(
+            &mut channel,
+            "1080p",
+            &[0, 1, 2, 3, 4, 5],
+            &[0, 1, 2, 3, 4, 5],
+            None,
+            Some(5),
+            &[],
+        );
+        channel.qualities.get_mut("1080p").unwrap().last_ingest_ms = Some(1);
+        {
+            let mut inner = state.inner.lock().await;
+            inner.channels.insert("live".to_owned(), channel);
+            let mut worker = worker_with_cached_qualities(&[
+                ("live", "720p", &[0, 1, 2, 3, 4, 5]),
+                ("live", "1080p", &[0, 1, 2, 3, 4, 5]),
+            ]);
+            worker.last_sync_ms = 40_000;
+            inner.workers.insert("worker-a".to_owned(), worker);
+        }
+        for sequence in 0..6 {
+            state.store.put("live", "720p", sequence, b"720p").unwrap();
+        }
+
+        let response = state
+            .master_playlist("live", 40_000, ExternalRouting::LocalOnly)
+            .await
+            .unwrap();
+        let MasterResponse::Local(body) = response else {
+            panic!("自前のマスタープレイリストを期待した");
+        };
+        assert!(body.contains("720p.m3u8"));
+        assert!(!body.contains("1080p.m3u8"));
+
+        // すべて停止した場合は master も 503 相当になる
+        {
+            let mut inner = state.inner.lock().await;
+            inner
+                .channels
+                .get_mut("live")
+                .unwrap()
+                .qualities
+                .get_mut("720p")
+                .unwrap()
+                .last_ingest_ms = Some(1);
+        }
+        let error = match state
+            .master_playlist("live", 40_000, ExternalRouting::LocalOnly)
+            .await
+        {
+            Ok(_) => panic!("全 quality 停止中は master を返さない"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, EdamameError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn long_stop_sets_publish_floor_and_clears_publication() {
+        let state = ControllerState::new(CanonicalStore::new(1_000), 6, 1_000, 10_000, 0, 1);
+        ingest_encrypted_segment(&state, 0).await;
+        {
+            let mut inner = state.inner.lock().await;
+            let quality = inner
+                .channels
+                .get_mut("live")
+                .unwrap()
+                .qualities
+                .get_mut("720p")
+                .unwrap();
+            quality.last_ingest_ms = Some(1);
+            quality.published = BTreeSet::from([0]);
+        }
+
+        ingest_encrypted_segment(&state, 1).await;
+
+        let inner = state.inner.lock().await;
+        let quality = &inner.channels["live"].qualities["720p"];
+        assert_eq!(quality.publish_floor, Some(0));
+        assert!(quality.published.is_empty());
+        assert_eq!(quality.highest_ingested_sequence, Some(1));
+        assert!(quality.publish_due_ms.is_some());
+    }
+
+    #[test]
+    fn resumed_publication_starts_after_the_floor() {
+        let mut channel = channel_with_quality(&[0, 1, 2, 3, 4, 5, 6], &[], None, Some(6), &[]);
+        let quality = channel.qualities.get_mut("720p").unwrap();
+        quality.last_ingest_ms = Some(6_000);
+        quality.publish_floor = Some(5);
+        let mut channels = BTreeMap::from([("live".to_owned(), channel)]);
+        let workers = BTreeMap::from([(
+            "worker-a".to_owned(),
+            worker_with_cached("live", "720p", &[0, 1, 2, 3, 4, 5, 6]),
+        )]);
+
+        advance_published(&mut channels, &workers, 6, 10_000, 6_000);
+
+        let quality = &channels["live"].qualities["720p"];
+        assert_eq!(quality.published, BTreeSet::from([6]));
+    }
+
+    #[test]
+    fn cache_target_skips_segments_at_or_before_floor() {
+        let mut channel = channel_with_quality(&[0, 1, 2, 3, 4, 5], &[], None, Some(5), &[]);
+        channel.qualities.get_mut("720p").unwrap().publish_floor = Some(3);
+        let channels = BTreeMap::from([("live".to_owned(), channel)]);
+
+        let target = cache_target(&channels, 6);
+
+        assert!(target.iter().all(|id| id.sequence > 3));
+        assert!(target.iter().any(|id| id.sequence == 4));
+        assert!(target.iter().any(|id| id.sequence == 5));
     }
 }
