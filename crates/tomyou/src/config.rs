@@ -238,6 +238,7 @@ impl Config {
             .with_context(|| format!("設定ファイルを読めません: {}", path.display()))?;
         let mut config: Self = toml::from_str(&text)
             .with_context(|| format!("設定ファイルの形式が不正です: {}", path.display()))?;
+        config.normalize_channel_id();
         config.apply_secrets();
         config.validate()?;
         Ok(config)
@@ -256,6 +257,16 @@ impl Config {
         self.store_secrets()
             .context("設定ファイルは保存しましたが、秘密情報を資格情報ストアへ保存できません")?;
         Ok(())
+    }
+
+    /// 設定ファイルのチャンネル名を、サーバーが使う大文字小文字へそろえる
+    fn normalize_channel_id(&mut self) {
+        if let Some(channel) = CHANNELS
+            .iter()
+            .find(|channel| channel.eq_ignore_ascii_case(&self.channel_id))
+        {
+            self.channel_id = (*channel).to_owned();
+        }
     }
 
     /// 起動時に使える設定か確認する
@@ -316,6 +327,23 @@ impl Config {
             Ok(Some(value)) => self.imageflux.token = value,
             Ok(None) => {}
             Err(error) => warn!("failed to load ImageFlux token from keyring: {error}"),
+        }
+        self.apply_imageflux_env(|key| std::env::var(key).ok());
+    }
+
+    /// 環境変数の ImageFlux API キーを設定へ反映する。空の値は無視する。
+    fn apply_imageflux_env<F>(&mut self, get: F)
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        for key in ["IMAGEFLUX_API_KEY", "IMAGEFLUX_TOKEN"] {
+            if let Some(value) = get(key) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    self.imageflux.token = value.to_owned();
+                    return;
+                }
+            }
         }
     }
 
@@ -381,12 +409,49 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_channel_id_case() {
+        let mut config = Config {
+            channel_id: "1a".to_owned(),
+            ..Config::default()
+        };
+        config.normalize_channel_id();
+        assert_eq!(config.channel_id, "1A");
+        config.validate().expect("正規化後は有効");
+    }
+
+    #[test]
     fn rejects_unknown_channel() {
         let config = Config {
             channel_id: "unknown".to_owned(),
             ..Config::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn environment_imageflux_key_overrides_config() {
+        let mut config = Config {
+            imageflux: ImageFluxConfig {
+                token: "old".to_owned(),
+                ..ImageFluxConfig::default()
+            },
+            ..Config::default()
+        };
+        config.apply_imageflux_env(|key| (key == "IMAGEFLUX_API_KEY").then(|| "new".to_owned()));
+        assert_eq!(config.imageflux.token, "new");
+    }
+
+    #[test]
+    fn empty_environment_imageflux_key_is_ignored() {
+        let mut config = Config {
+            imageflux: ImageFluxConfig {
+                token: "old".to_owned(),
+                ..ImageFluxConfig::default()
+            },
+            ..Config::default()
+        };
+        config.apply_imageflux_env(|key| (key == "IMAGEFLUX_API_KEY").then(|| "   ".to_owned()));
+        assert_eq!(config.imageflux.token, "old");
     }
 
     #[test]

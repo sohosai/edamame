@@ -95,7 +95,8 @@ HLS 設定は `whip-script` の設定を取り込み、解像度、FPS、ビッ�
 | ImageFlux のチャンネル作成に失敗 | Edamame だけで配信を開始する |
 | ImageFlux の WHIP が切れる | ImageFlux の ffmpeg だけをバックオフして再起動する。Edamame は継続する |
 | ImageFlux の HLS が生成されない | Edamame は継続し、画面に生成待ちを表示する |
-| edamame-publisher が停止 | ImageFlux は継続する。Edamame 側の ffmpeg だけを再起動する |
+| edamame-publisher が停止、または RTMP ポートへ到達できない | ImageFlux は継続する。Edamame 側の ffmpeg だけを再起動する。GUI のログに `Connection refused` などを表示する |
+| publisher の URL のチャンネル名が違う | publisher は `1A` など大文字小文字を区別する。`rtmp://albert:1936/live/1A` のように設定する |
 | RTMP 入力が切れる | 出力を止め、OBS の再接続を待つ |
 | ffmpeg が起動できない | 原因を画面に表示し、バックオフして再試行する |
 
@@ -115,6 +116,14 @@ ImageFlux と Edamame の出力は別プロセスなので、片方の停止が�
 起動時に `--config <FILE>` を指定すると、そのファイルを読み込み、保存先にも使う。
 GUI の「設定」にある「設定ファイル」でも、任意のパスを指定して読み込み・保存できる。
 指定したファイルを読めない場合も GUI は初期値で起動し、設定画面でパスを直せる。
+
+ImageFlux の API キーは、設定ファイルの `imageflux.token`、OS の資格情報ストア、環境変数 `IMAGEFLUX_API_KEY` または `IMAGEFLUX_TOKEN` の順で解決する。
+環境変数が設定されていれば、設定ファイルや資格情報ストアの値より優先する。
+起動ディレクトリ、実行ファイルの隣、設定ディレクトリの `.env` も読み込む。
+
+macOS の Finder から起動するとシェルの環境変数や `.env` を引き継がない。
+ターミナルから起動するか、GUI の設定から API キーを入力する。
+ワークスペース上の `.env` は、そのワークスペースで動くプロセスだけが読む。Mac 上の tomyou は読まない。
 
 OBS のパスワードと ImageFlux の API トークンは、OS の資格情報ストアへ保存する。
 

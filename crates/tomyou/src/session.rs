@@ -397,11 +397,7 @@ async fn run_output(
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let lower = line.to_ascii_lowercase();
-                    if lower.contains("error")
-                        || lower.contains("failed")
-                        || lower.contains("invalid")
-                    {
+                    if is_useful_ffmpeg_line(&line) {
                         let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
                     }
                 }
@@ -424,6 +420,24 @@ async fn run_output(
         }
         backoff = (backoff * 2).min(30);
     }
+}
+
+/// 画面に出す価値のある ffmpeg のエラー行か
+fn is_useful_ffmpeg_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "invalid",
+        "refused",
+        "timed out",
+        "unreachable",
+        "no route",
+        "handshake",
+        "broken pipe",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// 停止要求を待ちながらバックオフする。停止要求なら true。
