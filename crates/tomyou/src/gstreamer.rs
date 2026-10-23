@@ -207,9 +207,10 @@ pub fn inspect(gst_launch: &Path) -> Result<GstCapabilities> {
         whip_pads_ok,
     };
     info!(
-        "GStreamer capability check: {} ({})",
+        "GStreamer capability check: {} (edamame_ready={}, imageflux_ready={})",
         gst_launch.display(),
-        capabilities.summary()
+        capabilities.edamame_ready(),
+        capabilities.imageflux_ready()
     );
     Ok(capabilities)
 }
