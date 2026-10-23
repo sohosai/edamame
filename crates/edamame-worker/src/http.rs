@@ -120,9 +120,14 @@ pub fn router(state: Arc<WorkerState>, cors: &CorsOrigins) -> Router {
         state.path_prefix
     );
     // パスの接頭辞は URL のリテラルなので、`:` や `*` を axum 7 の記法として解釈させない
-    let router = Router::new()
+    let mut router = Router::new()
         .without_v07_checks()
+        .route("/health", get(health))
         .route(&route, get(get_segment));
+    // リバースプロキシが公開 URL のパス接頭辞ごと転送する場合にも health を確認できるようにする
+    if !state.path_prefix.is_empty() {
+        router = router.route(&format!("{}/health", state.path_prefix), get(health));
+    }
     let router = match cors_layer(cors) {
         Some(layer) => router.layer(layer),
         None => router,
@@ -161,6 +166,11 @@ impl IntoResponse for HttpError {
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         (status, self.0.message().to_owned()).into_response()
     }
+}
+
+/// プロセスが HTTP を受け付けられることを示す死活監視用の応答
+async fn health() -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, "ok")
 }
 
 async fn get_segment(

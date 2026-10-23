@@ -31,6 +31,27 @@ fn any_addr() -> std::net::SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+#[tokio::test]
+async fn health_is_available_without_auth() {
+    let controller = spawn_controller_with_auth(
+        any_addr(),
+        DEFAULT_STORAGE_CAPACITY_BYTES,
+        6,
+        1000,
+        10000,
+        "secret",
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/health", controller.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text().await.unwrap(), "ok");
+    controller.shutdown().await;
+}
+
 struct PublishInput<'a> {
     base_url: &'a str,
     quality: &'a str,

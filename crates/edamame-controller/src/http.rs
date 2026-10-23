@@ -95,13 +95,15 @@ pub fn router(
         authorize_bearer,
     ));
     let prefix = cluster.path_prefix();
+    let liveness = Router::new().route("/health", get(health));
     let control = internal
-        .route("/health", get(cluster_health))
+        .route("/internal/cluster/health", get(cluster_health))
         .with_state(cluster);
     let app = write
         .merge(sync)
         .merge(read)
         .with_state(state)
+        .merge(liveness)
         .merge(control);
     if prefix.is_empty() {
         app
@@ -317,6 +319,11 @@ impl IntoResponse for HttpError {
             StatusCode::from_u16(self.0.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, self.0.message().to_owned()).into_response()
     }
+}
+
+/// プロセスが HTTP を受け付けられることを示す死活監視用の応答
+async fn health() -> (StatusCode, &'static str) {
+    (StatusCode::OK, "ok")
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,7 +640,7 @@ mod cluster_tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/health")
+                    .uri("/internal/cluster/health")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

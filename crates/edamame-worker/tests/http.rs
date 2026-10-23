@@ -21,6 +21,34 @@ fn cache_with(segments: &[(&str, &str, u64, &[u8])]) -> Cache {
 }
 
 #[tokio::test]
+async fn health_is_available_at_root_and_path_prefix() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = WorkerState::new(
+        "worker-a".to_owned(),
+        "http://127.0.0.1:9000".to_owned(),
+        "http://127.0.0.1:9001/base".to_owned(),
+        1,
+        Cache::new(12).unwrap(),
+    )
+    .unwrap();
+    let app = router(state, &CorsOrigins::Disabled);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    for path in ["/health", "/base/health"] {
+        let response = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200, "path: {path}");
+        assert_eq!(response.text().await.unwrap(), "ok", "path: {path}");
+    }
+}
+
+#[tokio::test]
 async fn serves_segments_under_public_url_path_prefix() {
     let cache = cache_with(&[("live", "720p", 101, b"segment-101")]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

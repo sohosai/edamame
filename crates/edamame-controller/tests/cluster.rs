@@ -49,7 +49,7 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     let health: Value = client
-        .get(format!("{low_url}/health"))
+        .get(format!("{low_url}/internal/cluster/health"))
         .send()
         .await
         .unwrap()
