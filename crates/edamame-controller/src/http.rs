@@ -45,7 +45,6 @@ pub fn router(
     // ブラウザからは読み取りだけ許可し、書き込み系には CORS を付けない
     // セグメントのパスの第 3 要素は、PUT ではセグメント識別子、GET ではセグメント番号のファイル名として扱う
     let read = Router::new()
-        .route("/health", get(health))
         .route(
             "/segments/{channel_id}/{quality}/{filename}",
             get(get_segment),
@@ -96,13 +95,15 @@ pub fn router(
         authorize_bearer,
     ));
     let prefix = cluster.path_prefix();
+    let liveness = Router::new().route("/health", get(health));
     let control = internal
-        .route("/health", get(cluster_health))
+        .route("/internal/cluster/health", get(cluster_health))
         .with_state(cluster);
     let app = write
         .merge(sync)
         .merge(read)
         .with_state(state)
+        .merge(liveness)
         .merge(control);
     if prefix.is_empty() {
         app
@@ -639,7 +640,7 @@ mod cluster_tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/health")
+                    .uri("/internal/cluster/health")
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

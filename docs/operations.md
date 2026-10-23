@@ -99,8 +99,8 @@ edamame-controller \
 ```
 
 ```bash
-curl http://127.0.0.1:9000/health
-curl http://127.0.0.1:9002/health
+curl http://127.0.0.1:9000/internal/cluster/health
+curl http://127.0.0.1:9002/internal/cluster/health
 ```
 
 metric が 20 の機体が leader、10 の機体が follower になる。

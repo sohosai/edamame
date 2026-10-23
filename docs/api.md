@@ -7,7 +7,7 @@
 
 | 提供元 | メソッドとパス | 呼び出し元 | 認証 | 用途 |
 | --- | --- | --- | --- | --- |
-| controller | `GET /health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
+| controller | `GET /internal/cluster/health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
 | controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
 | controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
 | controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（必須） | 外部配信のマスタープレイリスト URL の登録と解除 |
@@ -65,7 +65,7 @@ controller と worker は、死活監視用の `GET /health` を提供する。
 ### インスタンスの役割を取得する
 
 ```http
-GET /health
+GET /internal/cluster/health
 ```
 
 認証なしで常に 200 と、そのインスタンス自身の状態を返す。
@@ -130,7 +130,7 @@ JSON body の上限は 4 MiB とする。
 
 ### follower の転送と leader 未確定時の応答
 
-`/health` と heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
+`/health`、`/internal/cluster/health`、heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
 Location は leader の public URL に元の API の path と query を連結する。
 HTTP と HTTPS の両方を許可する。
 public URL に接頭辞がある場合、API はその下に公開され、転送では leader の接頭辞に置き換わる。

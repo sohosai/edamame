@@ -134,7 +134,7 @@ async fn elects_self_without_seeds_and_defaults_metric_to_100() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let health: serde_json::Value = client
-            .get(format!("{base}/health"))
+            .get(format!("{base}/internal/cluster/health"))
             .send()
             .await
             .unwrap()

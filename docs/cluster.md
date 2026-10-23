@@ -16,7 +16,7 @@ follower はこれらを保存せず、leader への転送だけを行う。
 
 各 controller は自分の役割、leader の URL、既知の member を管理する。
 member は public URL、metric、役割、直接疎通に成功した最終時刻を持つ。
-役割と leader URL は `GET /health` で確認できる。
+役割と leader URL は `GET /internal/cluster/health` で確認できる。
 この API は認証なしで 200 を返すため、200 だけでは leader と判定しない。
 
 ## heartbeat と member の発見
@@ -50,7 +50,7 @@ seed がすべて停止していても、初回の送信が完了すれば自分
 
 ## リクエストの転送
 
-`/health` と `/internal/cluster/heartbeat` は各インスタンス自身で処理する。
+`/health`、`/internal/cluster/health`、`/internal/cluster/heartbeat` は各インスタンス自身で処理する。
 他の API は次の規則で処理する。
 
 | 役割とリクエスト | 動作 |
