@@ -6,13 +6,14 @@ OBS の配信先設定、RTMP の受信と分配、ImageFlux のチャンネル�
 ## 役割
 
 ```text
-OBS ── RTMP / H.264 + AAC ──> tomyou の RTMP サーバ
-                               ├─ ffmpeg ──> edamame-publisher
-                               └─ ffmpeg ──> WHIP ──> ImageFlux
+OBS ── RTMP ──> tomyou の RTMP サーバ
+                  ├─ GStreamer ──> rtmpsink ──> edamame-publisher
+                  └─ GStreamer ──> whipclientsink ──> ImageFlux
 ```
 
 - Edamame を主系、ImageFlux を予備系として扱う。
 - `whip-script` の ImageFlux チャンネル作成、WHIP URL の生成、プレイリスト URL の取得、削除を引き継ぐ。
+- Edamame と ImageFlux への送信は、それぞれ独立した GStreamer プロセスが行う。
 - ImageFlux のプレイリストや鍵を live2025-server へ登録する処理は行わない。
 - Edamame の URL と鍵の登録は、既存の `edamame-publisher` に任せる。
 
@@ -20,11 +21,16 @@ OBS ── RTMP / H.264 + AAC ──> tomyou の RTMP サーバ
 
 - Rust 1.93 以降
 - OBS Studio 30.2 以降（OBS WebSocket 5.5 以降）
-- ffmpeg
-  - Windows の配布ビルドでは実行ファイルに埋め込む。
-  - Linux と macOS では外部の ffmpeg を使う。
+- GStreamer
+  - `gst-launch-1.0` と `gst-inspect-1.0`
+  - `rswebrtc` の `whipclientsink`
+  - `rtmpsrc`、`flvdemux`、`h264parse`、`aacparse`、`flvmux`、`rtmpsink`
+  - `avdec_aac` または `faad`、`opusenc`、`audioconvert`、`audioresample`、`queue`
 - OBS の入力は H.264、B フレームなし、AAC 音声を前提とする。
 - OBS のキーフレーム間隔は 2 秒を推奨する。publisher の 6 秒セグメントと両立する。
+
+GStreamer はアプリに同梱しない。OS ごとに外部のランタイムを用意する。
+カスタムビルドの `rswebrtc` を使う場合は `GST_PLUGIN_PATH` を設定する。
 
 Linux でビルドする場合は、egui の開発パッケージを入れる。
 
@@ -55,36 +61,25 @@ OBS のパスワードと ImageFlux の API トークンも設定ファイルへ
 Unix では設定ファイルを所有者だけが読める 0600 で保存する。
 設定画面の「OS のアプリで開く」から、OS の既定アプリで TOML を直接編集できる。
 編集後は「再読込」を押す。
-初回は GUI の「設定」から OBS、publisher、ImageFlux を入力する。
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
-`ffmpeg.path` を空欄にすると、PATH、`TOMYOU_FFMPEG`、標準的なインストール先の順に探す。
+`gstreamer.path` を空欄にすると、PATH、`TOMYOU_GST_LAUNCH`、標準的なインストール先の順に探す。
 
-## ffmpeg の機能
+## GStreamer の機能
 
-起動時に次の機能を実際に確認する。
+起動時に次の要素を確認する。
 
-- WHIP muxer
-- DTLS
-- libopus encoder
-- RTMP protocol
-- FLV demuxer
-- AAC decoder
+- Edamame: `rtmpsrc`、`flvdemux`、`h264parse`、`aacparse`、`flvmux`、`rtmpsink`、`queue`
+- ImageFlux: `whipclientsink`、`opusenc`、`audioconvert`、`audioresample` など
+- AAC デコーダ: `avdec_aac` または `faad`
 
-不足している場合は画面に不足機能を表示する。
-ImageFlux 側だけを諦め、Edamame 側の送信は継続する。
-勝手に ffmpeg をダウンロードしたり、別の実行ファイルへ置き換えたりしない。
+`whipclientsink` では、音声パッドを先に接続して SDP の m-line を `audio0`、`video1` の順にする。
+Sora の answer は音声を先頭に返すため、この順序が必要である。
+`whip-endpoint` ではなく `signaller::whip-endpoint` を使う。
 
-### Windows の埋め込みビルド
-
-`TOMYOU_FFMPEG_PATH` に WHIP 対応の `ffmpeg.exe` を指定し、`bundled-ffmpeg` を有効にする。
-
-```bash
-TOMYOU_FFMPEG_PATH=/path/to/ffmpeg.exe \
-  cargo build --release -p tomyou --features bundled-ffmpeg
-```
-
-実行時にユーザー領域へ展開し、ハッシュが一致しない場合は書き直す。
+不足要素がある場合は、不足名を GUI のログに表示する。
+ImageFlux 側だけが不足している場合は Edamame の送信を継続する。
+GStreamer のインストールをアプリが自動実行することはない。
 
 ## 操作
 
@@ -92,7 +87,7 @@ TOMYOU_FFMPEG_PATH=/path/to/ffmpeg.exe \
 2. `tomyou` の設定を入力して保存する。
 3. 「配信を開始」を押す。
 4. OBS の配信先が `rtmp://127.0.0.1:1935/live/<channel>` に設定され、OBS の配信が始まる。
-5. `tomyou` が Edamame と ImageFlux の送信状態、ImageFlux の HLS URL を表示する。
+5. Edamame と ImageFlux の送信状態、ImageFlux の HLS URL を表示する。
 6. 終了時は「配信を停止」を押す。OBS の配信先は、変更していなければ元へ戻る。
 
 OBS が既に配信中の場合は開始しない。
@@ -104,6 +99,7 @@ OBS WebSocket だけが切れても、RTMP 入力が続く間は送信を維持�
 - ImageFlux の鍵取得、鍵配布、暗号化解除は行わない。既存の鍵 URI 設定は保持する。
 - 1 台につき 1 チャンネルとする。
 - OBS の置き換え、録画、映像プレビュー、複数チャンネル同時配信は行わない。
+- Windows の単一 exe 配布は行わない。GStreamer は外部ランタイムとする。
 - `tomyou` と `whip-script` を同じ OBS に対して同時に動かさない。
 - OBS、`tomyou`、拠点 PC、拠点回線は両系で共有する。独立した冗長化ではない。
 - 上り帯域は原則として映像約 2 本分必要になる。
@@ -121,4 +117,4 @@ cargo test -p tomyou
 ## ライセンス
 
 Apache License 2.0。
-使用する egui、shiguredo_rtmp、obws、ffmpeg のライセンスは各配布物の表記に従う。
+使用する egui、shiguredo_rtmp、obws、GStreamer、rswebrtc のライセンスは各配布物の表記に従う。

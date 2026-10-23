@@ -31,7 +31,7 @@ Edamame が対象とするライブ配信とは、セグメントファイルが
 - [運用](./operations.md)：CLI オプションと環境変数、パラメータ設計とメモリ容量の見積もり、TLS と ACME の設定、再起動や障害時の動作
 - [controller の冗長化](./cluster.md)：leader の選出、転送、交代時の状態消失と通信分断時の制約
 - [publisher](./publisher.md)：付属の `edamame-publisher` クレートの導入手順、エンコードと暗号化、外部サーバへの鍵登録の仕様
-- [tomyou](./tomyou.md)：OBS の映像を Edamame と ImageFlux へ中継する拠点向け GUI アプリの構成、ffmpeg の条件、障害時の動作
+- [tomyou](./tomyou.md)：OBS の映像を Edamame と ImageFlux へ中継する拠点向け GUI アプリの構成、GStreamer の条件、障害時の動作
 - [スクリプト](../scripts/README.md)：ローカルの MP4 ファイルを無限ループさせてテスト配信を行う `scripts/loop-publisher.py` の使い方
 
 ## 各コンポーネントの役割

@@ -128,7 +128,7 @@ cargo run --release -p tomyou
 cargo run --release -p tomyou -- --config /path/to/config.toml
 ```
 
-設定、OBS の条件、ffmpeg の必要機能、ImageFlux の扱い、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
+設定、OBS の条件、GStreamer の必要機能、ImageFlux の扱い、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
 この版では ImageFlux のプレイリストを live2025-server へ登録しない。
 Edamame の URL と鍵の登録は、既存の `publisher` の設定を使う。
 

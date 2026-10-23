@@ -73,6 +73,6 @@ archive_destination_id = ""
 [relay]
 bind = "127.0.0.1:1935"
 
-[ffmpeg]
-# 空欄なら PATH、環境変数 TOMYOU_FFMPEG、標準的なインストール先から探す。
-# path = "/usr/local/bin/ffmpeg"
+[gstreamer]
+# 空欄なら PATH、TOMYOU_GST_LAUNCH、標準的なインストール先から探す。
+# path = "/opt/homebrew/bin/gst-launch-1.0"

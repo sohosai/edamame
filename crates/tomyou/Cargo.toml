@@ -6,12 +6,6 @@ rust-version = "1.93"
 description = "OBS の映像を Edamame と ImageFlux へ中継する拠点向けアプリ"
 license = "Apache-2.0"
 
-[features]
-default = []
-# Windows の配布物では、ビルド時に assets/ffmpeg.exe を実行ファイルへ埋め込む。
-# Linux と macOS は外部の ffmpeg を検査して使う。
-bundled-ffmpeg = []
-
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

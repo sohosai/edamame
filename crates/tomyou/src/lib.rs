@@ -4,7 +4,7 @@
 
 pub mod app;
 pub mod config;
-pub mod ffmpeg;
+pub mod gstreamer;
 pub mod imageflux;
 pub mod obs;
 pub mod relay;

@@ -25,7 +25,7 @@ pub struct Config {
     #[serde(default)]
     pub relay: RelayConfig,
     #[serde(default)]
-    pub ffmpeg: FfmpegConfig,
+    pub gstreamer: GStreamerConfig,
 }
 
 /// OBS WebSocket の接続設定
@@ -119,9 +119,9 @@ pub struct RelayConfig {
     pub bind: String,
 }
 
-/// ffmpeg の探索設定
+/// GStreamer の探索設定
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FfmpegConfig {
+pub struct GStreamerConfig {
     /// 指定した場合は PATH より優先する
     #[serde(default)]
     pub path: Option<PathBuf>,
@@ -135,7 +135,7 @@ impl Default for Config {
             publisher: PublisherConfig::default(),
             imageflux: ImageFluxConfig::default(),
             relay: RelayConfig::default(),
-            ffmpeg: FfmpegConfig::default(),
+            gstreamer: GStreamerConfig::default(),
         }
     }
 }
@@ -295,10 +295,10 @@ impl Config {
                 bail!("publisher.rtmp_url は rtmp:// で始めてください");
             }
         }
-        if let Some(path) = &self.ffmpeg.path
+        if let Some(path) = &self.gstreamer.path
             && path.as_os_str().is_empty()
         {
-            bail!("ffmpeg.path が空です");
+            bail!("gstreamer.path が空です");
         }
         if self.imageflux.hls.is_empty() {
             bail!("imageflux.hls が空です");

@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::Config,
-    ffmpeg::{self, OutputKind, OutputSpec},
+    gstreamer::{self, OutputSpec},
     imageflux::{ImageFluxClient, whip_url},
     obs::{ObsClient, StreamSnapshot},
     relay::{self, RelayEvent},
@@ -83,16 +83,16 @@ async fn run(
         anyhow::bail!("publisher.rtmp_url が未設定です。Edamame へ送信できません");
     }
 
-    let ffmpeg_path = ffmpeg::resolve(config.ffmpeg.path.as_deref())?;
-    let capabilities = ffmpeg::inspect(&ffmpeg_path)?;
+    let gst_launch = gstreamer::resolve(config.gstreamer.path.as_deref())?;
+    let capabilities = gstreamer::inspect(&gst_launch)?;
     let _ = ui.send(SessionEvent::Log(format!(
-        "ffmpeg: {} ({})",
-        ffmpeg_path.display(),
+        "GStreamer: {} ({})",
+        gst_launch.display(),
         capabilities.summary()
     )));
     if !capabilities.edamame_ready() {
         anyhow::bail!(
-            "ffmpeg に RTMP と FLV の機能がありません: {}",
+            "GStreamer に Edamame 向け RTMP の要素がありません: {}",
             capabilities.summary()
         );
     }
@@ -102,7 +102,7 @@ async fn run(
         .bind
         .parse()
         .context("relay.bind を解釈できません")?;
-    let input_url = ffmpeg::rtmp_input(&config.relay.bind, &config.channel_id);
+    let input_url = gstreamer::rtmp_input(&config.relay.bind, &config.channel_id);
     let server = format!("rtmp://{}/live", config.relay.bind);
     let key = config.channel_id.clone();
 
@@ -112,11 +112,8 @@ async fn run(
 
     let (output_stop_tx, output_stop_rx) = watch::channel(false);
     spawn_output(
-        OutputSpec {
-            kind: OutputKind::Edamame,
-            args: ffmpeg::edamame_args(&input_url, &config.publisher.rtmp_url),
-        },
-        ffmpeg_path.clone(),
+        gstreamer::edamame_spec(&input_url, &config.publisher.rtmp_url),
+        gst_launch.clone(),
         output_stop_rx.clone(),
         ui.clone(),
     );
@@ -193,7 +190,7 @@ async fn run(
         match prepare_imageflux(
             client,
             &config,
-            &ffmpeg_path,
+            &gst_launch,
             &capabilities,
             &input_url,
             output_stop_rx.clone(),
@@ -279,7 +276,7 @@ async fn run(
         }
     }
 
-    // 出力タスクが ffmpeg を終了させる時間を少しだけ待つ
+    // 出力タスクが GStreamer を終了させる時間を少しだけ待つ
     tokio::time::sleep(Duration::from_millis(300)).await;
     info!("session stopped");
     Ok(())
@@ -288,18 +285,21 @@ async fn run(
 async fn prepare_imageflux(
     client: &ImageFluxClient,
     config: &Config,
-    ffmpeg_path: &Path,
-    capabilities: &ffmpeg::FfmpegCapabilities,
+    gst_launch: &Path,
+    capabilities: &gstreamer::GstCapabilities,
     input_url: &str,
     stop_rx: watch::Receiver<bool>,
     ui: Sender<SessionEvent>,
 ) -> anyhow::Result<String> {
     if !capabilities.imageflux_ready() {
         anyhow::bail!(
-            "ffmpeg に WHIP、DTLS、libopus の機能がありません: {}",
+            "GStreamer に ImageFlux 向け WHIP の要素がありません: {}",
             capabilities.summary()
         );
     }
+    let decoder = capabilities
+        .audio_decoder()
+        .context("AAC デコーダがありません")?;
     let created = client
         .create_channel(
             &config.imageflux.hls,
@@ -321,11 +321,8 @@ async fn prepare_imageflux(
     });
 
     spawn_output(
-        OutputSpec {
-            kind: OutputKind::ImageFlux,
-            args: ffmpeg::imageflux_args(input_url, &whip),
-        },
-        ffmpeg_path.to_path_buf(),
+        gstreamer::imageflux_spec(input_url, &whip, decoder),
+        gst_launch.to_path_buf(),
         stop_rx,
         ui.clone(),
     );
@@ -348,18 +345,18 @@ async fn prepare_imageflux(
 
 fn spawn_output(
     spec: OutputSpec,
-    ffmpeg: PathBuf,
+    gst_launch: PathBuf,
     stop_rx: watch::Receiver<bool>,
     ui: Sender<SessionEvent>,
 ) {
     tokio::spawn(async move {
-        run_output(spec, ffmpeg, stop_rx, ui).await;
+        run_output(spec, gst_launch, stop_rx, ui).await;
     });
 }
 
 async fn run_output(
     spec: OutputSpec,
-    ffmpeg: PathBuf,
+    gst_launch: PathBuf,
     mut stop_rx: watch::Receiver<bool>,
     ui: Sender<SessionEvent>,
 ) {
@@ -369,7 +366,7 @@ async fn run_output(
         if *stop_rx.borrow() {
             return;
         }
-        let mut command = Command::new(&ffmpeg);
+        let mut command = Command::new(&gst_launch);
         command
             .args(&spec.args)
             .stdin(Stdio::null())
@@ -397,7 +394,7 @@ async fn run_output(
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if is_useful_ffmpeg_line(&line) {
+                    if is_useful_gst_line(&line) {
                         let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
                     }
                 }
@@ -422,19 +419,25 @@ async fn run_output(
     }
 }
 
-/// 画面に出す価値のある ffmpeg のエラー行か
-fn is_useful_ffmpeg_line(line: &str) -> bool {
+/// 画面に出す価値のある GStreamer のエラー行か
+fn is_useful_gst_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     [
         "error",
         "failed",
         "invalid",
+        "warning",
         "refused",
         "timed out",
         "unreachable",
         "no route",
         "handshake",
         "broken pipe",
+        "not-negotiated",
+        "ice",
+        "dtls",
+        "whipclientsink",
+        "setup elements",
     ]
     .iter()
     .any(|needle| lower.contains(needle))

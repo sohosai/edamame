@@ -70,7 +70,7 @@ pub struct TomyouApp {
     edamame_output: bool,
     show_settings: bool,
     show_license: bool,
-    ffmpeg_path_draft: String,
+    gstreamer_path_draft: String,
     obs_snapshot: Option<StreamSnapshot>,
 }
 
@@ -85,8 +85,8 @@ impl TomyouApp {
         setup_fonts(&cc.egui_ctx);
         let (events_tx, events_rx) = std::sync::mpsc::channel();
         let config_path_draft = config_path.display().to_string();
-        let ffmpeg_path_draft = config
-            .ffmpeg
+        let gstreamer_path_draft = config
+            .gstreamer
             .path
             .as_ref()
             .map(|path| path.display().to_string())
@@ -110,7 +110,7 @@ impl TomyouApp {
             edamame_output: false,
             show_settings: false,
             show_license: false,
-            ffmpeg_path_draft,
+            gstreamer_path_draft,
             obs_snapshot: None,
         }
     }
@@ -257,10 +257,10 @@ impl TomyouApp {
     }
 
     fn save_config(&mut self) {
-        self.config.ffmpeg.path = if self.ffmpeg_path_draft.trim().is_empty() {
+        self.config.gstreamer.path = if self.gstreamer_path_draft.trim().is_empty() {
             None
         } else {
-            Some(PathBuf::from(self.ffmpeg_path_draft.trim()))
+            Some(PathBuf::from(self.gstreamer_path_draft.trim()))
         };
         let path = self.config_path_from_draft();
         match self.config.save(&path) {
@@ -310,8 +310,8 @@ impl TomyouApp {
         }
         match Config::load(&path) {
             Ok(config) => {
-                self.ffmpeg_path_draft = config
-                    .ffmpeg
+                self.gstreamer_path_draft = config
+                    .gstreamer
                     .path
                     .as_ref()
                     .map(|path| path.display().to_string())
@@ -603,12 +603,12 @@ impl TomyouApp {
                         }
                     });
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("ffmpeg").strong());
+                ui.label(egui::RichText::new("GStreamer").strong());
                 ui.horizontal(|ui| {
                     ui.label("実行ファイル");
-                    ui.text_edit_singleline(&mut self.ffmpeg_path_draft);
+                    ui.text_edit_singleline(&mut self.gstreamer_path_draft);
                 });
-                ui.label("空欄なら PATH と標準的な場所から自動検出します。");
+                ui.label("空欄なら PATH、TOMYOU_GST_LAUNCH、標準的な場所から自動検出します。");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("保存").clicked() {
@@ -655,7 +655,7 @@ impl TomyouApp {
                 ui.label("egui / eframe: MIT OR Apache-2.0");
                 ui.label("shiguredo_rtmp: Apache-2.0");
                 ui.label("obws: MIT");
-                ui.label("ffmpeg: ビルド内容に応じた LGPL / GPL。配布物の LICENSE を参照");
+                ui.label("GStreamer: LGPL。rswebrtc: MPL-2.0。配布物の LICENSE を参照");
                 ui.separator();
                 ui.label(
                     "ImageFlux の API トークンと OBS のパスワードは設定ファイルへ保存します。",
