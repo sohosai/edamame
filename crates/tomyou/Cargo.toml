@@ -19,6 +19,7 @@ directories = "6"
 eframe.workspace = true
 egui.workspace = true
 obws.workspace = true
+open = "5"
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -278,6 +278,30 @@ impl TomyouApp {
         }
     }
 
+    fn open_config_file(&mut self) {
+        let path = self.config_path_from_draft();
+        if path.as_os_str().is_empty() {
+            self.error = Some("設定ファイルのパスが空です".to_owned());
+            return;
+        }
+        if !path.is_file() {
+            self.save_config();
+            if self.error.is_some() {
+                return;
+            }
+        }
+        match open::that(&path) {
+            Ok(()) => {
+                self.error = None;
+                self.log(format!("設定ファイルを開きました: {}", path.display()));
+            }
+            Err(error) => {
+                self.error = Some(format!("設定ファイルを開けません: {error:#}"));
+                self.log(format!("設定ファイルを開けません: {error:#}"));
+            }
+        }
+    }
+
     fn load_config_from_draft(&mut self) {
         let path = self.config_path_from_draft();
         if path.as_os_str().is_empty() {
@@ -481,6 +505,7 @@ impl TomyouApp {
         let mut close_requested = false;
         let mut load_requested = false;
         let mut save_requested = false;
+        let mut open_requested = false;
         egui::Window::new("設定")
             .open(&mut open)
             .default_width(720.0)
@@ -491,10 +516,14 @@ impl TomyouApp {
                     if ui.button("読み込む").clicked() {
                         load_requested = true;
                     }
+                    if ui.button("OS のアプリで開く").clicked() {
+                        open_requested = true;
+                    }
                 });
                 ui.label(
                     "保存もこのパスへ書き込みます。空欄の場合は現在の設定ファイルを使います。",
                 );
+                ui.label("ファイルが無い場合は、現在の設定を保存してから開きます。");
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("接続").strong());
                 egui::Grid::new("settings-connection")
@@ -596,6 +625,9 @@ impl TomyouApp {
                 ui.label("配信中は接続先の変更を反映しません。停止してから保存してください。");
             });
         self.show_settings = open && !close_requested;
+        if open_requested {
+            self.open_config_file();
+        }
         if load_requested {
             self.load_config_from_draft();
         }

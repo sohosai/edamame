@@ -53,6 +53,8 @@ cargo run -p tomyou -- --config /path/to/config.toml
 GUI の「設定」でも設定ファイルのパスを指定して読み込み・保存できる。
 OBS のパスワードと ImageFlux の API トークンも設定ファイルへ保存する。
 Unix では設定ファイルを所有者だけが読める 0600 で保存する。
+設定画面の「OS のアプリで開く」から、OS の既定アプリで TOML を直接編集できる。
+編集後は「再読込」を押す。
 初回は GUI の「設定」から OBS、publisher、ImageFlux を入力する。
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
