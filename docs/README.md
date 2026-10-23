@@ -98,6 +98,11 @@ HLS のライブ配信では `#EXT-X-TARGETDURATION` を途中で変更できな
 切り替えが終わるまでのプレイリストリクエストには、`503 Service Unavailable` を返すことがある。
 また、公開範囲のセグメントファイルが容量超過などで `controller` のメモリから欠落している場合、`controller` はその `quality` のメディアプレイリストを作らず `422 Unprocessable Entity` を返す。
 
+`publisher` が新しいセグメントを送らなくなって、最後の `PUT` から `duration_ms × --playlist-segments + --publish-wait-ms` を超えると、その `quality` は停止中とみなす。
+停止中の `quality` はマスタープレイリストから除外し、メディアプレイリストは `503 Service Unavailable` を返す。
+停止中も保存済みのセグメントと `worker` のキャッシュは削除しない。
+停止後に再開した場合は、停止前のセグメント番号を公開範囲とキャッシュ対象から除き、再開後の新しいセグメントだけを公開する。
+
 ### 3. プレイリスト生成と配信先の振り分け
 
 `controller` は、`sync` が `--sync-timeout-ms` 以内に届いている `worker` だけを配信先の候補にする。

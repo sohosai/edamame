@@ -240,6 +240,10 @@ curl -i -b 'session=<session>' 'https://live.example.test/key/uni' | xxd
 `publisher` 自体を再起動した場合も、この番号を使って時刻を続ける。
 プレイリストを取得できない場合は `0` から始める。
 
+`controller` は、最後の `PUT` から `duration_ms × --playlist-segments + --publish-wait-ms` を超えた `quality` を停止中とみなし、マスタープレイリストから除外する。
+停止中は開始番号を取得できないため `0` から始めるが、`controller` の採番は変わらない。
+停止をまたいだ ffmpeg の出力時刻の継続は保証しない。
+
 再生側のプレイリストは設定した `duration_ms` の並びで作られる。
 そのため、バックログの破棄や `PUT` の失敗で一部のセグメントが欠けても時刻は詰まらず、実際の再生では欠けた区間が飛ぶ。
 
