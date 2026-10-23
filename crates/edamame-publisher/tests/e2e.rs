@@ -267,7 +267,11 @@ bandwidth = 12000000
     let media_url = format!("{}/channels/1A/main.m3u8", controller.base_url);
     let expected = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{key_uri}\",IV=0x");
     let listed = wait_for(
-        || http_get(&media_url).is_some_and(|body| body.contains(&expected)),
+        // IV の比較には 2 個必要なので、最初の 1 個だけで待機を終えない。
+        || {
+            http_get(&media_url)
+                .is_some_and(|body| body.contains(&expected) && playlist_ivs(&body).1.len() >= 2)
+        },
         Duration::from_secs(30),
     );
     assert!(

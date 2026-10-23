@@ -14,6 +14,7 @@ pub struct CanonicalStore {
     inner: Mutex<StoreInner>,
 }
 
+#[derive(Default)]
 struct StoreInner {
     segments: BTreeMap<SegmentKey, StoredSegment>,
     /// 削除する順番を決めるための、書き込み順の索引
@@ -33,13 +34,13 @@ impl CanonicalStore {
     pub fn new(capacity: u64) -> Self {
         Self {
             capacity,
-            inner: Mutex::new(StoreInner {
-                segments: BTreeMap::new(),
-                order: BTreeMap::new(),
-                used_bytes: 0,
-                next_order: 0,
-            }),
+            inner: Mutex::new(StoreInner::default()),
         }
+    }
+
+    /// 降格時に古いセグメントが残らないよう、索引と使用量もまとめて初期化する。
+    pub fn clear(&self) {
+        *self.inner.lock().expect("store lock is not poisoned") = StoreInner::default();
     }
 
     /// セグメントファイルが保存されているかを返す

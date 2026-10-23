@@ -13,9 +13,6 @@ use crate::config::{PublisherSettings, RenditionMode, RenditionSettings};
 /// publisher が HLS muxer の出力先として指定するプレイリストのファイル名
 pub const PLAYLIST_NAME: &str = "index.m3u8";
 
-/// イメージに同梱した raisr のフィルタデータの場所
-const RAISR_FILTER_FOLDER: &str = "/usr/local/share/raisr/filters_2x/filters_highres";
-
 /// ffmpeg に渡す引数を組み立てる
 #[must_use]
 pub fn build_command(
@@ -36,18 +33,6 @@ pub fn build_command(
         "-stats_period".to_owned(),
         "60".to_owned(),
     ];
-    // upscale はフレームを QSV へ戻す (hwupload) ため、先にフィルタ用のデバイスを固定する
-    if renditions
-        .iter()
-        .any(|rendition| rendition.mode == RenditionMode::Upscale)
-    {
-        args.extend([
-            "-init_hw_device".to_owned(),
-            "qsv=hw".to_owned(),
-            "-filter_hw_device".to_owned(),
-            "hw".to_owned(),
-        ]);
-    }
     // QSV は入力を指定する前に有効にし、デコードしたフレームをハードウェアメモリのまま扱う
     if settings.encoder.codec.ends_with("_qsv") {
         args.extend([
@@ -74,7 +59,7 @@ pub fn build_command(
             RenditionMode::Copy => {
                 args.extend(["-c:v".to_owned(), "copy".to_owned()]);
             }
-            RenditionMode::Encode | RenditionMode::Upscale => {
+            RenditionMode::Encode => {
                 args.extend([
                     "-c:v".to_owned(),
                     settings.encoder.codec.clone(),
@@ -92,7 +77,7 @@ pub fn build_command(
                 let bitrate = rendition.video_bitrate.unwrap_or(0);
                 args.extend([
                     "-vf".to_owned(),
-                    video_filter(&settings.encoder.codec, rendition),
+                    scale_filter(&settings.encoder.codec, rendition),
                     "-b:v".to_owned(),
                     bitrate.to_string(),
                     "-maxrate".to_owned(),
@@ -141,25 +126,6 @@ fn forced_idr_option(codec: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// rendition の映像フィルタ
-fn video_filter(codec: &str, rendition: &RenditionSettings) -> String {
-    if rendition.mode == RenditionMode::Upscale {
-        upscale_filter()
-    } else {
-        scale_filter(codec, rendition)
-    }
-}
-
-/// Intel VSR (raisr) で 2 倍に拡大するフィルタ。
-///
-/// raisr は planar の YUV しか受け付けないため、QSV のフレームをいったん
-/// ダウンロードして yuv420p にし、エンコードのために nv12 へ戻してアップロードする
-fn upscale_filter() -> String {
-    format!(
-        "hwdownload,format=yuv420p,raisr=filterfolder={RAISR_FILTER_FOLDER}:asm=opencl,setsar=1,format=nv12,hwupload=extra_hw_frames=16"
-    )
 }
 
 /// rendition の解像度へ変換するフィルタ。
@@ -408,20 +374,6 @@ mod tests {
         ]
     }
 
-    /// upscale する rendition
-    fn upscale_rendition() -> RenditionSettings {
-        RenditionSettings {
-            quality: "2160p".to_owned(),
-            mode: RenditionMode::Upscale,
-            resolution: Resolution {
-                width: 3840,
-                height: 2160,
-            },
-            bandwidth: 22_000_000,
-            video_bitrate: Some(20_000_000),
-        }
-    }
-
     #[test]
     fn builds_command_for_copy_and_encode() {
         let args = build_command(
@@ -507,48 +459,6 @@ mod tests {
         assert!(!text.contains("-forced-idr 1"));
         // copy の rendition は QSV でもそのままコピーする
         assert!(text.contains("-c:v copy"));
-    }
-
-    #[test]
-    fn builds_command_for_upscale() {
-        let mut target = settings();
-        target.encoder.codec = "h264_qsv".to_owned();
-        let mut target_renditions = renditions();
-        target_renditions.push(upscale_rendition());
-        let args = build_command(
-            &target,
-            "srt://0.0.0.0:9101?mode=listener",
-            &target_renditions,
-            Path::new("/tmp/run-1"),
-            0,
-        );
-        let text = args.join(" ");
-        // hwupload のデバイスを固定する
-        assert!(text.contains("-init_hw_device qsv=hw -filter_hw_device hw"));
-        // raisr は planar の YUV を受け取り、エンコード用の nv12 へ戻す
-        assert!(text.contains(
-            "-vf hwdownload,format=yuv420p,raisr=filterfolder=/usr/local/share/raisr/filters_2x/filters_highres:asm=opencl,setsar=1,format=nv12,hwupload=extra_hw_frames=16"
-        ));
-        // 4K への拡大は raisr に任せ、scale は使わない
-        assert!(!text.contains("scale_qsv=w=3840"));
-        assert!(!text.contains("scale=3840"));
-        assert!(text.contains("-b:v 20000000"));
-        assert!(text.contains("-forced_idr 1"));
-        assert!(text.contains("/tmp/run-1/2160p/%d.ts"));
-    }
-
-    #[test]
-    fn omits_the_filter_device_without_upscale() {
-        let mut target = settings();
-        target.encoder.codec = "h264_qsv".to_owned();
-        let args = build_command(
-            &target,
-            "srt://0.0.0.0:9101?mode=listener",
-            &renditions(),
-            Path::new("/tmp/run-1"),
-            0,
-        );
-        assert!(!args.join(" ").contains("-init_hw_device"));
     }
 
     #[test]

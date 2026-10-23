@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use edamame_controller::cluster::ClusterState;
 use edamame_controller::config::{ControllerConfig, DEFAULT_PUBLISH_WAIT_MS};
 use edamame_controller::http::router;
 use edamame_controller::state::ControllerState;
@@ -20,9 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "warning: --publish-wait-ms is not specified; using {DEFAULT_PUBLISH_WAIT_MS} ms"
         );
-    }
-    if config.auth_token.is_none() {
-        eprintln!("warning: --auth-token is not specified; PUT requests are not authenticated");
     }
     let cors = config.cors_origins()?;
     if config.cors_origin.is_empty() {
@@ -44,10 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.publish_wait_ms(),
         config.external_min_percent,
     );
-    let app = router(Arc::clone(&state), &cors, config.auth_token.as_deref());
+    let cluster = ClusterState::new(&config, state.clone())?;
+    let app = router(Arc::clone(&state), &cors, cluster.clone());
     let metrics_task = telemetry.is_enabled().then(|| state.spawn_metrics_loop());
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     println!("edamame-controller listening on {}", config.bind);
+    let health = cluster.health().await;
+    println!(
+        "controller public_url={} metric={} role={:?}",
+        health.public_url, health.metric, health.role
+    );
+    tokio::spawn(cluster.run());
     // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
     let serve_result = axum::serve(
         listener,

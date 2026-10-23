@@ -1,86 +1,219 @@
 # 運用
 
-## 構成
+この文書では、`controller` と `worker` の設定、パラメータ設計とメモリ容量の見積もり、TLS 配信、および再起動や障害時の動作を説明する。
+全体構成と用語の定義は [docs/README.md](./README.md) で説明する。
 
-Edamame は 1 つの controller と 1 つ以上の worker で構成する。
-publisher は controller にセグメントファイルを PUT する。
-client は controller からプレイリストを取得し、worker からセグメントファイルを取得する。
+## 構成と接続関係
 
+Edamame は単独または冗長化した `controller` と、1 つ以上の `worker` で構成する。
+`publisher` は `controller` にセグメントファイルを `PUT` し、`client` はプレイリストを `controller` から、セグメントファイルを `worker` から取得する。
+
+```text
+publisher ── PUT セグメントファイル ────────────────────> controller
+worker    ── PUT 登録 / POST sync / GET セグメントファイル ─> controller
+client    ── GET プレイリスト (.m3u8) ──────────────────> controller
+client    ── GET セグメントファイル (.ts) ──────────────> worker
 ```
-publisher -- PUT セグメントファイル --> controller
-client ---- GET プレイリスト --> controller
-client ---- GET セグメントファイル ---> worker
-controller <-- sync/GET ---- worker
-```
 
-client は外部の HLS player であり、Edamame の CLI option では設定しない。
-client には、controller に到達できる URL を設定する。
+`client` は外部の HLS プレイヤーであり、Edamame の CLI オプションでは設定しない。
+`client` には、`controller` のマスタープレイリスト URL（`{controller_url}/channels/{channel_id}/master.m3u8`）を設定する。
 
-## controller の設定
+## 設定リファレンス
 
-環境変数の名前は、option 名の `-` を `_` に変えて `EDAMAME_` を付けたものにする。
-各 option はコマンドライン引数か環境変数で指定する。
-両方を指定した場合はコマンドライン引数を優先する。
+各オプションはコマンドライン引数または環境変数で指定する。
+環境変数の名前は、オプション名の `-` を `_` に変えて先頭に `EDAMAME_` を付けたものにする。
+両方を指定した場合は、コマンドライン引数を優先する。
+
+### controller の設定
 
 | option | 環境変数 | 必須 | 説明 |
 | --- | --- | --- | --- |
-| `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレスであり、client や worker が接続する URL ではない |
-| `--storage-capacity` | `EDAMAME_STORAGE_CAPACITY` | 必須 | 正規セグメントファイルをメモリ上に保存する容量（`256MiB` のような 2 進接頭辞付きの値、または byte 数。1 以上） |
-| `--playlist-segments` | `EDAMAME_PLAYLIST_SEGMENTS` | 必須 | メディアプレイリストに含める直近のセグメント数（全 channel に共通、6 以上の整数） |
-| `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | worker に指示する sync の間隔をミリ秒で指定する（1 以上の整数） |
-| `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | sync が届かない worker を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
-| `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に worker の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は 2000 で警告を出す） |
-| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | PUT の認証に使うトークン（空白と制御文字を除く表示可能 ASCII、省略すると PUT を認証せず、起動時に警告を出す） |
-| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
-| `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 外部配信へ流す最低の割合（%、0 以上 100 以下、省略時は 1） |
+| `--bind` | `EDAMAME_BIND` | 必須 | HTTP サーバが待ち受けるアドレス。`client` や `worker` が接続する URL ではない |
+| `--storage-capacity` | `EDAMAME_STORAGE_CAPACITY` | 必須 | 正規セグメントファイルをメモリ上に保存する容量（`256MiB` のような 2 進接頭辞付きの値、またはバイト数。1 以上） |
+| `--playlist-segments` | `EDAMAME_PLAYLIST_SEGMENTS` | 必須 | メディアプレイリストに含める直近のセグメント数（全 `channel` に共通、6 以上の整数） |
+| `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | `worker` に指示する `sync` の間隔をミリ秒で指定する（1 以上の整数） |
+| `--sync-timeout-ms` | `EDAMAME_SYNC_TIMEOUT_MS` | 必須 | `sync` が届かない `worker` を配信先から外すまでの待ち時間をミリ秒で指定する（1 以上の整数） |
+| `--publish-wait-ms` | `EDAMAME_PUBLISH_WAIT_MS` | 任意 | 新しいセグメントを公開する前に `worker` の取得を待つ時間をミリ秒で指定する（0 以上の整数、省略時は `2000` を使い警告を出す） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 必須 | PUT と heartbeat に共通の token。空白と制御文字を除く表示可能 ASCII を使い、全 peer、worker、publisher で同じ値にする |
+| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの `GET` を許可する origin（`*`、`none`、またはカンマ区切りの origin 一覧。省略すると CORS ヘッダを付けず警告を出す） |
+| `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 外部配信が登録されているときに外部配信へ流す最低の割合（%、0 以上 100 以下、省略時は `1`。公開の遅れが増えると最大 100% まで上昇する） |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | peer、worker、client のすべてから到達できる、このインスタンス固有の HTTP または HTTPS の絶対 URL。query と fragment は不可、path の接頭辞は許可する |
+| `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下で、大きい値を優先する。省略時は 100 |
+| `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の URL。カンマ区切りと繰り返しを許可し、重複と自分の URL を除く。省略すると自分 1 台で始まり、後からの参加も受け付ける |
 
-## worker の設定
+### worker の設定
 
 | option | 環境変数 | 必須 | 説明 |
 | --- | --- | --- | --- |
-| `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | controller に登録する worker の識別子 |
-| `--bind` | `EDAMAME_BIND` | 必須 | HTTP server が待ち受けるアドレス |
-| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | client に公開する worker の URL であり、`http` または `https` で始まる絶対 URL（TLS 終端の reverse proxy を置く場合は `https`） |
-| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | worker から controller に接続するための、`http` の絶対 URL |
+| `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | `controller` に登録する `worker` の識別子 |
+| `--bind` | `EDAMAME_BIND` | 必須 | HTTP サーバが待ち受けるアドレス |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | `client` に公開する `worker` の URL。`http` または `https` で始まる絶対 URL（TLS 終端の reverse proxy を置く場合は `https`） |
+| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | `worker` から `controller` に接続するための `http` の絶対 URL |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | `(channel_id, quality)` ごとのキャッシュ上限（1 以上の整数） |
-| `--tls-cert` | `EDAMAME_TLS_CERT` | 任意 | TLS 配信に使う証明書の PEM ファイル。`--tls-key` と一緒に指定する |
-| `--tls-key` | `EDAMAME_TLS_KEY` | 任意 | TLS 配信に使う秘密鍵の PEM ファイル。`--tls-cert` と一緒に指定する |
-| `--acme` | `EDAMAME_ACME` | 任意 | ACME で証明書を取得して TLS 配信する |
+| `--tls-cert` | `EDAMAME_TLS_CERT` | 任意 | TLS 配信に使う証明書の PEM ファイル。`--tls-key` と組で指定する |
+| `--tls-key` | `EDAMAME_TLS_KEY` | 任意 | TLS 配信に使う秘密鍵の PEM ファイル。`--tls-cert` と組で指定する |
+| `--acme` | `EDAMAME_ACME` | 任意 | ACME で証明書を取得して TLS 配信する（環境変数で指定する場合は `true` または `false`） |
 | `--acme-directory` | `EDAMAME_ACME_DIRECTORY` | 任意 | ACME ディレクトリの `https` URL（省略時は Let's Encrypt の本番環境） |
-| `--acme-cache-dir` | `EDAMAME_ACME_CACHE_DIR` | `--acme` と一緒に必須 | ACME のアカウント鍵と証明書の保存先 |
-| `--acme-contact` | `EDAMAME_ACME_CONTACT` | 任意 | ACME の連絡先メール（省略すると起動時に警告を出す） |
-| `--weight` | `EDAMAME_WEIGHT` | 任意 | worker の重み（1 以上の整数、省略時は 1） |
-| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | controller の `--auth-token` と同じトークン（省略すると登録の PUT に `Authorization` ヘッダーを付けない） |
-| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの GET を許可する origin（省略すると CORS を付けず、起動時に警告を出す） |
+| `--acme-cache-dir` | `EDAMAME_ACME_CACHE_DIR` | `--acme` 指定時は必須 | ACME のアカウント鍵と証明書の保存先 |
+| `--acme-contact` | `EDAMAME_ACME_CONTACT` | 任意 | ACME の連絡先メールアドレス（省略すると起動時に警告を出す） |
+| `--weight` | `EDAMAME_WEIGHT` | 任意 | `worker` の重み（1 以上の整数、省略時は `1`） |
+| `--auth-token` | `EDAMAME_AUTH_TOKEN` | 任意 | `controller` の `--auth-token` と同じトークン（省略すると登録の `PUT` に `Authorization` ヘッダを付けない） |
+| `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | ブラウザからの `GET` を許可する origin（`*`、`none`、またはカンマ区切りの origin 一覧。省略すると CORS ヘッダを付けず警告を出す） |
 
-`--weight`、`--auth-token`、`--cors-origin` 以外の option は必須で、既定値はない。
-`--public-url` は `--bind` から推測しない。
-`0.0.0.0` など client から到達できないアドレスで待ち受ける場合でも、`--public-url` には client から到達できる URL を指定する。
-`--controller-url` には、worker から到達できる `http` の絶対 URL だけを指定できる。
-query と fragment は含めず、末尾の `/` は取り除いて使う。
+`--worker-id`、`--bind`、`--public-url`、`--controller-url`、`--cache-limit` の 5 つは必須であり、既定値はない。
+worker の CLI は `--auth-token` の省略を受け付けるが、controller への登録には同じ token が必要になる。
+省略した場合は登録が 401 になり、worker は 1 秒後に再試行する。
+`--public-url` はプレイリスト内のセグメント URL に書き込まれる公開 URL であり、`--bind` の値からは自動生成しない。
+`0.0.0.0` など `client` から直接到達できないアドレスで待ち受ける場合でも、`--public-url` には `client` から到達できる URL を指定する。
+URL にパスを含めた場合（例：`https://edge.example.test/worker-a`）は、`worker` 側もそのパスを接頭辞とした `{path}/segments/...` でリクエストを待ち受ける。
 
-## TLS 配信
+`--controller-url` には、`worker` から到達できる `http` の絶対 URL だけを指定できる。
+この URL には query と fragment を含めず、末尾に `/` がある場合は取り除いて使う。
 
-worker は既定で HTTP で待ち受ける。TLS 終端の reverse proxy を置く場合はそのまま使う。
-worker 自身で TLS を終端する場合は、次のどちらかを指定する。
+## controller を冗長化する
 
-- `--tls-cert` と `--tls-key`: PEM ファイルの証明書を使う
-- `--acme`: ACME で証明書を取得する。`--acme-cache-dir` にアカウント鍵と証明書を保存する永続ボリュームを指定する
+全 controller に同じ `--auth-token` と、異なる `--public-url` を指定する。
+`--public-url` と `--auth-token` は、1 台だけで起動する場合も必須になる。
+metric の既定値は `100` とし、seed は最初に接触する相手がある場合だけ指定する。
+seed を省略した機体にも、別の機体から接触して参加できる。
 
-TLS を有効にするときは、`--public-url` に `https` を指定する。
-`--acme` の証明書は `--public-url` のホストに対して取得する。client はそのホストへ接続するため、証明書のドメインと公開 URL のホストは常に一致する。
-`--acme-directory` でステージングなど別の ACME ディレクトリを指定できる。ZeroSSL は EAB が必要で対応していない。
-ACME では 443 を worker に割り当てる。80 は使わない。
-証明書の更新は worker の中で行うため、再起動は要らない。
-`--tls-cert` と `--tls-key` の場合も、ファイルの更新時刻を 1 分ごとに確認して読み直す。
+2 台をローカルで確認する最小例を示す。
+それぞれ別のターミナルで起動する。
 
-## 起動と確認
+```bash
+edamame-controller \
+  --bind 127.0.0.1:9000 --public-url http://127.0.0.1:9000 \
+  --metric 20 --seed http://127.0.0.1:9002 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
 
-controller を起動する。
+```bash
+edamame-controller \
+  --bind 127.0.0.1:9002 --public-url http://127.0.0.1:9002 \
+  --metric 10 --seed http://127.0.0.1:9000 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
+
+```bash
+curl http://127.0.0.1:9000/health
+curl http://127.0.0.1:9002/health
+```
+
+metric が 20 の機体が leader、10 の機体が follower になる。
+全 member に対する heartbeat は 1 秒間隔、timeout は 1 秒、死亡判定は最後の直接疎通から 3 秒とする。
+これらは option では変更できない。
+
+本番では reverse proxy を置かず、controller の共有名を DNS ラウンドロビンで複数の A レコードに対応させる。
+例えば `controller.example.test` に 2 台の IP を登録し、TTL は 5 秒など短い値にする。
+全機で共有名に対する待ち受けポートと API の path を揃える。
+各機の `--public-url` と `--seed` は共有名ではなく、機体固有の名前を使う。
+その public URL は peer、worker、client のすべてから同じ scheme で到達できるようにする。
+controller 自体の待ち受けは HTTP であり、HTTPS の public URL を指定するだけでは TLS は有効にならない。
+
+worker と publisher の `--controller-url` は、例えば `http://controller.example.test:9000` のような共有名に揃える。
+client のプレイリスト URL も共有名を使い、GET と sync の 307 に追従する。
+認証付き PUT は follower が内部中継するため、publisher の Authorization は維持される。
+
+停止した機体の A レコードは速やかに削除する。
+短い TTL でも、既存の DNS キャッシュや接続が切り替わる時刻は client によって異なる。
+DNS ラウンドロビンだけでは死んだ機体への接続失敗を回避できないため、接続失敗時は再試行する。
+既存 TCP 接続への応答が途絶えた場合、worker はリクエストの timeout まで最大 30 秒待つため、復旧が leader の交代より遅れる場合がある。
+leader 未確定時や中継失敗時の 503 では `Retry-After: 1` に従う。
+
+上位機が復帰すると自動で切り戻し、セグメント、採番、worker の登録、外部配信の登録は失われる。
+切り替え中はプレイリストが数秒間 404 または 503 になり得る。
+状態の責務、転送規則、二重 leader の条件は [controller の冗長化](./cluster.md) を参照する。
+
+## パラメータ設計とメモリ見積もり
+
+### sync 間隔と公開待ちの設計
+
+`worker` は登録時に受け取った `sync_interval_ms` の間隔で `controller` に `sync` を送る。
+`controller` は、`sync` が `--sync-timeout-ms` の時間を超えて届かない `worker` を配信先の候補から外す。
+各パラメータは次の関係を満たすように設定する。
+
+- `--sync-interval-ms`：セグメント長（`duration_ms`）より十分小さい値にする（例：6 秒セグメントに対して `1000` ミリ秒）
+- `--sync-timeout-ms`：1 回や 2 回の `sync` が遅れただけで配信先から外れないよう、`--sync-interval-ms` の 3 倍以上を推奨する（例：`10000` ミリ秒）
+- `--publish-wait-ms`：1 回目の `sync` でセグメントを取得し、次の `sync` でキャッシュ完了を報告する時間を確保するため、`--sync-interval-ms` の 2 倍を推奨する（例：`2000` ミリ秒）
+- `--cache-limit`：`controller` の `--playlist-segments` より 1 以上大きく設定することを推奨する（例：`--playlist-segments 6` に対して `12`）。公開待ちの間も直前の公開範囲と新しい範囲の両方を保持でき、古い範囲へ切り替わりにくくなる
+
+公開範囲が決まる仕組みの詳細は [docs/README.md](./README.md) の「2. worker の同期と公開範囲の決定」で説明する。
+
+### worker の重み付け
+
+`controller` はメディアプレイリストを生成するときに、`quality` ごとに公開範囲をキャッシュしている `worker` から配信先を選ぶ。
+候補が複数ある場合は、登録された重み（`--weight`）の比に従って選ぶ。
+たとえば重み `4` の `worker` と重み `1` の `worker` があれば、5 回のうち 4 回は重み `4` の `worker` を選ぶ。
+
+重みは相対値であり、選ばれる回数の比になる。
+同じ性能のホストなら同じ値にし、帯域や CPU に余裕があるホストほど大きい値にする（例：4 vCPU のホストを `--weight 1`、16 vCPU のホストを `--weight 4` にする）。
+`--weight` を省略した `worker` は `1` として扱い、登録時に `0` を送ると `controller` は `400 Bad Request` を返す。
+
+`controller` は `worker` のリアルタイムな負荷情報（CPU 使用率、同時接続数、配信帯域）を収集しないため、一時的に性能が落ちた `worker` でも重みの比に従って選ばれ続ける。
+
+### メモリ容量の見積もり
+
+`controller` はセグメントファイルをメモリ上に保存し、合計バイト数が `--storage-capacity` を超えたときは書き込んだ順に古いセグメントファイルから削除する。
+容量はセグメントファイルのバイト数の合計であり、セグメント識別子や暗号化指定などのメタデータは含まない（セグメントファイルを削除したときは、その識別子対応と暗号化指定も合わせて削除される）。
+
+保存容量には、公開範囲と、公開待ちから `worker` が取得し終えるまでに必要な範囲を保持できる大きさを確保する。
+容量が足りないと、`controller` が公開範囲のセグメントファイルを削除してしまい、その `quality` のメディアプレイリストは `422 Unprocessable Entity` を返す。
+また、セグメントファイル 1 つが `--storage-capacity` より大きい場合、その `PUT` には `413 Payload Too Large` を返して保存しない。
+
+必要な容量の目安は次の式で計算する（1 セットは、同じ時間帯における全 `quality` のセグメントの合計サイズ）。
+
+- `controller` の保存容量の目安：保持したいセグメント数 × 1 セットの最大サイズ × `channel` 数（保持したいセグメント数は、`--playlist-segments` に公開待ちと `sync` 間隔の分を足した数より大きくする）
+- `worker` のメモリ使用量の目安：1 セットの最大サイズ × `--cache-limit` × `channel` 数（`--cache-limit` は `(channel_id, quality)` ごとのセグメント数の上限）
+
+たとえば `publisher` の設定例（6 秒セグメント、1080p 12 Mbps、720p 6.5 Mbps、480p 1.4 Mbps）では、3 つの `quality` の合計で 1 セットあたり約 14 MiB になる。
+`--playlist-segments 6` に公開待ちと `sync` 間隔の分を足した 8 セグメントを下回らないよう、余裕を見て 10 セグメント分を 3 `channel` で保持すると仮定すると、`controller` の必要量は約 14 MiB × 10 × 3 ≒ 430 MiB となり、`--storage-capacity 512MiB` が目安になる。
+同じ構成で `worker` に `--cache-limit 12` を設定した場合、`worker` のメモリ使用量は約 14 MiB × 12 × 3 ≒ 504 MiB が目安になる。
+
+## 通信保護と信頼境界
+
+### TLS 配信と ACME
+
+`worker` は既定では HTTP で待ち受ける。
+TLS を終端する reverse proxy を前段に置く場合は、`worker` 側の TLS 設定は不要であり HTTP のまま使える。
+`worker` 自身で TLS を終端する場合は、次のどちらかを指定し、`--public-url` には `https` で始まる URL を指定する。
+
+- `--tls-cert` と `--tls-key`：PEM ファイルの証明書と秘密鍵を使う。ファイルの更新時刻を 1 分ごとに確認し、更新されていれば再起動なしで読み直す
+- `--acme` と `--acme-cache-dir`：ACME（TLS-ALPN-01 チャレンジ）で `--public-url` のホストに対する証明書を自動取得し、永続ボリュームに保存する。443 番ポートを `worker` に割り当て、80 番ポートは使わない。証明書の更新も `worker` 内部で行うため再起動は不要である（`--acme-directory` で別の ACME ディレクトリを指定できるが、EAB が必要な ZeroSSL には対応していない）
+
+TLS 配信を有効にした `worker` は、公開ルート CA で検証できる証明書を配信している間だけ `controller` への登録と `sync` を行う。
+公開ルート CA で信頼されない証明書（ステージング環境の証明書など）では `controller` に登録されない。
+
+### セキュリティと信頼境界
+
+- `controller` は `--auth-token` を必須とし、PUT と heartbeat に常に Bearer 認証を要求する。token がない場合や一致しない場合は 401 を返す
+- `GET` と `POST /workers/{worker_id}/sync` には認証がないため、`controller` の待ち受けポートへは信頼できるネットワークからか、reverse proxy 経由でのみアクセスできるようにする
+- `publisher` が送るセグメント識別子は文字種を限定し、`controller` と `worker` は識別子をメモリ上の索引にだけ使う
+- `worker` は `--controller-url` から GET と sync を送り、follower が返す leader の URL への redirect に追従する。cluster の token を持つ peer は転送先を宣言できるため、信頼できる controller だけに token を渡す
+- `--public-url` には `client` から到達できる URL を指定し、`controller` はこの URL をプレイリストに書く
+- `controller` は登録された外部配信の URL を取得せず、`client` が外部配信から直接取得する
+- 外部配信への振り分けは、接続元の IP と `channel` から決まる値と、その時点の公開の遅れに応じた外部配信の割合とを比較し、リクエストごとに判定する。外部配信へ流す割合が変われば、同じ接続元と `channel` でも判定結果が変わることがある。reverse proxy や NAT の配下で接続元の IP が同じ `client` は、同じ `channel` と割合であれば同じ判定結果になる
+- CORS は `GET` の読み取りだけを許可し、`PUT` と `POST` には CORS ヘッダを付けない
+
+### ログ出力
+
+- ログメッセージはすべて英語で出力する
+- 起動時に待ち受けアドレス、public URL、metric、現在の役割を標準出力へ出力する
+- cluster の役割の変化、member の追加、死亡、復帰と中継失敗を出力する
+- `sync` の失敗とセグメントファイルの取得失敗は標準エラーへ出力する
+- メトリクス用のエンドポイントは提供しない
+
+## 起動と動作確認
+
+`controller` を起動する。
 
 ```bash
 edamame-controller \
   --bind 127.0.0.1:9000 \
+  --public-url http://127.0.0.1:9000 \
   --storage-capacity 512MiB \
   --playlist-segments 6 \
   --sync-interval-ms 1000 \
@@ -90,7 +223,7 @@ edamame-controller \
   --cors-origin '*'
 ```
 
-worker を起動する。
+`worker` を起動する。
 
 ```bash
 edamame-worker \
@@ -103,7 +236,7 @@ edamame-worker \
   --cors-origin '*'
 ```
 
-セグメントファイルを PUT する。
+セグメントファイルを `PUT` する。レスポンスの `sequence`（この例では `0`）が `controller` の割り当てたセグメント番号である。
 
 ```bash
 printf 'segment-1' > /tmp/segment-1.ts
@@ -113,11 +246,9 @@ curl -i -X PUT \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
 ```
 
-レスポンスの `sequence` が controller の割り当てたセグメント番号である。
-この例では 0 になる。
-
-セグメントを AES-128 で暗号化する場合は、鍵を指す `key_uri` を付けて PUT する。
-鍵の実体は publisher が配信し、controller は鍵を取得も検証もしない。
+セグメントを AES-128 で暗号化する場合は、暗号鍵を指す `key_uri`（`http` または `https` の絶対 URL）を付けて `PUT` する。
+暗号鍵の URI はセグメントごとに記録されるため、後続のセグメントに同じ鍵を使う場合も毎回 `key_uri` を指定する。
+`client` はプレイリストの `#EXT-X-KEY` に書かれた `key_uri` から直接鍵を取得するため、鍵の配信元は `client` から到達できるようにする。
 
 ```bash
 curl -i -X PUT \
@@ -126,131 +257,51 @@ curl -i -X PUT \
   'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720&key_uri=https%3A%2F%2Fkeys.example.test%2Flive%2Fkey-1'
 ```
 
-`key_uri` は `http` または `https` の絶対 URL とする。
-暗号鍵の URI はセグメントごとに記録されるため、続くセグメントに同じ鍵を使う場合も、そのセグメントの PUT で同じ `key_uri` を指定する。
-暗号鍵の URI を変えた PUT を送ると、そのセグメントのプレイリストに新しい暗号鍵の URI が反映される。
-暗号鍵の URI を付けない PUT は、そのセグメントだけを暗号化なしに戻す。
-client はプレイリストの `#EXT-X-KEY` に書かれた暗号鍵の URI から自分で鍵を取得するため、鍵の配信元は client から到達できるようにする。
-
-worker は次の sync でセグメントファイルを取得する。
-最初の公開範囲ができるまで、メディアプレイリストは 503 を返すことがある。
-公開範囲ができた後は、新しいセグメントファイルを PUT しても `--publish-wait-ms` の間は前のプレイリストを返す。
-503 が続く場合は、その quality の公開範囲を保持している worker がいるか確認する。
+`worker` が次の `sync` でセグメントファイルを取得し、`--publish-wait-ms` が経過するとプレイリストが取得できるようになる。
+最初の公開範囲ができるまでは `503 Service Unavailable` を返すことがあるため、`--retry` を付けて確認する。
 
 ```bash
 curl -i --retry 30 --retry-delay 1 --retry-connrefused \
   http://127.0.0.1:9000/channels/live/720p.m3u8
 ```
 
-プレイリストに worker の URL が書かれていることを確認し、セグメントファイルを取得する。
+プレイリストに `worker` の URL が書かれていることを確認したうえで、その URL からセグメントファイルを取得する。
 
 ```bash
 curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
 ```
 
-## sync とタイムアウト
+## 再起動と障害時の動作
 
-worker は登録時に受け取った `sync_interval_ms` の間隔で controller に sync を送る。
-controller は `--sync-timeout-ms` を超えて sync が届かない worker を配信先の候補から外す。
-
-`--sync-timeout-ms` は `--sync-interval-ms` の 3 倍以上を推奨する。
-1 回や 2 回の sync が遅れても配信先から外さないためである。
-
-新しいセグメントファイルを PUT してから、controller がプレイリストに反映するまでには公開待ちがある。
-controller は最初の未公開セグメントファイルを PUT した時刻から `--publish-wait-ms` だけ待つ。
-追加の PUT では待ち時間を延長しない。
-公開待ちの間は、未公開セグメントを公開範囲の候補にもフォールバックにも含めない。
-公開待ちが終わった時点で存在するセグメントを公開可能として扱う。
-
-controller は sync を受けた時に、各 quality の公開範囲を決める。
-sync が届いている worker が連続してキャッシュしている公開可能範囲のうち、最新のものを選ぶ。
-公開範囲は quality ごとに独立して決まり、quality 間で一致させる必要はない。
-media sequence は前進するだけでなく、後退したり飛んだりすることがある。
-現在の公開範囲を保持している worker がいれば、より新しい候補が出るまで維持する。
-現在の公開範囲を保持している worker がいなければ、次の sync で、より古い範囲も含めて配信可能な最新の候補へ更新する。
-更新するまでの間、プレイリストのリクエストには 503 を返すことがある。
-公開範囲の切り替えは sync の処理で行い、プレイリストのリクエストでは行わない。
-
-公開範囲が変わるまで、プレイリストは前の公開範囲を返す。
-初回など公開範囲がまだない場合と、公開範囲を保持する worker がいない quality は、次の sync で公開範囲が更新されるまで 503 になる。
-`--publish-wait-ms` の推奨値は `--sync-interval-ms` の 2 倍とする。
-1 回目の sync で取得し、次の sync で報告する時間を確保するためである。
-`--sync-interval-ms` はセグメントの `duration_ms` より十分小さくする。
-
-worker のキャッシュ上限（`--cache-limit`）は controller の `--playlist-segments` より 1 以上大きくすることを推奨する。
-公開待ちの間は前の公開範囲と新しい範囲の両方を保持できるため、公開待ちの途中で古い範囲へフォールバックしにくくなる。
-キャッシュ上限が小さい場合、controller は次の sync で保持されている最新の連続範囲へ切り替える。
-
-## worker の選択
-
-controller はメディアプレイリストを生成するときに、quality ごとに、公開範囲をキャッシュしている worker から配信先を選ぶ。
-候補が複数ある場合は、登録された重みの比に従って選ぶ。
-重み 4 の worker と重み 1 の worker があれば、5 回のうち 4 回は重み 4 の worker を選ぶ。
-
-重みは相対値であり、選ばれる回数の比になる。
-同じスペックのホストなら同じ値にし、速いホストほど大きい値にする。
-例えば 4 vCPU のホストを `--weight 1`、16 vCPU のホストを `--weight 4` にする。
-`--weight` を省略した worker は 1 として扱う。
-
-重みを変えたときと、配信先の候補となる worker が増減したときは、その時点から重みの比に従って選び直す。
-controller は worker の負荷情報（CPU 使用率、同時接続数、配信量）を扱わない。
-そのため、一時的に性能が落ちた worker でも重みの分だけ選ばれる。
-
-登録時の `weight` は 1 以上の整数とする。
-0 を送ると controller は 400 を返す。
-
-## 容量
-
-controller はセグメントファイルをメモリ上に保存する。
-保存しているバイト数の合計が `--storage-capacity` を超えたときは、書き込んだ順に古いセグメントファイルから削除する。
-容量はセグメントファイルのバイト数の合計であり、セグメント識別子や暗号化の指定などのメタデータの分は含まない。
-メタデータは実行中に PUT したセグメント数に比例して増える。
-
-容量は、公開範囲と、公開待ちと sync 間隔の間に worker が取得する範囲を保持できる大きさにする。
-容量が足りないと公開範囲のセグメントファイルが削除され、その quality のメディアプレイリストは 422 を返す。
-セグメントファイル 1 つが容量より大きい場合、その PUT には 413 を返し、保存しない。
-
-目安の計算式は、保持したいセグメント数 × 1 セットの最大サイズ × channel 数とする。
-保持したいセグメント数は、`--playlist-segments` に公開待ちと sync 間隔の分を足した数より大きくする。
-
-publisher の設定例（6 秒セグメント、1080p 12 Mbps、720p 6.5 Mbps、480p 1.4 Mbps）では、3 quality 合計で 1 セットあたり約 14 MiB になる。
-`--playlist-segments 6` に公開待ちと sync 間隔の分を足した 8 セグメントを下回らないよう、余裕を見て 10 セグメント分を 3 channel で保持すると仮定すると、約 14 MiB × 10 × 3 ≒ 430 MiB になる。
-この構成では `--storage-capacity 512MiB` を目安にする。
-セグメント長、ビットレート、channel 数、quality 数が大きい場合はその分を増やす。
-
-worker のキャッシュ上限は `(channel_id, quality)` ごとのセグメント数の上限であり、worker 全体の容量上限ではない。
-worker はセグメントファイルをメモリ上にキャッシュし、上限を超えた古いものから削除する。
-
-## 再起動
-
-controller を再起動すると、メモリにあるセグメントファイル、channel、quality、セグメントのメタデータ、セグメント識別子とセグメント番号の対応、worker の登録はすべて失われる。
-セグメント番号は 0 から始まり、新しい識別子に順に割り当てる。
-`GET /segments/...` は再起動後に PUT されるまで 404 を返す。
-プレイリストは再起動後に PUT されたセグメントファイルから作り直すため、publisher がセグメントファイルを PUT するまで 404 になる。
-worker は sync で 404 を受け取ると再登録し、登録に成功した時点でキャッシュを捨てて取り直す。
-取得と sync を再開すれば配信先に戻る。
-client はプレイリストを取り直し、メディアシーケンスが 0 から始まるプレイリストに合わせて再同期する。
-
-メタデータは最初に成功した PUT の属性から作り直す。
-同じ識別子を再 PUT すると新しい番号で保存される。
-
-worker を再起動すると、メモリ上のキャッシュは失われる。
-worker は controller に登録し、取得を指示されたセグメントファイルを取り直す。
-controller が停止中の間は、client は worker が保持しているセグメントファイルだけを取得できる。
-
-worker はセグメントファイルを保存するたびに、`(channel_id, quality)` ごとにキャッシュ上限まで新しい順に残す。
-上限を超えた古いセグメントファイルは削除する。
+### 再起動時の動作
 
 起動の順序は問わない。
-worker は controller への登録に失敗しても動作を続け、1 秒後に再試行する。
-登録に成功するまでは controller から間隔を受け取れないため、1 秒は固定の再試行間隔とする。
-登録に成功すると、受け取った間隔で sync を送る。
+`worker` は `controller` への登録に失敗しても動作を続け、登録に成功するまで 1 秒間隔で再試行する。
+登録に成功すると、受け取った `sync_interval_ms` の間隔で `sync` を送る。
 
-## 失敗時の扱い
+`controller` を再起動すると、メモリ上にあるセグメントファイル、`channel`、`quality`、メタデータ、識別子と番号の対応、および `worker` の登録情報はすべて失われる。
+再起動後の `controller` ではセグメント番号が `0` から始まり、新しい識別子に順番に割り当てられる。
+メタデータも最初に成功した `PUT` の属性から作り直され、以前と同じ識別子が再 `PUT` された場合も新しい番号で保存される。
+再起動後に新しいセグメントファイルが `PUT` されるまで、`GET /segments/...` とプレイリストの取得はどちらも `404 Not Found` を返す。
+
+`controller` の再起動後、`worker` は `sync` で `404` を受け取った時点で再登録を行い、登録に成功すると手元のキャッシュをすべて捨てて取り直す。
+セグメントの取得と `sync` が進めば、再び配信先の候補に戻る。
+`client` はプレイリストを取得し直し、メディアシーケンス番号が `0` から始まる新しいプレイリストに合わせて再生位置を再同期する。
+
+`worker` を再起動すると、メモリ上のキャッシュは失われる。
+`worker` は `controller` に再登録し、取得を指示されたセグメントファイルを取り直す。
+`controller` が停止している間も、`client` は `worker` がすでにキャッシュしているセグメントファイルを取得できる。
+
+### 失敗時の扱い
 
 | 状況 | 動作 |
 | --- | --- |
-| controller が停止した | client はプレイリストを取得できない。worker はキャッシュしているセグメントファイルの配信を続けるが、sync は失敗し続ける。controller が復帰すると、worker は再登録してキャッシュを捨てる |
+| 単独の controller が停止した | client はプレイリストを取得できない。worker はキャッシュしているセグメントファイルの配信を続けるが、sync は失敗し続ける。controller が復帰すると、worker は再登録してキャッシュを捨てる |
+| cluster の leader が停止した | 残った最大の metric の機体が昇格する。状態は複製しないため、採番は 0 から始まり、worker は sync の 404 で再登録する |
+| 上位の metric の controller が復帰した | 上位機へ切り戻す。直前の状態は失われ、プレイリストは再構築まで 404 または 503 になる |
+| leader が未確定、または PUT を中継できない | 503 と `Retry-After: 1` を返す。中継失敗では heartbeat を再要求する |
+| DNS が停止機体の IP を返した | 接続に失敗する。停止機体の A レコードを削除し、client は再試行する |
+| peer 間の通信が分断された | 二重 leader と PUT の取りこぼしがあり得る。通信回復後は最大の metric の機体へ戻り、分断中の状態は統合しない |
 | worker が停止した | controller は `--sync-timeout-ms` の経過後にその worker を配信先の候補から外す。その quality の公開範囲を保持する他の worker があればそれを使い、なければ次の sync で公開範囲が更新されるまで 503 になる |
 | セグメントファイルの取得に失敗した | worker はログを出して次の sync で同じセグメントファイルを再取得する。公開範囲を保持していなければ配信先に使われない |
 | 公開範囲のセグメントファイルが容量超過で削除された | controller はその quality のプレイリストを生成せず 422 を返し、worker がキャッシュしているセグメントファイルの配信は続く |
@@ -265,20 +316,3 @@ worker は controller への登録に失敗しても動作を続け、1 秒後�
 | 公開範囲に暗号鍵の URI の異なるセグメントが混ざった | メディアプレイリストはセグメントごとに `#EXT-X-KEY` を出し分ける。client はセグメントごとに適切な鍵を取得する |
 | 外部配信が停止した | controller は外部の状態を確認しないため、外部配信の登録を取り消すか、controller を再起動するまで振り分けを続ける |
 | controller が再起動した | 登録された外部配信は失われ、publisher が再登録するまで外部へ振り分けない |
-
-## セキュリティと信頼境界
-
-- controller は `--auth-token` を指定すると PUT に Bearer トークンを要求し、指定しなければ警告を出して PUT を認証しない
-- publisher が送るセグメント識別子は文字種を限定し、controller と worker は識別子をメモリ上の索引にだけ使う
-- worker が取得する URL は `--controller-url` とセグメントの識別子から作り、外部から渡された URL は取得しない
-- `--public-url` には client から到達できる URL を指定し、controller はこの URL をプレイリストに書く
-- controller は登録された外部配信の URL を取得しない。client が外部配信から直接取得する
-- 外部配信への振り分けは、接続元の IP と channel から決まる値と、その時点の公開の遅れに応じた外部配信の割合とを比較し、リクエストごとに判定する。割合が変われば、同じ接続元と channel でも判定結果が変わることがある。プロキシや NAT 配下で接続元の IP が同じ client は、同じ channel と割合であれば同じ判定結果になる
-- CORS は GET の読み取りだけを許可し、`PUT` と `POST` には CORS ヘッダを付けない
-
-## ログ
-
-- ログメッセージは英語とする
-- 起動時に待ち受けアドレスを出力する
-- sync の失敗とセグメントファイルの取得失敗は標準エラーに出力する
-- メトリクス用のエンドポイントは提供しない

@@ -10,6 +10,7 @@ clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
 edamame-telemetry = { path = "../edamame-telemetry" }
 opentelemetry.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -17,7 +18,6 @@ tower-http.workspace = true
 
 [dev-dependencies]
 edamame-worker = { path = "../edamame-worker" }
-reqwest.workspace = true
 # router を接続情報なしで直接呼ぶテストに使う
 tower = { version = "0.5", features = ["util"] }
 # 設定のテストで実バイナリを起動して出力を読むために使う

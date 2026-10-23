@@ -8,14 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use edamame_controller::cluster::{ClusterState, Role};
 use edamame_controller::storage::CanonicalStore;
-use edamame_controller::{ControllerState, router as controller_router};
+use edamame_controller::{ControllerConfig, ControllerState, router as controller_router};
 use edamame_domain::CorsOrigins;
 use edamame_worker::{Cache, WorkerState, router as worker_router};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub const AUTH_TOKEN: &str = "example-token";
 
 /// テストで使う既定の保存容量。セグメントの内容より十分に大きくする
 pub const DEFAULT_STORAGE_CAPACITY_BYTES: u64 = 16 * 1024 * 1024;
@@ -53,6 +56,7 @@ pub struct ControllerHandle {
     pub base_url: String,
     pub state: Arc<ControllerState>,
     shutdown: Option<oneshot::Sender<()>>,
+    heartbeat_task: tokio::task::JoinHandle<()>,
 }
 
 impl ControllerHandle {
@@ -62,6 +66,13 @@ impl ControllerHandle {
             let _ = sender.send(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+impl Drop for ControllerHandle {
+    fn drop(&mut self) {
+        // サーバーと同じ寿命にし、停止後も配信状態を保持するタスクを残さない。
+        self.heartbeat_task.abort();
     }
 }
 
@@ -83,7 +94,7 @@ pub async fn spawn_controller(
             publish_wait_ms: 0,
             external_min_percent: 1,
             cors: CorsOrigins::Disabled,
-            auth_token: None,
+            auth_token: AUTH_TOKEN,
         },
     )
     .await
@@ -108,7 +119,7 @@ pub async fn spawn_controller_with_publish_wait(
             publish_wait_ms,
             external_min_percent: 1,
             cors: CorsOrigins::Disabled,
-            auth_token: None,
+            auth_token: AUTH_TOKEN,
         },
     )
     .await
@@ -133,7 +144,7 @@ pub async fn spawn_controller_with_cors(
             publish_wait_ms: 0,
             external_min_percent: 1,
             cors,
-            auth_token: None,
+            auth_token: AUTH_TOKEN,
         },
     )
     .await
@@ -158,7 +169,7 @@ pub async fn spawn_controller_with_auth(
             publish_wait_ms: 0,
             external_min_percent: 1,
             cors: CorsOrigins::Disabled,
-            auth_token: Some(auth_token),
+            auth_token,
         },
     )
     .await
@@ -184,7 +195,7 @@ pub async fn spawn_controller_with_external_percent(
             publish_wait_ms,
             external_min_percent,
             cors: CorsOrigins::Disabled,
-            auth_token: None,
+            auth_token: AUTH_TOKEN,
         },
     )
     .await
@@ -198,7 +209,7 @@ struct ControllerOptions<'a> {
     publish_wait_ms: u64,
     external_min_percent: u8,
     cors: CorsOrigins,
-    auth_token: Option<&'a str>,
+    auth_token: &'a str,
 }
 
 /// controller の全設定を指定して HTTP サーバーを起動する
@@ -218,7 +229,27 @@ async fn spawn_controller_with_options(
     );
     let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = controller_router(state.clone(), &options.cors, options.auth_token);
+    let config = ControllerConfig {
+        bind: addr,
+        storage_capacity: storage_capacity_bytes,
+        playlist_segments: options.playlist_segments,
+        sync_interval_ms: options.sync_interval_ms,
+        sync_timeout_ms: options.sync_timeout_ms,
+        publish_wait_ms: Some(options.publish_wait_ms),
+        external_min_percent: options.external_min_percent,
+        cors_origin: vec![],
+        public_url: format!("http://{addr}"),
+        metric: 100,
+        auth_token: options.auth_token.to_owned(),
+        seed: vec![],
+    };
+    let cluster = ClusterState::new(&config, state.clone()).unwrap();
+    let heartbeat_task = tokio::spawn(cluster.clone().run());
+    // 通常の API テストは、初回の選出が終わった状態から始める。
+    while cluster.health().await.role != Role::Leader {
+        tokio::task::yield_now().await;
+    }
+    let app = controller_router(state.clone(), &options.cors, cluster);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     tokio::spawn(async move {
         // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
@@ -237,6 +268,7 @@ async fn spawn_controller_with_options(
         base_url: format!("http://{addr}"),
         state,
         shutdown: Some(shutdown_sender),
+        heartbeat_task,
     }
 }
 
@@ -337,7 +369,7 @@ impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
             cors: CorsOrigins::Disabled,
-            auth_token: None,
+            auth_token: Some(AUTH_TOKEN.to_owned()),
             weight: 1,
         }
     }
@@ -435,5 +467,110 @@ pub async fn wait_for_segment(client: &reqwest::Client, url: &str, expected: &[u
             panic!("セグメントファイルが期待する内容になりません: {url}");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 停止と同じアドレスでの再起動を試せるよう、実プロセスと接続先を保持する。
+pub struct ControllerProcess {
+    pub child: tokio::process::Child,
+    pub addr: SocketAddr,
+    pub base_url: String,
+}
+
+/// 起動前の seed 指定に使うアドレスを返すが、ポートの予約は維持しない。
+pub fn available_addr() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// 外部の EDAMAME_ 設定を引き継がず実プロセスを起動し、health の応答まで待つ。
+pub async fn spawn_cluster_process(
+    addr: SocketAddr,
+    metric: u32,
+    seeds: &[String],
+    prefix: &str,
+) -> ControllerProcess {
+    let base_url = format!("http://{addr}{prefix}");
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_edamame-controller"));
+    for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("EDAMAME_")) {
+        command.env_remove(name);
+    }
+    command.args([
+        "--bind",
+        &addr.to_string(),
+        "--storage-capacity",
+        "16MiB",
+        "--playlist-segments",
+        "6",
+        "--sync-interval-ms",
+        "100",
+        "--sync-timeout-ms",
+        "1000",
+        "--publish-wait-ms",
+        "0",
+        "--auth-token",
+        "cluster-test-token",
+        "--cors-origin",
+        "*",
+        "--public-url",
+        &base_url,
+        "--metric",
+        &metric.to_string(),
+    ]);
+    if !seeds.is_empty() {
+        command.args(["--seed", &seeds.join(",")]);
+    }
+    let child = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let process = ControllerProcess {
+        child,
+        addr,
+        base_url,
+    };
+    let client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if client
+            .get(format!("{}/health", process.base_url))
+            .send()
+            .await
+            .is_ok()
+        {
+            return process;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "controller が起動しなかった"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 選出の収束を確認するため、役割と leader URL の両方が一致するまで待つ。
+pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str, leader_url: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let health: serde_json::Value = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if health["role"] == role && health["leader_url"] == leader_url {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "役割が切り替わらなかった: {health}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
 }
