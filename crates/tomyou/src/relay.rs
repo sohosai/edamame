@@ -15,7 +15,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use shiguredo_rtmp::{
-    AudioFrame, MediaFrame, RtmpConnectionEvent, RtmpServerConnection, VideoFrame,
+    AudioFrame, MediaFrame, RtmpConnectionEvent, RtmpConnectionState, RtmpServerConnection,
+    VideoFrame,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -114,7 +115,7 @@ pub async fn start(
                     next_client_id += 1;
                     connections.spawn(async move {
                         if let Err(error) = handler.run().await {
-                            warn!("RTMP connection ended with error: {error}");
+                            warn!("RTMP connection from {peer} ended with error: {error}");
                         }
                     });
                 }
@@ -182,10 +183,17 @@ impl ClientConnectionHandler {
     }
 
     async fn run_one(&mut self) -> Result<bool> {
-        while let Some(event) = self.conn.next_event() {
-            self.process_event(event).await?;
-        }
-        while !self.conn.send_buf().is_empty() {
+        loop {
+            while let Some(event) = self.conn.next_event() {
+                self.process_event(event).await?;
+            }
+            // ACK の判定は送信完了時にも変わるため、送信待ちフレームを取り出す前に再確認する。
+            if self.conn.state() == RtmpConnectionState::Disconnecting {
+                return Ok(false);
+            }
+            if self.conn.send_buf().is_empty() {
+                break;
+            }
             let data = self.conn.send_buf();
             self.stream
                 .write_all(data)

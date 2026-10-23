@@ -54,9 +54,12 @@ GStreamer は外部ランタイムとして用意する。アプリには同梱�
 必要な要素:
 
 - Edamame: `rtmpsrc`、`flvdemux`、`h264parse`、`aacparse`、`flvmux`、`rtmpsink`、`queue`
-- ImageFlux: `whipclientsink`、`opusenc`、`audioconvert`、`audioresample`、`queue`
+- ImageFlux: `whipclientsink`、`webrtcbin`、`nicesrc`、`nicesink`、`opusenc`、`audioconvert`、`audioresample`、`queue`
 - AAC デコーダ: `avdec_aac` または `faad`
 - `whipclientsink` を含む `rswebrtc` プラグイン
+
+macOS の Homebrew 環境では、ICE（WebRTC の通信経路を確立する仕組み）に必要な `nicesrc` と `nicesink` を `brew install libnice-gstreamer` で導入する。
+`libnice` 単体のインストールでは GStreamer の要素は追加されない。
 
 起動時に `gst-inspect-1.0` で要素を確認する。
 不足している場合は不足名を GUI に表示する。
@@ -78,14 +81,23 @@ ImageFlux には `whipclientsink` を使う。`whipsink` は使わない。
 パイプラインの形:
 
 ```text
-rtmpsrc location={input} ! flvdemux name=demux
+rtmpsrc location="{input} live=1 flashver=tomyou" ! flvdemux name=demux
 demux.audio ! aacparse ! {aac_decoder} ! audioconvert ! audioresample !
-  audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 ! queue ! whip.audio_0
+  audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 !
+  queue max-size-time=5000000000 max-size-buffers=0 max-size-bytes=0 ! whip.audio_0
 demux.video ! h264parse config-interval=-1 ! queue ! whip.video_0
 whipclientsink name=whip
   signaller::whip-endpoint="{endpoint}"
   signaller::use-link-headers=true
 ```
+
+ローカル RTMP への接続では、ライブ入力の指定と `flashVer` を明示する。
+中継側は `flashVer` を省略した接続も受け付けるため、GStreamer の再接続で接続情報が省略されても中継を継続できる。
+`flashVer` に文字列以外を送った場合や、接続先を示す `app` / `tcUrl` を省略した場合は接続を拒否する。
+RTMP の確認応答（ACK）で使う累計バイト数には、接続時のハンドシェイクも含める。
+接続が切断中になったら、その接続へのフレーム送信を止め、送信待ちのフレームを破棄して接続を閉じる。
+途中接続では音声が映像のキーフレームより先に届くため、両方の出力で音声キューを最大 5 秒分にする。
+音声キューの既定の 1 秒制限に達すると、共通の RTMP 入力が止まり、キーフレームも届かなくなる。
 
 `gst-launch-1.0` には `-e` を付け、停止時に EOS を送る。
 

@@ -8,6 +8,11 @@ members = [
   "crates/tomyou",
 ]
 resolver = "3"
+exclude = ["vendor/shiguredo_rtmp"]
+
+[patch.crates-io]
+# flashVer を省略する再接続を拒否しない受信処理を使う。
+shiguredo_rtmp = { path = "vendor/shiguredo_rtmp" }
 
 [workspace.package]
 version = "0.1.0"

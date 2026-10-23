@@ -59,6 +59,9 @@ impl GstCapabilities {
             "h264parse",
             "aacparse",
             "whipclientsink",
+            "webrtcbin",
+            "nicesrc",
+            "nicesink",
             "opusenc",
             "audioconvert",
             "audioresample",
@@ -131,11 +134,11 @@ pub struct OutputSpec {
 }
 
 impl OutputSpec {
-    fn new(kind: OutputKind, pipeline: String) -> Self {
-        Self {
-            kind,
-            args: vec!["-e".to_owned(), pipeline],
-        }
+    fn new(kind: OutputKind, pipeline: Vec<String>) -> Self {
+        // gst-launch は引数内の空白を引用扱いにするため、処理列全体を 1 引数にできない。
+        let mut args = vec!["-e".to_owned()];
+        args.extend(pipeline);
+        Self { kind, args }
     }
 }
 
@@ -186,6 +189,9 @@ pub fn inspect(gst_launch: &Path) -> Result<GstCapabilities> {
         "flvmux",
         "rtmpsink",
         "whipclientsink",
+        "webrtcbin",
+        "nicesrc",
+        "nicesink",
         "opusenc",
         "audioconvert",
         "audioresample",
@@ -216,30 +222,97 @@ pub fn inspect(gst_launch: &Path) -> Result<GstCapabilities> {
 }
 
 /// Edamame publisher 向けの RTMP パイプライン
-pub fn edamame_pipeline(input: &str, publisher: &str) -> String {
-    format!(
-        "rtmpsrc location={input} ! flvdemux name=demux \
-         demux.video ! h264parse ! queue ! mux. \
-         demux.audio ! aacparse ! queue ! mux. \
-         flvmux name=mux streamable=true ! rtmpsink location={publisher}"
-    )
+pub fn edamame_pipeline(input: &str, publisher: &str) -> Vec<String> {
+    [
+        "rtmpsrc",
+        &rtmp_location(input),
+        "!",
+        "flvdemux",
+        "name=demux",
+        "demux.video",
+        "!",
+        "h264parse",
+        "!",
+        "queue",
+        "!",
+        "mux.",
+        "demux.audio",
+        "!",
+        "aacparse",
+        "!",
+        "queue",
+        // 推奨する 2 秒間隔のキーフレームを待つ間、音声の既定 1 秒制限で映像の読み取りまで止まる。
+        "max-size-time=5000000000",
+        "max-size-buffers=0",
+        "max-size-bytes=0",
+        "!",
+        "mux.",
+        "flvmux",
+        "name=mux",
+        "streamable=true",
+        "!",
+        "rtmpsink",
+        &format!("location={publisher}"),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 /// ImageFlux 向けの WHIP パイプライン。
 ///
 /// 音声を先に接続して m-line を audio0, video1 の順にする。
 /// Sora の answer は音声を先頭に返すため、この順序が必要である。
-pub fn imageflux_pipeline(input: &str, endpoint: &str, decoder: AudioDecoder) -> String {
-    format!(
-        "rtmpsrc location={input} ! flvdemux name=demux \
-         demux.audio ! aacparse ! {decoder} ! audioconvert ! audioresample ! \
-           audio/x-raw,rate=48000,channels=2 ! opusenc bitrate=128000 ! queue ! whip.audio_0 \
-         demux.video ! h264parse config-interval=-1 ! queue ! whip.video_0 \
-         whipclientsink name=whip \
-           signaller::whip-endpoint=\"{endpoint}\" \
-           signaller::use-link-headers=true",
-        decoder = decoder.element()
-    )
+pub fn imageflux_pipeline(input: &str, endpoint: &str, decoder: AudioDecoder) -> Vec<String> {
+    [
+        "rtmpsrc",
+        &rtmp_location(input),
+        "!",
+        "flvdemux",
+        "name=demux",
+        "demux.audio",
+        "!",
+        "aacparse",
+        "!",
+        decoder.element(),
+        "!",
+        "audioconvert",
+        "!",
+        "audioresample",
+        "!",
+        "audio/x-raw,rate=48000,channels=2",
+        "!",
+        "opusenc",
+        "bitrate=128000",
+        "!",
+        "queue",
+        // 映像の最初のキーフレームが届くまで、音声の背圧で共通の RTMP 入力を止めない。
+        "max-size-time=5000000000",
+        "max-size-buffers=0",
+        "max-size-bytes=0",
+        "!",
+        "whip.audio_0",
+        "demux.video",
+        "!",
+        "h264parse",
+        "config-interval=-1",
+        "!",
+        "queue",
+        "!",
+        "whip.video_0",
+        "whipclientsink",
+        "name=whip",
+        &format!("signaller::whip-endpoint={endpoint}"),
+        "signaller::use-link-headers=true",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn rtmp_location(input: &str) -> String {
+    // librtmp の接続オプションは独立した引数ではなく、location の値に含める必要がある。
+    format!("location={input} live=1 flashver=tomyou")
 }
 
 /// Edamame 向けの出力定義
@@ -357,7 +430,7 @@ mod tests {
     #[test]
     fn edamame_pipeline_uses_flvmux_and_rtmpsink() {
         let pipeline =
-            edamame_pipeline("rtmp://127.0.0.1:1935/live/1A", "rtmp://publisher/live/1A");
+            edamame_pipeline("rtmp://127.0.0.1:1935/live/1A", "rtmp://publisher/live/1A").join(" ");
         assert!(pipeline.contains("rtmpsrc"));
         assert!(pipeline.contains("flvmux"));
         assert!(pipeline.contains("rtmpsink"));
@@ -370,7 +443,8 @@ mod tests {
             "rtmp://127.0.0.1:1935/live/1A",
             "https://sora.example/whip/abc",
             AudioDecoder::AvdecAac,
-        );
+        )
+        .join(" ");
         assert!(pipeline.contains("whipclientsink"));
         assert!(pipeline.contains("signaller::whip-endpoint"));
         assert!(pipeline.contains("signaller::use-link-headers=true"));
@@ -385,6 +459,51 @@ mod tests {
         );
         assert_eq!(choose_audio_decoder(false, true), Some(AudioDecoder::Faad));
         assert_eq!(choose_audio_decoder(false, false), None);
+    }
+
+    #[test]
+    fn launch_arguments_run_with_installed_gstreamer() {
+        // 文字列比較では検出できない引数の引用処理を、実際のパーサと有限の処理列で検証する。
+        let Ok(launch) = resolve(None) else {
+            eprintln!("GStreamer がないため、処理列の実行検証を省略します");
+            return;
+        };
+        let spec = OutputSpec::new(
+            OutputKind::Edamame,
+            ["fakesrc", "num-buffers=1", "!", "fakesink"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        let output = Command::new(launch)
+            .args(spec.args)
+            .output()
+            .expect("GStreamer を実行できる");
+        assert!(
+            output.status.success(),
+            "処理列の実行に失敗しました: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn output_urls_remain_single_property_arguments() {
+        // URL の空白や記号を処理列の区切りと誤認しないよう、プロパティ単位で保持する。
+        let input = "rtmp://127.0.0.1/live/key token=value";
+        let publisher = "rtmp://127.0.0.1/live/output token=value";
+        let endpoint = "https://example.test/whip?token=a&value=b";
+        let edamame = edamame_spec(input, publisher);
+        let imageflux = imageflux_spec(input, endpoint, AudioDecoder::AvdecAac);
+        for spec in [&edamame, &imageflux] {
+            assert!(spec.args.contains(&rtmp_location(input)));
+            assert!(spec.args.iter().any(|arg| arg == "!"));
+        }
+        assert!(edamame.args.contains(&format!("location={publisher}")));
+        assert!(
+            imageflux
+                .args
+                .contains(&format!("signaller::whip-endpoint={endpoint}"))
+        );
     }
 
     #[test]
@@ -433,5 +552,31 @@ mod tests {
         let missing = capabilities.imageflux_missing();
         assert!(missing.iter().any(|value| value.contains("whipclientsink")));
         assert!(missing.iter().any(|value| value.contains("avdec_aac")));
+    }
+
+    #[test]
+    fn requires_ice_elements_even_when_whip_is_installed() {
+        // whipclientsink の存在だけでは、webrtcbin が接続用パッドを作れるとは限らない。
+        let elements = [
+            "rtmpsrc",
+            "flvdemux",
+            "h264parse",
+            "aacparse",
+            "whipclientsink",
+            "webrtcbin",
+            "opusenc",
+            "audioconvert",
+            "audioresample",
+            "queue",
+        ];
+        let incomplete = capabilities(&elements, Some(AudioDecoder::AvdecAac));
+        assert!(!incomplete.imageflux_ready());
+        assert_eq!(incomplete.imageflux_missing(), vec!["nicesrc", "nicesink"]);
+
+        let mut complete = incomplete;
+        complete
+            .available
+            .extend(["nicesrc".to_owned(), "nicesink".to_owned()]);
+        assert!(complete.imageflux_ready());
     }
 }
