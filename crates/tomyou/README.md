@@ -56,17 +56,6 @@ GUI の「設定」でも設定ファイルのパスを指定して読み込み�
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
 `ffmpeg.path` を空欄にすると、PATH、`TOMYOU_FFMPEG`、標準的なインストール先の順に探す。
 
-ImageFlux の API キーは、設定ファイルやキーチェーンだけでなく環境変数でも指定できる。
-
-```bash
-export IMAGEFLUX_API_KEY=...
-cargo run -p tomyou
-```
-
-起動ディレクトリ、実行ファイルの隣、設定ディレクトリの順に `.env` を探して読み込む。
-`.env` では `IMAGEFLUX_API_KEY` と `IMAGEFLUX_TOKEN` の両方を受け付ける。
-macOS の Finder から起動した場合はシェルの環境変数を引き継がないため、ターミナルから起動するか、GUI の設定で入力する。
-
 ## ffmpeg の機能
 
 起動時に次の機能を実際に確認する。

@@ -328,23 +328,6 @@ impl Config {
             Ok(None) => {}
             Err(error) => warn!("failed to load ImageFlux token from keyring: {error}"),
         }
-        self.apply_imageflux_env(|key| std::env::var(key).ok());
-    }
-
-    /// 環境変数の ImageFlux API キーを設定へ反映する。空の値は無視する。
-    fn apply_imageflux_env<F>(&mut self, get: F)
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        for key in ["IMAGEFLUX_API_KEY", "IMAGEFLUX_TOKEN"] {
-            if let Some(value) = get(key) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    self.imageflux.token = value.to_owned();
-                    return;
-                }
-            }
-        }
     }
 
     /// 秘密情報を資格情報ストアへ書く。
@@ -426,32 +409,6 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn environment_imageflux_key_overrides_config() {
-        let mut config = Config {
-            imageflux: ImageFluxConfig {
-                token: "old".to_owned(),
-                ..ImageFluxConfig::default()
-            },
-            ..Config::default()
-        };
-        config.apply_imageflux_env(|key| (key == "IMAGEFLUX_API_KEY").then(|| "new".to_owned()));
-        assert_eq!(config.imageflux.token, "new");
-    }
-
-    #[test]
-    fn empty_environment_imageflux_key_is_ignored() {
-        let mut config = Config {
-            imageflux: ImageFluxConfig {
-                token: "old".to_owned(),
-                ..ImageFluxConfig::default()
-            },
-            ..Config::default()
-        };
-        config.apply_imageflux_env(|key| (key == "IMAGEFLUX_API_KEY").then(|| "   ".to_owned()));
-        assert_eq!(config.imageflux.token, "old");
     }
 
     #[test]

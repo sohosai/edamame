@@ -16,7 +16,6 @@ bundled-ffmpeg = []
 anyhow.workspace = true
 clap.workspace = true
 directories = "6"
-dotenvy = "0.15"
 eframe.workspace = true
 egui.workspace = true
 keyring.workspace = true

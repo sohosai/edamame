@@ -23,34 +23,6 @@ struct Args {
     config: Option<PathBuf>,
 }
 
-/// 起動ディレクトリ、実行ファイルの隣、設定ディレクトリの順に .env を探して読み込む。
-fn load_dotenv_files() {
-    let mut candidates = vec![PathBuf::from(".env")];
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        candidates.push(parent.join(".env"));
-    }
-    if let Ok(config_path) = Config::default_path()
-        && let Some(parent) = config_path.parent()
-    {
-        candidates.push(parent.join(".env"));
-    }
-    for path in candidates {
-        if !path.is_file() {
-            continue;
-        }
-        match dotenvy::from_path(&path) {
-            Ok(_) => tracing::info!("loaded environment file: {}", path.display()),
-            Err(error) => tracing::warn!(
-                "failed to load environment file {}: {error}",
-                path.display()
-            ),
-        }
-        return;
-    }
-}
-
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -58,7 +30,6 @@ fn main() -> eframe::Result<()> {
         )
         .with_target(false)
         .init();
-    load_dotenv_files();
 
     let args = Args::parse();
     let explicit_config = args.config.is_some();
