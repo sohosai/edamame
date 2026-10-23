@@ -1,0 +1,3 @@
+- targets: ["https://edamame-controller.sohosai.com/health"]
+  labels:
+    device: "edamame-controller"
