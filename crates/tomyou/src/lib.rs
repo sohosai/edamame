@@ -11,3 +11,4 @@ pub mod obs;
 pub mod relay;
 pub mod session;
 pub mod state;
+pub mod stream_info;

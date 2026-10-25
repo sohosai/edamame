@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use shiguredo_rtmp::{
-    AudioFrame, MediaFrame, RtmpConnectionEvent, RtmpConnectionState, RtmpServerConnection,
-    VideoFrame,
+    AudioFormat, AudioFrame, MediaFrame, RtmpConnectionEvent, RtmpConnectionState,
+    RtmpServerConnection, RtmpTimestamp, VideoFrame, VideoFrameType,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -26,6 +26,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::stream_info::{self, StreamInfo};
+
 /// 中継の状態変化
 #[derive(Debug, Clone)]
 pub enum RelayEvent {
@@ -34,6 +36,7 @@ pub enum RelayEvent {
     PublisherDisconnected,
     PlayerConnected,
     PlayerDisconnected,
+    StreamInfo(StreamInfo),
     Error(String),
 }
 
@@ -273,6 +276,8 @@ impl ClientConnectionHandler {
         state.publisher_id = Some(self.client_id);
         state.video_sequence_header = None;
         state.audio_sequence_header = None;
+        state.stream_info = StreamInfo::default();
+        state.last_keyframe_timestamp = None;
         self.stream_id = stream_id;
         self.is_publisher = true;
         let _ = self.events.send(RelayEvent::PublisherConnected);
@@ -331,6 +336,14 @@ impl ClientConnectionHandler {
         if frame.is_aac_sequence_header {
             state.audio_sequence_header = Some(frame.clone());
         }
+        let update_info = frame.is_aac_sequence_header
+            || (frame.format != AudioFormat::Aac && state.stream_info.audio.is_none());
+        if update_info {
+            state.stream_info.audio = Some(stream_info::audio_info(&frame));
+            let _ = self
+                .events
+                .send(RelayEvent::StreamInfo(state.stream_info.clone()));
+        }
         for player in state.players.values_mut() {
             if !player.sent_audio_header
                 && let Some(header) = state.audio_sequence_header.clone()
@@ -355,6 +368,39 @@ impl ClientConnectionHandler {
             frame.avc_packet_type == Some(shiguredo_rtmp::AvcPacketType::SequenceHeader);
         if is_sequence_header {
             state.video_sequence_header = Some(frame.clone());
+            state.stream_info.video = Some(stream_info::video_info(&frame));
+            let _ = self
+                .events
+                .send(RelayEvent::StreamInfo(state.stream_info.clone()));
+        } else {
+            let mut changed = false;
+            // AVC 以外のコーデックはシーケンスヘッダーがないため、最初のフレームで種類だけ記録する
+            if state.stream_info.video.is_none() {
+                state.stream_info.video = Some(stream_info::video_info(&frame));
+                changed = true;
+            }
+            state.stream_info.video_frames += 1;
+            if (frame.composition_timestamp_offset.as_millis() != 0
+                || frame.frame_type == VideoFrameType::DisposableInterFrame)
+                && !state.stream_info.has_cts_offset
+            {
+                state.stream_info.has_cts_offset = true;
+                changed = true;
+            }
+            if frame.is_keyframe() {
+                if let Some(previous) = state.last_keyframe_timestamp
+                    && let Some(delta) = frame.timestamp.checked_sub(previous)
+                {
+                    state.stream_info.keyframe_interval_ms = Some(delta.as_millis() as u64);
+                }
+                state.last_keyframe_timestamp = Some(frame.timestamp);
+                changed = true;
+            }
+            if changed {
+                let _ = self
+                    .events
+                    .send(RelayEvent::StreamInfo(state.stream_info.clone()));
+            }
         }
         for player in state.players.values_mut() {
             if is_sequence_header {
@@ -428,6 +474,8 @@ struct StreamState {
     publisher_id: Option<usize>,
     video_sequence_header: Option<VideoFrame>,
     audio_sequence_header: Option<AudioFrame>,
+    stream_info: StreamInfo,
+    last_keyframe_timestamp: Option<RtmpTimestamp>,
     players: HashMap<usize, PlayerState>,
 }
 

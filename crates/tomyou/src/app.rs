@@ -17,6 +17,7 @@ use crate::{
     config::{CHANNELS, Config},
     obs::StreamSnapshot,
     session::{self, SessionEvent, SessionHandle},
+    stream_info::StreamInfo,
 };
 
 /// 画面全体の状態
@@ -74,6 +75,7 @@ pub struct TomyouApp {
     show_license: bool,
     gstreamer_path_draft: String,
     obs_snapshot: Option<StreamSnapshot>,
+    stream_info: Option<StreamInfo>,
 }
 
 impl TomyouApp {
@@ -116,6 +118,7 @@ impl TomyouApp {
             show_license: false,
             gstreamer_path_draft,
             obs_snapshot: None,
+            stream_info: None,
         }
     }
 
@@ -142,6 +145,7 @@ impl TomyouApp {
         self.imageflux_playlist = None;
         self.fallback_registered = false;
         self.fallback_error = None;
+        self.stream_info = None;
         self.publisher_connected = false;
         self.imageflux_output = false;
         self.edamame_output = false;
@@ -192,14 +196,21 @@ impl TomyouApp {
             }
             SessionEvent::PublisherConnected => {
                 self.publisher_connected = true;
+                self.stream_info = None;
                 self.log("OBS からの RTMP 入力を受け付けました");
             }
             SessionEvent::PublisherDisconnected => {
                 self.publisher_connected = false;
+                self.stream_info = None;
                 self.log("OBS からの RTMP 入力が切れました");
             }
             SessionEvent::PlayerConnected => {
                 self.log("ローカルの中継クライアントが接続しました");
+            }
+            SessionEvent::StreamInfo(info) => {
+                if self.session.is_some() {
+                    self.stream_info = Some(info);
+                }
             }
             SessionEvent::ImageFluxChannel {
                 channel_id,
@@ -264,6 +275,7 @@ impl TomyouApp {
                 self.edamame_output = false;
                 self.fallback_registered = false;
                 self.fallback_error = None;
+                self.stream_info = None;
                 self.log("停止しました");
             }
         }
@@ -455,6 +467,113 @@ impl eframe::App for TomyouApp {
                         ui.label("チャンネル");
                         ui.label(&self.config.channel_id);
                         ui.end_row();
+                        ui.label("映像");
+                        match self
+                            .stream_info
+                            .as_ref()
+                            .and_then(|info| info.video.as_ref())
+                        {
+                            Some(info) => {
+                                let problem = info.problem();
+                                let text = match &problem {
+                                    Some(problem) => {
+                                        format!("{}（{}）", info.summary(), problem)
+                                    }
+                                    None => info.summary(),
+                                };
+                                let color = if problem.is_some() {
+                                    egui::Color32::RED
+                                } else {
+                                    egui::Color32::GREEN
+                                };
+                                ui.colored_label(color, text);
+                            }
+                            None => {
+                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("音声");
+                        match self
+                            .stream_info
+                            .as_ref()
+                            .and_then(|info| info.audio.as_ref())
+                        {
+                            Some(info) => {
+                                let problem = info.problem();
+                                let text = match &problem {
+                                    Some(problem) => {
+                                        format!("{}（{}）", info.summary(), problem)
+                                    }
+                                    None => info.summary(),
+                                };
+                                let color = if problem.is_some() {
+                                    egui::Color32::RED
+                                } else {
+                                    egui::Color32::GREEN
+                                };
+                                ui.colored_label(color, text);
+                            }
+                            None => {
+                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("B フレーム");
+                        match &self.stream_info {
+                            Some(info) => {
+                                let color = if info.video_frames == 0 {
+                                    egui::Color32::GRAY
+                                } else if info.bframe_problem().is_some() {
+                                    egui::Color32::RED
+                                } else {
+                                    egui::Color32::GREEN
+                                };
+                                ui.colored_label(color, info.bframe_text());
+                            }
+                            None => {
+                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("キーフレーム間隔");
+                        match &self.stream_info {
+                            Some(info) => match info.keyframe_text() {
+                                Some(text) => {
+                                    let color = if info.keyframe_problem().is_some() {
+                                        egui::Color32::RED
+                                    } else {
+                                        egui::Color32::GREEN
+                                    };
+                                    ui.colored_label(color, text);
+                                }
+                                None => {
+                                    ui.colored_label(egui::Color32::GRAY, "計測中");
+                                }
+                            },
+                            None => {
+                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                            }
+                        }
+                        ui.end_row();
+                        ui.label("入力チェック");
+                        match &self.stream_info {
+                            Some(info) if info.is_ready() => {
+                                if info.video_frames == 0
+                                    || info.keyframe_interval_ms.is_none()
+                                {
+                                    ui.colored_label(egui::Color32::GRAY, "計測中");
+                                } else if info.problems().is_empty() {
+                                    ui.colored_label(egui::Color32::GREEN, "OK");
+                                } else {
+                                    ui.colored_label(egui::Color32::RED, "要確認");
+                                }
+                            }
+                            _ => {
+                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                            }
+                        }
+                        ui.end_row();
                     });
             });
             ui.add_space(8.0);
@@ -514,7 +633,7 @@ impl eframe::App for TomyouApp {
             });
             ui.add_space(8.0);
             ui.label(
-                "OBS の入力条件: H.264 / B フレームなし / AAC / キーフレーム間隔 2 秒を推奨",
+                "入力の期待値: H.264 / 1920x1080 / AAC / B フレームなし / キーフレーム間隔 2 秒推奨。赤は要確認。",
             );
             if let Some(status) = &self.obs_snapshot {
                 ui.label(format!(

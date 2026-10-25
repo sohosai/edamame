@@ -23,6 +23,7 @@ use crate::{
     obs::{ObsClient, StreamSnapshot},
     relay::{self, RelayEvent},
     state::State,
+    stream_info::StreamInfo,
 };
 
 /// GUI へ送るセッションの状態変化
@@ -36,6 +37,7 @@ pub enum SessionEvent {
     PublisherConnected,
     PublisherDisconnected,
     PlayerConnected,
+    StreamInfo(StreamInfo),
     ImageFluxChannel {
         channel_id: String,
         playlist_url: Option<String>,
@@ -248,6 +250,7 @@ async fn run(
                     Some(RelayEvent::PublisherConnected) => { let _ = ui.send(SessionEvent::PublisherConnected); }
                     Some(RelayEvent::PublisherDisconnected) => { let _ = ui.send(SessionEvent::PublisherDisconnected); }
                     Some(RelayEvent::PlayerConnected) => { let _ = ui.send(SessionEvent::PlayerConnected); }
+                    Some(RelayEvent::StreamInfo(info)) => { let _ = ui.send(SessionEvent::StreamInfo(info)); }
                     Some(RelayEvent::Error(message)) => { let _ = ui.send(SessionEvent::Error(message)); }
                     Some(RelayEvent::Listening(address)) => { let _ = ui.send(SessionEvent::RelayListening(address.to_string())); }
                     Some(RelayEvent::PlayerDisconnected) => {}

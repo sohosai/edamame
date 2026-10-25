@@ -128,7 +128,7 @@ cargo run --release -p tomyou
 cargo run --release -p tomyou -- --config /path/to/config.toml
 ```
 
-設定、OBS の条件、GStreamer の必要機能、ImageFlux の扱い、fallback 登録、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
+設定、OBS の条件、入力チェック、GStreamer の必要機能、ImageFlux の扱い、fallback 登録、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
 ImageFlux のプレイリストと鍵は、live2025-server へ fallback として登録する。
 fallback 登録を使う場合は、`[stream_credentials]` に live2025-server のベース URL と `STREAM_INGEST_TOKEN` を指定する。
 通常用の URL と鍵の登録は、既存の `publisher` の設定を使う。

@@ -19,6 +19,7 @@ tomyou ── HTTPS ──> live2025-server（ImageFlux を fallback として�
 - ImageFlux のプレイリスト URL と鍵を live2025-server へ fallback として登録する。
 - Edamame の通常用 URL と鍵の登録は、既存の `edamame-publisher` に任せる。
 - ImageFlux の鍵は ImageFlux の `GetEncryptKey` で取得し、live2025-server へ送る。ローカルには保存しない。
+- RTMP で受信した FLV の AVC シーケンスヘッダー (SPS) と AAC の AudioSpecificConfig を解析し、実際の解像度・音声形式・B フレームの可能性・キーフレーム間隔を GUI に表示する。
 
 ## 必要なもの
 
@@ -93,6 +94,26 @@ fallback 行の有効期間は 7 日で、削除する API はない。
 配信を停止すると ImageFlux のチャンネルは削除され、プレイリストを取得できなくなった行は選択対象から外れる。
 ImageFlux の再接続でプレイリスト URL が変わった場合、次回の配信開始まで再登録しない。
 
+## 入力チェック
+
+RTMP で受信した FLV のシーケンスヘッダーを解析し、次の値を GUI に表示する。
+
+- 映像: コーデック、解像度、profile/level
+- 音声: コーデック、サンプリングレート、チャンネル数
+- B フレーム: CTS offset または破棄可能フレームの有無
+- キーフレーム間隔: 直前のキーフレームからの間隔
+
+期待値は H.264、1920x1080、AAC、B フレームなし、キーフレーム間隔 2 秒である。
+映像・音声・B フレームが期待値と違う場合、またはキーフレーム間隔が 2.5 秒を超える場合は該当行を赤で表示する。
+入力チェックは表示だけで、配信は停止しない。
+
+解像度は H.264 の SPS (Sequence Parameter Set) から取得する。
+1920x1080 は SPS 上では 1920x1088 になるため、frame cropping を適用して 1080 に戻す。
+音声のサンプリングレートとチャンネル数は AAC の AudioSpecificConfig から取得する。
+FLV の音声ヘッダーのサンプリングレートは AAC では固定値なので使わない。
+
+B フレームは FLV の CTS offset とフレーム種別による目安であり、デコード結果を完全に保証するものではない。
+
 ## GStreamer の機能
 
 起動時に次の要素を確認する。
@@ -115,7 +136,7 @@ GStreamer のインストールをアプリが自動実行することはない�
 2. `tomyou` の設定を入力して保存する。
 3. 「配信を開始」を押す。
 4. OBS の配信先が `rtmp://127.0.0.1:1935/live/<channel>` に設定され、OBS の配信が始まる。
-5. Edamame と ImageFlux の送信状態、ImageFlux の HLS URL、fallback 登録の状態を表示する。
+5. Edamame と ImageFlux の送信状態、ImageFlux の HLS URL、fallback 登録の状態、入力ストリームの映像・音声情報を表示する。
 6. 終了時は「配信を停止」を押す。OBS の配信先は、変更していなければ元へ戻る。
 
 OBS が既に配信中の場合は開始しない。
@@ -128,6 +149,7 @@ OBS WebSocket だけが切れても、RTMP 入力が続く間は送信を維持�
 - 7 日を超える連続配信では fallback 行が鮮度切れになる。配信を開始し直すと再登録する。
 - fallback 登録に失敗しても Edamame と ImageFlux の送信は継続する。
 - fallback 登録が無効な場合、ImageFlux の HLS は暗号化しない。
+- 入力チェックは表示だけで、期待値と違っても配信を止めない。
 - 1 台につき 1 チャンネルとする。
 - OBS の置き換え、録画、映像プレビュー、複数チャンネル同時配信は行わない。
 - Windows の単一 exe 配布は行わない。GStreamer は外部ランタイムとする。

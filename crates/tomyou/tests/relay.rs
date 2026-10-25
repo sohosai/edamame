@@ -2,10 +2,12 @@
 
 use std::{process::Stdio, time::Duration};
 
+use shiguredo_rtmp::{AudioFormat, VideoCodec};
 use tokio::process::Command;
 use tomyou::{
     gstreamer,
     relay::{self, RelayEvent},
+    stream_info::StreamInfo,
 };
 
 fn ffmpeg_available() -> bool {
@@ -399,4 +401,113 @@ async fn relay_keeps_reader_connected_across_ack_windows() {
         "ACK の間隔を超えて受信を継続できません: 受信バイト数={bytes}, 切断={disconnected}, 詳細={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reports_1920x1080_aac_stream_info() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg がないため、入力ストリーム情報の結合テストを省略します");
+        return;
+    }
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = relay::start(
+        "127.0.0.1:0".parse().expect("待ち受けアドレス"),
+        "live",
+        "uni",
+        events_tx,
+    )
+    .await
+    .expect("RTMP 中継を開始できる");
+
+    let address = loop {
+        match events_rx.recv().await {
+            Some(RelayEvent::Listening(address)) => break address,
+            Some(_) => {}
+            None => panic!("RTMP 中継の待ち受けアドレスを取得できない"),
+        }
+    };
+    let url = format!("rtmp://{address}/live/uni");
+
+    let mut publisher = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=1920x1080:rate=30",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:sample_rate=48000",
+            "-t",
+            "6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "60",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-f",
+            "flv",
+            &url,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("1920x1080/AAC の配信を起動できる");
+
+    let info = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut latest: Option<StreamInfo> = None;
+        while let Some(event) = events_rx.recv().await {
+            if let RelayEvent::StreamInfo(info) = event {
+                if info.is_ready() && info.keyframe_interval_ms.is_some() && info.video_frames > 0 {
+                    return info;
+                }
+                latest = Some(info);
+            }
+        }
+        panic!("入力ストリーム情報を受信できません: {latest:?}");
+    })
+    .await
+    .expect("入力ストリーム情報が時間内に届く");
+
+    let video = info.video.as_ref().expect("映像情報がある");
+    assert_eq!(video.codec, VideoCodec::Avc);
+    assert_eq!(video.width, Some(1920));
+    assert_eq!(video.height, Some(1080));
+    assert!(video.problem().is_none(), "映像に問題がある: {video:?}");
+
+    let audio = info.audio.as_ref().expect("音声情報がある");
+    assert_eq!(audio.codec, AudioFormat::Aac);
+    assert_eq!(audio.sample_rate, Some(48_000));
+    assert_eq!(audio.channels, Some(2));
+    assert!(audio.problem().is_none(), "音声に問題がある: {audio:?}");
+
+    assert!(!info.has_cts_offset, "B フレームの可能性があります");
+    let interval = info
+        .keyframe_interval_ms
+        .expect("キーフレーム間隔を計測できない");
+    assert!(
+        (1_500..=2_500).contains(&interval),
+        "キーフレーム間隔が想定外です: {interval} ms"
+    );
+
+    let _ = publisher.kill().await;
+    let _ = publisher.wait().await;
+    handle.stop();
 }
