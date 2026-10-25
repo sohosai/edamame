@@ -12,8 +12,10 @@ OBS の映像を Edamame と ImageFlux へ同時に送り、送信先ごとの�
 OBS ── RTMP ──> tomyou の RTMP サーバ
                   ├─ GStreamer ──> rtmpsink ──> edamame-publisher
                   │                                  ├─> controller / worker
-                  │                                  └─> live2025-server に既存方式で登録
+                  │                                  └─> live2025-server に通常用として登録
                   └─ GStreamer ──> whipclientsink ──> ImageFlux
+
+tomyou ── HTTPS ──> live2025-server に ImageFlux を fallback として登録
 ```
 
 `tomyou` は OBS の配信先をローカルの RTMP サーバへ変更する。
@@ -24,8 +26,8 @@ Edamame と ImageFlux への送信は、それぞれ独立した GStreamer プ�
 - Edamame 向けは H.264 と AAC を FLV に戻し、publisher へ RTMP で送る。
 - ImageFlux 向けは H.264 をコピーし、音声を Opus に変換して WHIP で送る。
 - ImageFlux のチャンネル作成、WHIP URL の生成、プレイリスト URL の取得、削除は `whip-script` の API 操作を引き継ぐ。
-- ImageFlux のプレイリストと鍵を live2025-server へ登録する処理は行わない。
-- Edamame の URL と鍵の登録は、既存の `edamame-publisher` が行う。
+- ImageFlux のプレイリスト URL と鍵を live2025-server へ fallback として登録する。
+- Edamame の通常用 URL と鍵の登録は、既存の `edamame-publisher` が行う。
 
 ## OBS の条件
 
@@ -111,12 +113,26 @@ HLS 設定は `whip-script` の設定を取り込み、解像度、FPS、ビッ�
 30 秒以内に生成されない場合は「生成待ち」として表示する。
 停止時はチャンネル削除を試み、失敗した場合は次回起動時に残存チャンネルとして確認できるようにする。
 
-この版では、ImageFlux のプレイリスト URL と鍵を live2025-server へ登録しない。
-また、ImageFlux の鍵取得、鍵の保存、鍵配布も行わない。
-既存の `encrypt_key_uri` は保持するが、Edamame の鍵だけを返す現在のエンドポイントを ImageFlux の鍵配布先として流用できるとは扱わない。
+fallback 登録を有効にすると、ImageFlux の鍵 URI は `<stream_credentials.base_url>/key/<channel_id>?fallback=1` になる。
+ImageFlux はこの URI に `&kid=...` を追加してプレイリストへ出力する。
+`tomyou` はプレイリストの `#EXT-X-KEY` から `kid` を取り出し、`ImageFlux_20200707.GetEncryptKey` で 16 バイトの鍵を取得する。
 
-したがって、この版だけで視聴 client の自動フォールバックを完成させない。
-画面に HLS URL を表示できても、復号再生を確認できるまでは「視聴可能」と表示しない。
+取得した鍵とプレイリスト URL は、`POST <stream_credentials.base_url>/internal/stream-credentials?fallback=1` に登録する。
+`channel_id` は ImageFlux のチャンネル ID ではなく、`uni`、`1A`、`kaikan` のいずれかである。
+登録は配信開始後、プレイリストが生成されてから行う。
+鍵はメモリ上だけで扱い、設定ファイルやログには保存しない。
+
+登録に失敗しても、Edamame と ImageFlux の送信は継続する。
+通信エラーと 5xx は 1 秒から 30 秒の間隔で再試行し、400 と 401 は設定エラーとして打ち切る。
+fallback 行の有効期間は 7 日で、削除する API はない。
+停止後はプレイリストを取得できなくなった行が選択対象から外れ、7 日の鮮度切れでも外れる。
+ImageFlux の再接続でプレイリスト URL が変わった場合は、次回の配信開始まで再登録しない。
+登録の反映はサーバのキャッシュにより最大 10 秒、配信終了の反映は最大 5 秒遅れる。
+
+通常用の鍵が未登録の場合、通常用のプレイリストが生きていても鍵取得は 404 になり、fallback の鍵へは自動で切り替わらない。
+通常用の鍵の登録は `edamame-publisher` が行う。
+
+画面に HLS URL を表示できても、視聴 client での復号再生を確認できるまでは「視聴可能」と表示しない。
 
 ## 障害時の動作
 
@@ -124,11 +140,16 @@ HLS 設定は `whip-script` の設定を取り込み、解像度、FPS、ビッ�
 | --- | --- |
 | OBS に接続できない | 配信を開始しない |
 | OBS が既に配信中 | 既存の配信を停止せず、開始を拒否する |
+| fallback 登録の設定が不完全 | 設定エラーとして保存・開始しない |
 | GStreamer の Edamame 要素が不足 | 配信を開始しない |
 | ImageFlux の GStreamer 要素が不足 | Edamame だけで配信を開始する |
 | ImageFlux のチャンネル作成に失敗 | Edamame だけで配信を開始する |
 | ImageFlux の WHIP が切れる | ImageFlux の GStreamer だけをバックオフして再起動する。Edamame は継続する |
-| ImageFlux の HLS が生成されない | Edamame は継続し、画面に生成待ちを表示する |
+| ImageFlux の HLS が生成されない | Edamame は継続し、画面に生成待ちを表示する。fallback 登録は失敗表示にする |
+| ImageFlux の暗号鍵を取得できない | fallback 登録を中止し、GUI とログに表示する。配信は継続する |
+| fallback 登録の通信または 5xx | 1 秒から 30 秒の間隔で再試行する。配信は継続する |
+| fallback 登録の 400 または 401 | 再試行せず、設定エラーとして GUI とログに表示する。配信は継続する |
+| ImageFlux の再接続でプレイリスト URL が変わる | 再登録しない。次回の配信開始まで古い URL のまま |
 | edamame-publisher が停止、または RTMP URL へ到達できない | ImageFlux は継続する。Edamame 側の GStreamer だけを再起動する。GUI のログに接続失敗を表示する |
 | RTMP 入力が切れる | 出力を止め、OBS の再接続を待つ |
 | GStreamer が起動できない | 原因を画面に表示し、バックオフして再試行する |
@@ -150,11 +171,16 @@ ImageFlux と Edamame の出力は別プロセスなので、片方の停止が�
 GUI の「設定」にある「設定ファイル」でも、任意のパスを指定して読み込み・保存できる。
 指定したファイルを読めない場合も GUI は初期値で起動し、設定画面でパスを直せる。
 
-OBS のパスワードと ImageFlux の API トークンも設定ファイルへ保存する。
+OBS のパスワード、ImageFlux の API トークン、`STREAM_INGEST_TOKEN` も設定ファイルへ保存する。
 Unix では保存時に 0600 へ変更し、所有者だけが読めるようにする。
 設定画面の「OS のアプリで開く」から、OS の既定アプリで TOML を直接編集できる。
 ファイルが無い場合は、現在の設定を保存してから開く。
 編集後は「再読込」を押す。
+
+fallback 登録を使う場合は、`[stream_credentials]` に live2025-server の `base_url` と `ingest_token` を指定する。
+`base_url` は視聴者と `tomyou` の双方から到達できる HTTPS のオリジンにする。
+鍵 URI は `base_url` と `channel_id` から自動で決まる。
+`[stream_credentials]` が空の場合は登録せず、ImageFlux の HLS は暗号化しない。
 
 秘密情報を含むため、設定ファイルを配布したりリポジトリへ commit したりしない。
 ログと画面のコピー機能には秘密情報を出さない。
@@ -197,6 +223,13 @@ GStreamer は外部ランタイムとし、アプリには同梱しない。
 8. 片方の GStreamer を止めても、もう片方が継続することを確認する。
 9. テストで作成した ImageFlux チャンネルを削除する。
 
+fallback 登録を使う場合は、上記に加えて次を確認する。
+
+1. GUI の fallback 登録が「登録済み」になる。
+2. ImageFlux のプレイリストの `#EXT-X-KEY` URI に `fallback=1` と `kid` が含まれる。
+3. 通常用のプレイリストを取得できない状態で、`GET /channel/<channel>` の `live_url` が ImageFlux の URL になる。
+4. セッション Cookie 付きの `GET /key/<channel>?fallback=1` が、登録した鍵を返す。
+
 ローカル RTMP の遅延は、初回のキーフレーム待ち、再接続、HLS の遅延と分けて測る。
 
 ## 制約
@@ -204,4 +237,6 @@ GStreamer は外部ランタイムとし、アプリには同梱しない。
 - 録画、映像プレビュー、遠隔操作、複数チャンネル同時配信は行わない。
 - 映像の自動再エンコード、自前 WebRTC、ImageFlux の RTMP ingest は行わない。
 - `tomyou` と `whip-script` を同じ OBS に対して同時に動かさない。
+- fallback 登録は配信開始後に一度だけ行う。ImageFlux の再接続でプレイリスト URL が変わった場合は、次回の配信開始まで再登録しない。
+- fallback 行を削除する API はない。7 日を超える連続配信では鮮度切れになる。
 - Edamame と ImageFlux の独立した冗長化ではない。

@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub publisher: PublisherConfig,
     #[serde(default)]
+    pub stream_credentials: StreamCredentialsConfig,
+    #[serde(default)]
     pub imageflux: ImageFluxConfig,
     #[serde(default)]
     pub relay: RelayConfig,
@@ -48,19 +50,81 @@ pub struct PublisherConfig {
     pub rtmp_url: String,
 }
 
+/// ImageFlux を fallback 配信として登録する live2025-server の設定
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamCredentialsConfig {
+    /// live2025-server のベース URL
+    #[serde(default)]
+    pub base_url: String,
+    /// live2025-server の STREAM_INGEST_TOKEN
+    #[serde(default)]
+    pub ingest_token: String,
+}
+
+impl StreamCredentialsConfig {
+    /// fallback 登録を使う設定か
+    pub fn enabled(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.ingest_token.trim().is_empty()
+    }
+
+    /// ベース URL を検証し、末尾の / を除いた文字列を返す
+    fn normalized_base_url(&self) -> Result<&str> {
+        let base_url = self.base_url.trim();
+        let url = url::Url::parse(base_url)
+            .context("stream_credentials.base_url が URL として不正です")?;
+        if url.scheme() != "https" {
+            bail!("stream_credentials.base_url は https:// で始めてください");
+        }
+        if url.host_str().is_none() {
+            bail!("stream_credentials.base_url にホストがありません");
+        }
+        if url.path() != "/" && !url.path().is_empty() {
+            bail!("stream_credentials.base_url にパスは指定できません");
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            bail!("stream_credentials.base_url にクエリやフラグメントは指定できません");
+        }
+        Ok(base_url.trim_end_matches('/'))
+    }
+
+    /// 設定の矛盾を確認する
+    fn validate(&self) -> Result<()> {
+        let base_url = self.base_url.trim();
+        let ingest_token = self.ingest_token.trim();
+        if base_url.is_empty() && ingest_token.is_empty() {
+            return Ok(());
+        }
+        if base_url.is_empty() || ingest_token.is_empty() {
+            bail!("stream_credentials.base_url と ingest_token は両方指定してください");
+        }
+        self.normalized_base_url()?;
+        if !ingest_token
+            .chars()
+            .all(|character| ('!'..='~').contains(&character))
+        {
+            bail!(
+                "stream_credentials.ingest_token は空白を含まない印字可能 ASCII で指定してください"
+            );
+        }
+        Ok(())
+    }
+
+    /// ImageFlux に渡す暗号鍵 URI を組み立てる
+    pub fn key_uri(&self, channel_id: &str) -> Result<String> {
+        if !CHANNELS.contains(&channel_id) {
+            bail!("channel_id は uni、1A、kaikan のいずれかです");
+        }
+        let base_url = self.normalized_base_url()?;
+        Ok(format!("{base_url}/key/{channel_id}?fallback=1"))
+    }
+}
+
 /// ImageFlux の API と HLS 出力設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageFluxConfig {
     /// 設定ファイルに保存する
     #[serde(default)]
     pub token: String,
-    #[serde(
-        default,
-        rename = "encrypt-key-uri",
-        alias = "encrypt_key_uri",
-        alias = "encryptKeyUri"
-    )]
-    pub encrypt_key_uri: String,
     #[serde(
         default,
         rename = "event_webhook_url",
@@ -133,6 +197,7 @@ impl Default for Config {
             channel_id: "uni".to_owned(),
             obs: ObsConfig::default(),
             publisher: PublisherConfig::default(),
+            stream_credentials: StreamCredentialsConfig::default(),
             imageflux: ImageFluxConfig::default(),
             relay: RelayConfig::default(),
             gstreamer: GStreamerConfig::default(),
@@ -154,7 +219,6 @@ impl Default for ImageFluxConfig {
     fn default() -> Self {
         Self {
             token: String::new(),
-            encrypt_key_uri: String::new(),
             event_webhook_url: String::new(),
             hls: default_hls(),
         }
@@ -300,6 +364,13 @@ impl Config {
         {
             bail!("gstreamer.path が空です");
         }
+        self.stream_credentials.validate()?;
+        if self.stream_credentials.enabled() {
+            if !self.imageflux_enabled() {
+                bail!("fallback 登録には imageflux.token が必要です");
+            }
+            let _ = self.imageflux_key_uri()?;
+        }
         if self.imageflux.hls.is_empty() {
             bail!("imageflux.hls が空です");
         }
@@ -325,6 +396,14 @@ impl Config {
         !self.imageflux.token.trim().is_empty()
     }
 
+    /// ImageFlux に渡す暗号鍵 URI を返す
+    pub fn imageflux_key_uri(&self) -> Result<String> {
+        if !self.stream_credentials.enabled() {
+            return Ok(String::new());
+        }
+        self.stream_credentials.key_uri(&self.channel_id)
+    }
+
     /// Edamame 側の送信設定がそろっているか
     pub fn edamame_enabled(&self) -> bool {
         !self.publisher.rtmp_url.trim().is_empty()
@@ -335,9 +414,94 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// fallback 登録を有効にした設定を作る
+    fn fallback_config() -> Config {
+        Config {
+            channel_id: "1A".to_owned(),
+            stream_credentials: StreamCredentialsConfig {
+                base_url: "https://live.example.test".to_owned(),
+                ingest_token: "ingest-token".to_owned(),
+            },
+            imageflux: ImageFluxConfig {
+                token: "imageflux-secret".to_owned(),
+                ..ImageFluxConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().expect("既定値は有効");
+    }
+
+    #[test]
+    fn builds_key_uri_from_base_url_and_channel() {
+        let config = fallback_config();
+        assert_eq!(
+            config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
+            "https://live.example.test/key/1A?fallback=1"
+        );
+    }
+
+    #[test]
+    fn strips_trailing_slash_from_base_url() {
+        let mut config = fallback_config();
+        config.stream_credentials.base_url = "https://live.example.test/".to_owned();
+        assert_eq!(
+            config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
+            "https://live.example.test/key/1A?fallback=1"
+        );
+    }
+
+    #[test]
+    fn disables_key_uri_without_stream_credentials() {
+        assert_eq!(
+            Config::default()
+                .imageflux_key_uri()
+                .expect("鍵 URI を組み立てられる"),
+            ""
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_stream_credentials_base_url() {
+        for base_url in [
+            "http://live.example.test",
+            "https://live.example.test/base",
+            "https://live.example.test?x=1",
+            "https://live.example.test#fragment",
+            "not-a-url",
+        ] {
+            let mut config = fallback_config();
+            config.stream_credentials.base_url = base_url.to_owned();
+            assert!(config.validate().is_err(), "受理してはいけない: {base_url}");
+        }
+    }
+
+    #[test]
+    fn rejects_partial_stream_credentials() {
+        let mut config = fallback_config();
+        config.stream_credentials.ingest_token.clear();
+        assert!(config.validate().is_err());
+
+        let mut config = fallback_config();
+        config.stream_credentials.base_url.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn requires_imageflux_token_for_fallback() {
+        let mut config = fallback_config();
+        config.imageflux.token.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ingest_token_with_spaces() {
+        let mut config = fallback_config();
+        config.stream_credentials.ingest_token = "bad token".to_owned();
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -355,6 +519,10 @@ mod tests {
                 password: "obs-secret".to_owned(),
                 ..ObsConfig::default()
             },
+            stream_credentials: StreamCredentialsConfig {
+                base_url: "https://live.example.test".to_owned(),
+                ingest_token: "ingest-secret".to_owned(),
+            },
             imageflux: ImageFluxConfig {
                 token: "imageflux-secret".to_owned(),
                 ..ImageFluxConfig::default()
@@ -365,6 +533,7 @@ mod tests {
         let text = fs::read_to_string(&path).expect("保存した設定を読める");
         assert!(text.contains("obs-secret"));
         assert!(text.contains("imageflux-secret"));
+        assert!(text.contains("ingest-secret"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -412,9 +581,6 @@ channel_id = "1A"
 
 [publisher]
 rtmp_url = "rtmp://publisher.example.test:1936/live/1A"
-
-[imageflux]
-encrypt-key-uri = "https://live.example.test/key/1A"
 
 [[imageflux.hls]]
 duration-seconds = 2

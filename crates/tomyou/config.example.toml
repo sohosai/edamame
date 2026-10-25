@@ -1,5 +1,5 @@
 # tomyou の設定例
-# OBS のパスワードと ImageFlux の API トークンもこのファイルへ保存される。
+# OBS のパスワード、ImageFlux の API トークン、STREAM_INGEST_TOKEN もこのファイルへ保存される。
 # 秘密情報を含むため、ファイルの権限と配布先に注意する。
 # 初回は GUI の「設定」から入力し、「保存」を押す。
 
@@ -15,10 +15,19 @@ port = 4455
 # edamame-publisher が待ち受ける RTMP URL
 rtmp_url = "rtmp://publisher.example.test:1935/live/uni"
 
+[stream_credentials]
+# ImageFlux を fallback として登録する live2025-server のベース URL。
+# 視聴者と tomyou の双方から到達できる HTTPS のオリジン。
+# 空欄の場合は登録しない。ingest_token と両方指定する。
+# 例: https://live.example.test
+base_url = ""
+# live2025-server の STREAM_INGEST_TOKEN と同じ値
+ingest_token = ""
+
 [imageflux]
 # token もこのファイルへ保存される
-# 例: https://live-api-dev.sohosai.com/key/uni
-encrypt-key-uri = ""
+# fallback 登録を有効にすると、鍵 URI は
+# <stream_credentials.base_url>/key/<channel_id>?fallback=1 になる。
 event_webhook_url = ""
 
 # whip-script の example.toml と同じ HLS 設定

@@ -16,7 +16,8 @@ use tokio::{
 use tracing::{error, info, warn};
 
 use crate::{
-    config::Config,
+    config::{Config, StreamCredentialsConfig},
+    credentials,
     gstreamer::{self, OutputSpec},
     imageflux::{ImageFluxClient, whip_url},
     obs::{ObsClient, StreamSnapshot},
@@ -41,6 +42,8 @@ pub enum SessionEvent {
     },
     ImageFluxPlaylist(String),
     ImageFluxError(String),
+    FallbackRegistered,
+    FallbackRegistrationFailed(String),
     OutputStarted(String),
     OutputExited(String, String),
     Error(String),
@@ -158,6 +161,11 @@ async fn run(
         ));
         None
     };
+    if config.stream_credentials.enabled() && imageflux_client.is_none() {
+        let _ = ui.send(SessionEvent::FallbackRegistrationFailed(
+            "ImageFlux の API クライアントを作れません".to_owned(),
+        ));
+    }
 
     if let Some(client) = &imageflux_client {
         let mut remaining = Vec::new();
@@ -213,6 +221,11 @@ async fn run(
             Err(error) => {
                 warn!("ImageFlux is unavailable: {error:#}");
                 let _ = ui.send(SessionEvent::ImageFluxError(format!("{error:#}")));
+                if config.stream_credentials.enabled() {
+                    let _ = ui.send(SessionEvent::FallbackRegistrationFailed(format!(
+                        "ImageFlux を準備できません: {error:#}"
+                    )));
+                }
             }
         }
     }
@@ -300,10 +313,11 @@ async fn prepare_imageflux(
     let decoder = capabilities
         .audio_decoder()
         .context("AAC デコーダがありません")?;
+    let key_uri = config.imageflux_key_uri()?;
     let created = client
         .create_channel(
             &config.imageflux.hls,
-            &config.imageflux.encrypt_key_uri,
+            &key_uri,
             &config.imageflux.event_webhook_url,
         )
         .await?;
@@ -323,24 +337,135 @@ async fn prepare_imageflux(
     spawn_output(
         gstreamer::imageflux_spec(input_url, &whip, decoder),
         gst_launch.to_path_buf(),
-        stop_rx,
+        stop_rx.clone(),
         ui.clone(),
     );
 
     let channel_id = created.channel_id.clone();
     let playlist_client = client.clone();
+    let registration = config
+        .stream_credentials
+        .enabled()
+        .then(|| config.stream_credentials.clone());
+    let registration_enabled = registration.is_some();
+    let registration_stop = stop_rx;
     tokio::spawn(async move {
         match playlist_client.wait_for_playlist(&channel_id).await {
             Ok(url) => {
-                let _ = ui.send(SessionEvent::ImageFluxPlaylist(url));
+                let _ = ui.send(SessionEvent::ImageFluxPlaylist(url.clone()));
+                if let Some(settings) = registration {
+                    register_fallback(
+                        playlist_client,
+                        settings,
+                        channel_id,
+                        url,
+                        registration_stop,
+                        ui,
+                    )
+                    .await;
+                }
             }
             Err(error) => {
                 let _ = ui.send(SessionEvent::ImageFluxError(format!("{error:#}")));
+                if registration_enabled {
+                    let _ = ui.send(SessionEvent::FallbackRegistrationFailed(format!(
+                        "ImageFlux の HLS プレイリストを取得できません: {error:#}"
+                    )));
+                }
             }
         }
     });
 
     Ok(created.channel_id)
+}
+
+/// ImageFlux を fallback 配信として live2025-server へ登録する
+async fn register_fallback(
+    imageflux: ImageFluxClient,
+    settings: StreamCredentialsConfig,
+    channel_id: String,
+    playlist_url: String,
+    mut stop: watch::Receiver<bool>,
+    ui: Sender<SessionEvent>,
+) {
+    let Some(key) = fetch_encrypt_key_with_retry(&imageflux, &playlist_url, &mut stop, &ui).await
+    else {
+        return;
+    };
+    let client = match credentials::client() {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = ui.send(SessionEvent::FallbackRegistrationFailed(format!(
+                "fallback 登録の HTTP クライアントを作れません: {error:#}"
+            )));
+            return;
+        }
+    };
+    let endpoint = credentials::endpoint(&settings.base_url);
+    let body = credentials::body(&channel_id, &playlist_url, &key);
+    let ingest_token = settings.ingest_token.trim();
+    let log_ui = ui.clone();
+    let log = move |message: String| {
+        let _ = log_ui.send(SessionEvent::Log(message));
+    };
+    match credentials::register_until_success(
+        &client,
+        &endpoint,
+        ingest_token,
+        &body,
+        &mut stop,
+        log,
+    )
+    .await
+    {
+        Ok(()) => {
+            info!("fallback stream credentials registered");
+            let _ = ui.send(SessionEvent::FallbackRegistered);
+        }
+        Err(error) => {
+            if !*stop.borrow() {
+                warn!("failed to register fallback stream credentials: {error:#}");
+                let _ = ui.send(SessionEvent::FallbackRegistrationFailed(format!(
+                    "{error:#}"
+                )));
+            }
+        }
+    }
+}
+
+/// プレイリストの内容が準備できるまで、鍵取得を少しだけ再試行する
+async fn fetch_encrypt_key_with_retry(
+    imageflux: &ImageFluxClient,
+    playlist_url: &str,
+    stop: &mut watch::Receiver<bool>,
+    ui: &Sender<SessionEvent>,
+) -> Option<String> {
+    const KEY_FETCH_ATTEMPTS: u32 = 3;
+    let mut delay = Duration::from_secs(2);
+    for attempt in 0..KEY_FETCH_ATTEMPTS {
+        match imageflux.fetch_encrypt_key(playlist_url).await {
+            Ok(key) => return Some(key),
+            Err(error) if attempt + 1 < KEY_FETCH_ATTEMPTS => {
+                let _ = ui.send(SessionEvent::Log(format!(
+                    "ImageFlux の暗号鍵を取得できません。再試行します: {error:#}"
+                )));
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = stop.changed() => return None,
+                }
+                delay *= 2;
+            }
+            Err(error) => {
+                if !*stop.borrow() {
+                    let _ = ui.send(SessionEvent::FallbackRegistrationFailed(format!(
+                        "ImageFlux の暗号鍵を取得できません: {error:#}"
+                    )));
+                }
+                return None;
+            }
+        }
+    }
+    None
 }
 
 fn spawn_output(

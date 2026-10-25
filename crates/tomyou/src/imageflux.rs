@@ -111,6 +111,63 @@ impl ImageFluxClient {
         }
     }
 
+    /// プレイリストから ImageFlux の暗号鍵を取得する
+    pub async fn fetch_encrypt_key(&self, playlist_url: &str) -> Result<String> {
+        let playlist = self.fetch_text(playlist_url).await?;
+        // マスターなら最初のバリアント、メディアならそのまま鍵タグを探す
+        if let Ok(variant_url) = first_variant_url(&playlist, playlist_url) {
+            let media = self.fetch_text(&variant_url).await?;
+            let key_uri = find_key_uri(&media)
+                .context("ImageFlux のプレイリストに #EXT-X-KEY がありません")?;
+            return self.fetch_key_from_uri(&key_uri).await;
+        }
+        let key_uri = find_key_uri(&playlist)
+            .context("ImageFlux のプレイリストに #EXT-X-KEY がありません")?;
+        self.fetch_key_from_uri(&key_uri).await
+    }
+
+    /// 鍵 URI の kid から ImageFlux の暗号鍵を取得する
+    async fn fetch_key_from_uri(&self, key_uri: &str) -> Result<String> {
+        let kid = kid_from_key_uri(key_uri)?;
+        let response = self
+            .request("ImageFlux_20200707.GetEncryptKey", &json!({ "kid": kid }))
+            .await?;
+        let parsed: EncryptKeyResponse =
+            serde_json::from_slice(&response).context("ImageFlux の暗号鍵応答を読めません")?;
+        let key = parsed.encrypt_key.trim();
+        if key.is_empty() {
+            bail!(
+                "ImageFlux の暗号鍵を取得できませんでした: {}",
+                parsed.error.unwrap_or_default()
+            );
+        }
+        if !is_hex_key(key) {
+            bail!("ImageFlux の暗号鍵が 16 バイトの hex ではありません");
+        }
+        Ok(key.to_owned())
+    }
+
+    async fn fetch_text(&self, url: &str) -> Result<String> {
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("ImageFlux のプレイリストに接続できません: {url}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("ImageFlux のプレイリストを読めません")?;
+        if !status.is_success() {
+            bail!(
+                "ImageFlux のプレイリストが {} を返しました: {url}",
+                status.as_u16()
+            );
+        }
+        Ok(body)
+    }
+
     /// チャンネルを削除する
     pub async fn delete_channel(&self, channel_id: &str) -> Result<()> {
         let response = self
@@ -183,6 +240,74 @@ pub fn whip_url(sora_url: &str, channel_id: &str) -> Result<String> {
 fn optional(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// プレイリストから最初の #EXT-X-KEY の URI を探す
+fn find_key_uri(playlist: &str) -> Option<String> {
+    for line in playlist.lines() {
+        let line = line.trim();
+        if !line.starts_with("#EXT-X-KEY") {
+            continue;
+        }
+        // METHOD=NONE など URI を持たない行は読み飛ばす
+        let Some(start) = line.find("URI=\"") else {
+            continue;
+        };
+        let rest = &line[start + "URI=\"".len()..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        return Some(rest[..end].to_owned());
+    }
+    None
+}
+
+/// マスタープレイリストから最初のバリアント URL を探す
+fn first_variant_url(playlist: &str, playlist_url: &str) -> Result<String> {
+    let base = Url::parse(playlist_url).context("ImageFlux のプレイリスト URL が不正です")?;
+    let mut expect_variant = false;
+    for line in playlist.lines() {
+        let line = line.trim();
+        if line.starts_with("#EXT-X-STREAM-INF") {
+            expect_variant = true;
+            continue;
+        }
+        if expect_variant && !line.is_empty() && !line.starts_with('#') {
+            return base
+                .join(line)
+                .map(|url| url.to_string())
+                .with_context(|| format!("ImageFlux のバリアント URL が不正です: {line}"));
+        }
+    }
+    // #EXT-X-STREAM-INF がなくても、m3u8 を指す行があればバリアントとして扱う
+    for line in playlist.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = line.split('?').next().unwrap_or(line);
+        if path.ends_with(".m3u8") {
+            return base
+                .join(line)
+                .map(|url| url.to_string())
+                .with_context(|| format!("ImageFlux のバリアント URL が不正です: {line}"));
+        }
+    }
+    bail!("ImageFlux のマスタープレイリストにバリアント URL がありません");
+}
+
+/// 鍵 URI の kid を取り出す
+fn kid_from_key_uri(key_uri: &str) -> Result<String> {
+    let url = Url::parse(key_uri).context("ImageFlux の鍵 URI が不正です")?;
+    url.query_pairs()
+        .find(|(key, _)| key == "kid")
+        .map(|(_, value)| value.into_owned())
+        .context("ImageFlux の鍵 URI に kid がありません")
+}
+
+/// 16 バイトの hex か
+fn is_hex_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Serialize)]
@@ -286,6 +411,14 @@ struct SimpleResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EncryptKeyResponse {
+    #[serde(default)]
+    encrypt_key: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +475,64 @@ mod tests {
     #[test]
     fn parses_empty_delete_response() {
         assert!(serde_json::from_slice::<SimpleResponse>(b"").is_err());
+    }
+
+    #[test]
+    fn finds_kid_in_key_uri() {
+        let playlist = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://live.example.test/key/uni?fallback=1&kid=abc\"\n";
+        let key_uri = find_key_uri(playlist).expect("鍵 URI を取得できる");
+        assert_eq!(
+            key_uri,
+            "https://live.example.test/key/uni?fallback=1&kid=abc"
+        );
+        assert_eq!(kid_from_key_uri(&key_uri).unwrap(), "abc");
+    }
+
+    #[test]
+    fn skips_key_tag_without_uri() {
+        let playlist = "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://live.example.test/key/uni?kid=abc\"\n";
+        assert_eq!(
+            find_key_uri(playlist).unwrap(),
+            "https://live.example.test/key/uni?kid=abc"
+        );
+    }
+
+    #[test]
+    fn resolves_variant_urls() {
+        let playlist = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nmedia/stream.m3u8\n";
+        assert_eq!(
+            first_variant_url(playlist, "https://px.example.test/path/master.m3u8").unwrap(),
+            "https://px.example.test/path/media/stream.m3u8"
+        );
+
+        let playlist =
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nhttps://px.example.test/stream.m3u8\n";
+        assert_eq!(
+            first_variant_url(playlist, "https://px.example.test/master.m3u8").unwrap(),
+            "https://px.example.test/stream.m3u8"
+        );
+
+        // タグがなくても m3u8 を指す行をバリアントとして扱う
+        let playlist = "#EXTM3U\nchild.m3u8\n";
+        assert_eq!(
+            first_variant_url(playlist, "https://px.example.test/master.m3u8").unwrap(),
+            "https://px.example.test/child.m3u8"
+        );
+    }
+
+    #[test]
+    fn rejects_playlist_without_variant_or_key() {
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:2\nsegment.ts\n";
+        assert!(find_key_uri(playlist).is_none());
+        assert!(first_variant_url(playlist, "https://px.example.test/live.m3u8").is_err());
+    }
+
+    #[test]
+    fn validates_encrypt_key() {
+        assert!(is_hex_key("0123456789abcdef0123456789abcdef"));
+        assert!(is_hex_key("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!is_hex_key(""));
+        assert!(!is_hex_key("0123456789abcdef0123456789abcde"));
+        assert!(!is_hex_key("0123456789abcdef0123456789abcdeg"));
     }
 }

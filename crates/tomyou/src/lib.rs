@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod config;
+pub mod credentials;
 pub mod gstreamer;
 pub mod imageflux;
 pub mod obs;

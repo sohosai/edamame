@@ -65,6 +65,8 @@ pub struct TomyouApp {
     startup_error: Option<String>,
     imageflux_channel: Option<String>,
     imageflux_playlist: Option<String>,
+    fallback_registered: bool,
+    fallback_error: Option<String>,
     publisher_connected: bool,
     imageflux_output: bool,
     edamame_output: bool,
@@ -105,6 +107,8 @@ impl TomyouApp {
             startup_error,
             imageflux_channel: None,
             imageflux_playlist: None,
+            fallback_registered: false,
+            fallback_error: None,
             publisher_connected: false,
             imageflux_output: false,
             edamame_output: false,
@@ -136,6 +140,8 @@ impl TomyouApp {
         self.error = None;
         self.imageflux_channel = None;
         self.imageflux_playlist = None;
+        self.fallback_registered = false;
+        self.fallback_error = None;
         self.publisher_connected = false;
         self.imageflux_output = false;
         self.edamame_output = false;
@@ -212,6 +218,20 @@ impl TomyouApp {
             SessionEvent::ImageFluxError(error) => {
                 self.log(format!("ImageFlux: {error}"));
             }
+            SessionEvent::FallbackRegistered => {
+                if self.session.is_some() {
+                    self.fallback_registered = true;
+                    self.fallback_error = None;
+                    self.log("ImageFlux を fallback 配信として登録しました");
+                }
+            }
+            SessionEvent::FallbackRegistrationFailed(error) => {
+                if self.session.is_some() {
+                    self.fallback_registered = false;
+                    self.fallback_error = Some(error.clone());
+                    self.log(format!("fallback 登録に失敗: {error}"));
+                }
+            }
             SessionEvent::OutputStarted(name) => {
                 if name == "Edamame" {
                     self.edamame_output = true;
@@ -242,6 +262,8 @@ impl TomyouApp {
                 self.publisher_connected = false;
                 self.imageflux_output = false;
                 self.edamame_output = false;
+                self.fallback_registered = false;
+                self.fallback_error = None;
                 self.log("停止しました");
             }
         }
@@ -469,7 +491,25 @@ impl eframe::App for TomyouApp {
                             }
                         });
                     }
-                    ui.label("視聴サイトへの登録は行いません");
+                    let (fallback_status, fallback_color) =
+                        if !self.config.stream_credentials.enabled() {
+                            ("未設定", egui::Color32::GRAY)
+                        } else if self.fallback_error.is_some() {
+                            ("失敗", egui::Color32::RED)
+                        } else if self.fallback_registered {
+                            ("登録済み", egui::Color32::GREEN)
+                        } else if self.session.is_some() {
+                            ("待機中", egui::Color32::YELLOW)
+                        } else {
+                            ("未登録", egui::Color32::GRAY)
+                        };
+                    ui.colored_label(
+                        fallback_color,
+                        format!("fallback 登録: {fallback_status}"),
+                    );
+                    if let Some(error) = &self.fallback_error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
                 });
             });
             ui.add_space(8.0);
@@ -560,6 +600,27 @@ impl TomyouApp {
                         ui.end_row();
                     });
                 ui.add_space(8.0);
+                ui.label(egui::RichText::new("fallback 登録").strong());
+                egui::Grid::new("settings-stream-credentials")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("ベース URL");
+                        ui.text_edit_singleline(&mut self.config.stream_credentials.base_url);
+                        ui.end_row();
+                        ui.label("STREAM_INGEST_TOKEN");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.config.stream_credentials.ingest_token,
+                            )
+                            .password(true),
+                        );
+                        ui.end_row();
+                    });
+                ui.label(
+                    "空欄なら登録しません。鍵 URI はベース URL とチャンネル名から自動で決まります。",
+                );
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("ImageFlux").strong());
                 egui::Grid::new("settings-imageflux")
                     .num_columns(2)
@@ -570,9 +631,6 @@ impl TomyouApp {
                             egui::TextEdit::singleline(&mut self.config.imageflux.token)
                                 .password(true),
                         );
-                        ui.end_row();
-                        ui.label("暗号鍵 URI");
-                        ui.text_edit_singleline(&mut self.config.imageflux.encrypt_key_uri);
                         ui.end_row();
                         ui.label("Webhook URL");
                         ui.text_edit_singleline(&mut self.config.imageflux.event_webhook_url);
@@ -658,7 +716,7 @@ impl TomyouApp {
                 ui.label("GStreamer: LGPL。rswebrtc: MPL-2.0。配布物の LICENSE を参照");
                 ui.separator();
                 ui.label(
-                    "ImageFlux の API トークンと OBS のパスワードは設定ファイルへ保存します。",
+                    "ImageFlux の API トークン、STREAM_INGEST_TOKEN、OBS のパスワードは設定ファイルへ保存します。",
                 );
                 ui.label("秘密情報を含むため、設定ファイルの権限と配布先に注意してください。");
                 ui.label("ログと画面には秘密情報を表示しません。");
