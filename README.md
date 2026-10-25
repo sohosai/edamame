@@ -162,35 +162,35 @@ docker build --target publisher -t edamame-publisher .
 
 1. テスト用のセグメントファイルを `controller` に `PUT` する。URL 末尾の `segment-1` は、`publisher` がセグメントごとに付ける任意の識別子である。
 
-```bash
-printf 'segment-1' > /tmp/segment-1.ts
-curl -i -X PUT \
-  -H 'Authorization: Bearer example-token' \
-  --data-binary @/tmp/segment-1.ts \
-  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
-```
+   ```bash
+   printf 'segment-1' > /tmp/segment-1.ts
+   curl -i -X PUT \
+     -H 'Authorization: Bearer example-token' \
+     --data-binary @/tmp/segment-1.ts \
+     'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+   ```
 
-`controller` は新しい識別子に `0` 始まりのセグメント番号を割り当て、レスポンス JSON の `sequence`（この例では `{"sequence": 0}`）として返す。
+   `controller` は新しい識別子に `0` 始まりのセグメント番号を割り当て、レスポンス JSON の `sequence`（この例では `{"sequence": 0}`）として返す。
 
 2. `controller` からプレイリストを取得する。
 
-`PUT` したセグメントは、すぐにはプレイリストに出ない。
-`--publish-wait-ms`（上の例では 2000 ミリ秒）が過ぎ、さらに `worker` が `sync` でそのセグメントを取得し終えるとプレイリストに反映される。
-反映される前のリクエストには `503 Service Unavailable` が返るため、`--retry` を付けて取得する。
+   `PUT` したセグメントは、すぐにはプレイリストに出ない。
+   `--publish-wait-ms`（上の例では 2000 ミリ秒）が過ぎ、さらに `worker` が `sync` でそのセグメントを取得し終えるとプレイリストに反映される。
+   反映される前のリクエストには `503 Service Unavailable` が返るため、`--retry` を付けて取得する。
 
-```bash
-curl -i --retry 30 --retry-delay 1 --retry-connrefused \
-  http://127.0.0.1:9000/channels/live/master.m3u8
+   ```bash
+   curl -i --retry 30 --retry-delay 1 --retry-connrefused \
+     http://127.0.0.1:9000/channels/live/master.m3u8
 
-curl -i --retry 30 --retry-delay 1 --retry-connrefused \
-  http://127.0.0.1:9000/channels/live/720p.m3u8
-```
+   curl -i --retry 30 --retry-delay 1 --retry-connrefused \
+     http://127.0.0.1:9000/channels/live/720p.m3u8
+   ```
 
 3. メディアプレイリスト（`720p.m3u8`）に `worker` の公開 URL（`http://127.0.0.1:9001/segments/live/720p/0.ts`）が出力されていることを確認する。続けて、その URL からセグメントファイルを取得する。
 
-```bash
-curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
-```
+   ```bash
+   curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
+   ```
 
 `503` が解消しない場合は、`worker` が起動しており、`--controller-url` と `--auth-token` が `controller` の設定と一致しているかを確認する。
 

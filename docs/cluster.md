@@ -32,15 +32,15 @@ curl --fail --show-error http://127.0.0.1:9002/internal/cluster/health
 選出が完了すると metric `20` の機体が leader、`10` の機体が follower になる。
 この構成は状態を複製しないため、冗長化しても無停止の配信やデータの保持を保証しない。
 
-運用では共有名を DNS ラウンドロビンで複数の A レコードに対応させ、全機で待ち受けポートと API のパスをそろえる。
-例えば `controller.example.test:9000` を共有の接続先とし、各機の `--public-url` と `--seed` には共有名ではなく機体固有の名前を使う。
-worker と publisher の `--controller-url`、client のプレイリスト URL は共有名に向ける。
-GET と sync の `307` に追従でき、転送先の固有 URL にも到達できることが必要になる。
+本番運用での DNS と接続先の設定、および障害時の注意点は次のとおりである。
 
-停止した機体の A レコードは削除する。
-TTL を短くしても既存の DNS キャッシュと TCP 接続が残るため、接続失敗を再試行する。
-worker のリクエストは最大 30 秒待つ場合があり、復旧は leader の選出完了より遅れることがある。
-leader 未確定や中継失敗の `503` では `Retry-After: 1` に従う。
+- 共有名（例：`controller.example.test:9000`）を DNS ラウンドロビンで複数の A レコードに対応させ、全機で待ち受けポートと API のパスをそろえる
+- 各機の `--public-url` と `--seed` には共有名ではなく機体固有の名前を使う
+- worker と publisher の `--controller-url`、client のプレイリスト URL は共有名に向ける（GET と sync の `307` に追従でき、転送先の固有 URL にも到達できることが必要になる）
+- 停止した機体の A レコードは削除する。
+  TTL を短くしても既存の DNS キャッシュと TCP 接続が残るため、接続失敗を再試行する
+- worker のリクエストは最大 30 秒待つ場合があり、復旧は leader の選出完了より遅れることがある。
+  leader 未確定や中継失敗の `503` では `Retry-After: 1` に従う
 
 ## 役割と保存する状態
 
