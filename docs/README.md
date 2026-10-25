@@ -30,6 +30,7 @@ Edamame が対象とするライブ配信とは、セグメントファイルが
 - [HLS の出力](./hls.md)：マスタープレイリストとメディアプレイリストの出力形式、暗号化タグ、外部配信へのリダイレクト条件
 - [運用](./operations.md)：CLI オプションと環境変数、パラメータ設計とメモリ容量の見積もり、TLS と ACME の設定、再起動や障害時の動作
 - [controller の冗長化](./cluster.md)：leader の選出、転送、交代時の状態消失と通信分断時の制約
+- [可観測性](./observability.md)：共通のメトリクス仕様、送信設定、死活監視、ローカルでの確認方法
 - [publisher](./publisher.md)：付属の `edamame-publisher` クレートの導入手順、エンコードと暗号化、外部サーバへの鍵登録の仕様
 - [スクリプト](../scripts/README.md)：ローカルの MP4 ファイルを無限ループさせてテスト配信を行う `scripts/loop-publisher.py` の使い方
 
@@ -181,6 +182,6 @@ HLS のライブ配信では `#EXT-X-TARGETDURATION` を途中で変更できな
 - AES-128 以外の暗号化方式
 - controller のセグメントファイルとメタデータの永続化
 - worker のキャッシュの永続化
-- メトリクス用のエンドポイント
+- アプリ自体による Prometheus 用の `/metrics` の提供（メトリクスは OTLP/gRPC で送信する）
 - controller 単体での TLS 終端（worker は単体での TLS 終端および ACME に対応する）
 - 全 quality の公開範囲を一致させること

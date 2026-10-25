@@ -204,7 +204,7 @@ TLS 配信を有効にした `worker` は、公開ルート CA で検証でき�
 - 起動時に待ち受けアドレス、public URL、metric、現在の役割を標準出力へ出力する
 - cluster の役割の変化、member の追加、死亡、復帰と中継失敗を出力する
 - `sync` の失敗とセグメントファイルの取得失敗は標準エラーへ出力する
-- メトリクス用のエンドポイントは提供しない
+- controller と worker はメトリクスを OTLP/gRPC で送信できるが、アプリ自体は Prometheus 用の `/metrics` を提供しない。送信設定と死活監視は [可観測性](./observability.md) を参照する
 
 ## 起動と動作確認
 
