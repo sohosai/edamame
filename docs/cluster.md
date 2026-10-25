@@ -1,11 +1,53 @@
 # controller の冗長化
 
+## 起動と DNS の設定
+
+単体の設定一覧は [controller](./controller.md#設定) を参照する。
+全 controller に同じ `--auth-token` と異なる `--public-url` を指定する。
+2 台をローカルで確認する場合は、リポジトリのルートから別のターミナルで起動する。
+
+```bash
+cargo run --locked -p edamame-controller -- \
+  --bind 127.0.0.1:9000 --public-url http://127.0.0.1:9000 \
+  --metric 20 --seed http://127.0.0.1:9002 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
+
+```bash
+cargo run --locked -p edamame-controller -- \
+  --bind 127.0.0.1:9002 --public-url http://127.0.0.1:9002 \
+  --metric 10 --seed http://127.0.0.1:9000 \
+  --storage-capacity 512MiB --playlist-segments 6 \
+  --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
+  --auth-token example-token --cors-origin '*'
+```
+
+```bash
+curl --fail --show-error http://127.0.0.1:9000/internal/cluster/health
+curl --fail --show-error http://127.0.0.1:9002/internal/cluster/health
+```
+
+選出が完了すると metric `20` の機体が leader、`10` の機体が follower になる。
+この構成は状態を複製しないため、冗長化しても無停止の配信やデータの保持を保証しない。
+
+運用では共有名を DNS ラウンドロビンで複数の A レコードに対応させ、全機で待ち受けポートと API のパスをそろえる。
+例えば `controller.example.test:9000` を共有の接続先とし、各機の `--public-url` と `--seed` には共有名ではなく機体固有の名前を使う。
+worker と publisher の `--controller-url`、client のプレイリスト URL は共有名に向ける。
+GET と sync の `307` に追従でき、転送先の固有 URL にも到達できることが必要になる。
+
+停止した機体の A レコードは削除する。
+TTL を短くしても既存の DNS キャッシュと TCP 接続が残るため、接続失敗を再試行する。
+worker のリクエストは最大 30 秒待つ場合があり、復旧は leader の選出完了より遅れることがある。
+leader 未確定や中継失敗の `503` では `Retry-After: 1` に従う。
+
 ## 役割と保存する状態
 
 controller は台数によらず常に cluster の選出処理を使う。
 各 controller には固有の `--public-url` と、peer 間で共通の `--auth-token` を必ず指定する。
 `--metric` の既定値は `100` とし、複数台で起動する場合は必要に応じて優先度を変える。
-起動例と DNS の設定は [運用](./operations.md#controller-を冗長化する) を参照する。
+起動例と DNS の設定は [この文書の起動と DNS の設定](#起動と-dns-の設定) を参照する。
 seed を指定しない場合は自分 1 台で始まり、最初の選出で自分が leader になる。
 公開 URL または token がなければ起動に失敗する。
 seed がなくても認証済みの heartbeat を受け付け、後から参加した peer と選出を続ける。

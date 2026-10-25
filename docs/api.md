@@ -1,7 +1,7 @@
 # HTTP API
 
 この文書では、`controller` と `worker` が提供する HTTP API の仕様を説明する。
-全体構成と用語の定義は [docs/README.md](./README.md) で説明する。
+全体構成と各文書の役割は [ドキュメント案内](./README.md) を参照する。
 
 ## エンドポイント一覧
 
@@ -327,18 +327,16 @@ POST /workers/{worker_id}/sync
 `sync` は `worker` が開始する pull 方式の同期処理である。
 `controller` から `worker` へセグメントファイルのバイト列を直接 `PUT` することはない。
 
-```text
-worker                           controller
-  |                                       |
-  |-- POST /workers/{id}/sync ----------->|
-  |   cached_segments, fetching_segments  |
-  |                                       |  公開範囲を評価する
-  |<-- fetch_segments --------------------|
-  |                                       |
-  |-- GET /segments/... ----------------->|
-  |<-- bytes -----------------------------|
-  |                                       |
-  |   次の sync でキャッシュ内容を報告する |
+```mermaid
+sequenceDiagram
+    participant W as worker
+    participant C as controller
+    W->>C: POST /workers/{id}/sync（cached_segments, fetching_segments）
+    C->>C: 公開範囲を評価する
+    C-->>W: fetch_segments
+    W->>C: GET /segments/...
+    C-->>W: バイト列
+    Note over W: 次の sync でキャッシュ内容を報告する
 ```
 
 リクエスト：
@@ -376,7 +374,7 @@ worker                           controller
 `worker` は再取得したバイト列でキャッシュを上書きする。
 
 `controller` は `sync` を受け取るたびに、各 `quality` の公開範囲を再評価する。
-最初の未公開セグメントファイルが `PUT` された時刻から `--publish-wait-ms` の公開待ちが経過したセグメントを公開可能とし、`sync` が `--sync-timeout-ms` 以内に届いている `worker` が連続してキャッシュしている最新の公開可能範囲を、その `quality` の公開範囲にする。
+公開待ちと連続範囲の選び方は [controller の公開範囲の決定](./controller.md#公開範囲の決定) を参照する。
 
 ステータス：
 

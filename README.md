@@ -18,11 +18,11 @@ client    ─── GET プレイリスト (.m3u8) ─────────�
 client    ─── GET セグメント (.ts) ────────────────> worker
 ```
 
-設計、HTTP API、運用、暗号化の仕組みは [docs/README.md](./docs/README.md) で説明する。
+各コンポーネントの設定と動作、HTTP API、運用の詳細は [ドキュメント案内](./docs/README.md) から辿れる。
 
 ## 必要な環境
 
-- Rust 1.85 以降（edition 2024）
+- Rust 1.99.1（edition 2024）でビルドを確認済み。より古い版は未検証
 - ネットワークの到達性：
   - `publisher` と `worker` から、`controller` の HTTP アドレスへ到達できること
   - `client` から、`controller` のアドレス（プレイリスト取得用）へ到達できること
@@ -70,24 +70,11 @@ cargo run -p edamame-worker -- \
 
 ### 必須条件と任意条件
 
-`controller` のオプションは次のとおりである。
+各オプションの必須、任意、既定値、制約は、コンポーネントごとの文書にまとめている。
 
-- 必須：`--bind`、`--public-url`、`--auth-token`、`--storage-capacity`、`--playlist-segments`（直近 6 セグメント以上）、`--sync-interval-ms`、`--sync-timeout-ms`
-- 任意：
-  - `--publish-wait-ms`：新しいセグメントをプレイリストに載せる前の待ち時間。省略すると `2000`（ミリ秒）を使い、起動時に警告を出す
-  - `--metric`：leader の優先度。省略すると `100` になる
-  - `--seed`：最初に接触する controller の URL。省略した機体も後からの参加を受け付ける
-  - `--cors-origin`：ブラウザからの `GET` を許可する origin。省略すると CORS ヘッダを返さず、起動時に警告を出す
-  - `--external-min-percent`：外部配信を登録したときに振り分ける最小の割合（%）。省略すると `1` になる
-
-`worker` のオプションは次のとおりである。
-
-- 必須：`--worker-id`、`--bind`、`--public-url`（プレイリストに載せる `client` 向けの公開 URL）、`--controller-url`、`--cache-limit`
-- 任意：
-  - `--weight`：複数 `worker` 間の配信比率。省略すると `1` になる
-  - `--auth-token`：CLI は省略を受け付けるが、`controller` への登録には必須の token
-  - `--cors-origin`：ブラウザからの `GET` を許可する origin
-  - `--tls-cert` / `--tls-key`、または `--acme` 系オプション：`worker` 自身で TLS を終端する場合に指定する
+- controller：[設定](./docs/controller.md#設定)
+- worker：[CLI と環境変数](./docs/worker.md#cli-と環境変数)
+- publisher：[設定リファレンス](./docs/publisher.md#設定リファレンス)
 
 各オプションは環境変数でも指定できる。
 環境変数の名前は、オプション名の `-` を `_` に変えて先頭に `EDAMAME_` を付けたものにする（例：`--bind` は `EDAMAME_BIND`）。
@@ -96,11 +83,10 @@ cargo run -p edamame-worker -- \
 `controller` の `--auth-token` は必須であり、`worker` と `publisher` にも同じ token を設定する。
 `--public-url` には、peer、worker、client のすべてから到達できる機体固有の URL を指定する。
 cluster の処理は常に有効であり、seed を省略した場合は自分 1 台で始まる。
-全オプションの詳細と TLS の設定手順は [運用](./docs/operations.md) で説明する。
 
 複数台に増やすときは、参加する機体の `--seed` に起動済みの controller の URL を指定する。
 leader の優先度を変える場合は `--metric` を指定する。
-DNS の共有名から各機へ到達させる起動例は [運用](./docs/operations.md#controller-を冗長化する)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
+DNS の共有名から各機へ到達させる起動例は [controller の冗長化](./docs/cluster.md#起動と-dns-の設定)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
 
 ## publisher
 
@@ -157,7 +143,7 @@ services:
 ```
 
 別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更する。
-`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[運用](./docs/operations.md#controller-を冗長化する)）。
+`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[controller の冗長化](./docs/cluster.md#起動と-dns-の設定)）。
 
 `publisher` のコンテナイメージには `ffmpeg` と Intel の GPU ドライバが含まれるため、Dockerfile の `publisher` ターゲットを指定してビルドする。
 NVIDIA の GPU は NVIDIA Container Toolkit（`--gpus all`）で、Intel の GPU は `--device /dev/dri:/dev/dri` でコンテナに割り当てる。
