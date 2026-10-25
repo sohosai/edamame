@@ -11,11 +11,14 @@ Edamame は、ライブ HLS 配信用のインメモリ配信サーバである�
 - **worker** は、一定間隔で `controller` と同期（`sync`）し、不足しているセグメントファイルを取得してメモリ上にキャッシュする。`client` が再生する `.ts` ファイルの配信を担当し、複数台並べることで配信帯域の負荷を分散する。
 - **client** は、視聴者が使う HLS プレイヤーである。`controller` からプレイリスト（`.m3u8`）を取得し、その中に書かれた `worker` の URL からセグメントファイル（`.ts`）を取得して再生する。
 
-```text
-publisher ─── PUT セグメント ──────────────────────> controller
-worker    ─── PUT 登録 / POST sync / GET セグメント ─> controller
-client    ─── GET プレイリスト (.m3u8) ────────────> controller
-client    ─── GET セグメント (.ts) ────────────────> worker
+```mermaid
+flowchart LR
+    encoder["映像送信側<br>SRT / RTMP"] -->|"ライブ映像"| publisher
+    publisher -->|"PUT セグメント (.ts)"| controller
+    worker -->|"PUT 登録 / POST sync / GET セグメント"| controller
+    client -->|"GET プレイリスト (.m3u8)"| controller
+    client -->|"GET セグメント (.ts)"| worker
+    client -.->|"GET 暗号鍵（key_uri 使用時）"| keys["外部の鍵配信サーバー"]
 ```
 
 各コンポーネントの設定と動作、HTTP API、運用の詳細は [ドキュメント案内](./docs/README.md) から辿れる。
