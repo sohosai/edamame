@@ -41,14 +41,66 @@ impl Status {
         }
     }
 
-    fn color(self) -> egui::Color32 {
+    fn tone(self) -> Tone {
         match self {
-            Self::Idle => egui::Color32::GRAY,
-            Self::Starting | Self::Stopping => egui::Color32::YELLOW,
-            Self::Streaming => egui::Color32::GREEN,
-            Self::Error => egui::Color32::RED,
+            Self::Idle => Tone::Idle,
+            Self::Starting | Self::Stopping => Tone::Warn,
+            Self::Streaming => Tone::Good,
+            Self::Error => Tone::Bad,
         }
     }
+}
+
+/// 状態の意味を表す色
+///
+/// 明るい背景に純色を置くと読みにくいため、テーマの明暗に合わせて濃さを変える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// 待機中、未接続
+    Idle,
+    /// 正常
+    Good,
+    /// 注意、遷移中
+    Warn,
+    /// 異常
+    Bad,
+}
+
+impl Tone {
+    fn color(self, visuals: &egui::Visuals) -> egui::Color32 {
+        let dark = visuals.dark_mode;
+        match self {
+            Self::Idle => visuals.weak_text_color(),
+            // 暗い背景では淡く、明るい背景では濃くする
+            Self::Good if dark => egui::Color32::from_rgb(110, 225, 135),
+            Self::Good => egui::Color32::from_rgb(0, 110, 40),
+            Self::Warn if dark => egui::Color32::from_rgb(255, 200, 70),
+            Self::Warn => egui::Color32::from_rgb(140, 88, 0),
+            Self::Bad if dark => egui::Color32::from_rgb(255, 120, 110),
+            Self::Bad => egui::Color32::from_rgb(180, 25, 25),
+        }
+    }
+}
+
+/// 状態の色を付けたラベル
+///
+/// 色だけに頼らず、太字にして小さな文字でも読み取れるようにする。
+fn tone_label(ui: &mut egui::Ui, tone: Tone, text: impl Into<String>) {
+    let color = tone.color(ui.visuals());
+    ui.label(egui::RichText::new(text.into()).color(color).strong());
+}
+
+/// 状態を色付きのバッジで示す
+fn status_badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
+    let color = tone.color(ui.visuals());
+    egui::Frame::NONE
+        .fill(color.gamma_multiply(0.16))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.6)))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(color).strong());
+        });
 }
 
 /// tomyou のメイン画面
@@ -244,10 +296,13 @@ impl TomyouApp {
                 }
             }
             SessionEvent::OutputStarted(name) => {
-                if name == "Edamame" {
-                    self.edamame_output = true;
-                } else {
-                    self.imageflux_output = true;
+                // セッション終了の通知より後に届くことがあるため、配信中だけ反映する
+                if self.session.is_some() {
+                    if name == "Edamame" {
+                        self.edamame_output = true;
+                    } else {
+                        self.imageflux_output = true;
+                    }
                 }
                 self.log(format!("{name} への送信を開始しました"));
             }
@@ -276,6 +331,7 @@ impl TomyouApp {
                 self.fallback_registered = false;
                 self.fallback_error = None;
                 self.stream_info = None;
+                self.obs_snapshot = None;
                 self.log("停止しました");
             }
         }
@@ -376,11 +432,7 @@ impl eframe::App for TomyouApp {
                 ui.separator();
                 ui.label(format!("チャンネル: {}", self.config.channel_id));
                 ui.separator();
-                ui.label(
-                    egui::RichText::new(self.status.label())
-                        .color(self.status.color())
-                        .strong(),
-                );
+                status_badge(ui, self.status.label(), self.status.tone());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("ライセンス").clicked() {
                         self.show_license = true;
@@ -418,11 +470,11 @@ impl eframe::App for TomyouApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
             if let Some(error) = &self.startup_error {
-                ui.colored_label(egui::Color32::RED, format!("起動時の設定: {error}"));
+                tone_label(ui, Tone::Bad, format!("起動時の設定: {error}"));
                 ui.add_space(4.0);
             }
             if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::RED, error);
+                tone_label(ui, Tone::Bad, error.clone());
                 ui.add_space(4.0);
             }
             ui.horizontal(|ui| {
@@ -481,15 +533,15 @@ impl eframe::App for TomyouApp {
                                     }
                                     None => info.summary(),
                                 };
-                                let color = if problem.is_some() {
-                                    egui::Color32::RED
+                                let tone = if problem.is_some() {
+                                    Tone::Bad
                                 } else {
-                                    egui::Color32::GREEN
+                                    Tone::Good
                                 };
-                                ui.colored_label(color, text);
+                                tone_label(ui, tone, text);
                             }
                             None => {
-                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                                tone_label(ui, Tone::Idle, "待機中");
                             }
                         }
                         ui.end_row();
@@ -507,32 +559,32 @@ impl eframe::App for TomyouApp {
                                     }
                                     None => info.summary(),
                                 };
-                                let color = if problem.is_some() {
-                                    egui::Color32::RED
+                                let tone = if problem.is_some() {
+                                    Tone::Bad
                                 } else {
-                                    egui::Color32::GREEN
+                                    Tone::Good
                                 };
-                                ui.colored_label(color, text);
+                                tone_label(ui, tone, text);
                             }
                             None => {
-                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                                tone_label(ui, Tone::Idle, "待機中");
                             }
                         }
                         ui.end_row();
                         ui.label("B フレーム");
                         match &self.stream_info {
                             Some(info) => {
-                                let color = if info.video_frames == 0 {
-                                    egui::Color32::GRAY
+                                let tone = if info.video_frames == 0 {
+                                    Tone::Idle
                                 } else if info.bframe_problem().is_some() {
-                                    egui::Color32::RED
+                                    Tone::Bad
                                 } else {
-                                    egui::Color32::GREEN
+                                    Tone::Good
                                 };
-                                ui.colored_label(color, info.bframe_text());
+                                tone_label(ui, tone, info.bframe_text());
                             }
                             None => {
-                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                                tone_label(ui, Tone::Idle, "待機中");
                             }
                         }
                         ui.end_row();
@@ -540,19 +592,19 @@ impl eframe::App for TomyouApp {
                         match &self.stream_info {
                             Some(info) => match info.keyframe_text() {
                                 Some(text) => {
-                                    let color = if info.keyframe_problem().is_some() {
-                                        egui::Color32::RED
+                                    let tone = if info.keyframe_problem().is_some() {
+                                        Tone::Bad
                                     } else {
-                                        egui::Color32::GREEN
+                                        Tone::Good
                                     };
-                                    ui.colored_label(color, text);
+                                    tone_label(ui, tone, text);
                                 }
                                 None => {
-                                    ui.colored_label(egui::Color32::GRAY, "計測中");
+                                    tone_label(ui, Tone::Idle, "計測中");
                                 }
                             },
                             None => {
-                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                                tone_label(ui, Tone::Idle, "待機中");
                             }
                         }
                         ui.end_row();
@@ -562,15 +614,15 @@ impl eframe::App for TomyouApp {
                                 if info.video_frames == 0
                                     || info.keyframe_interval_ms.is_none()
                                 {
-                                    ui.colored_label(egui::Color32::GRAY, "計測中");
+                                    tone_label(ui, Tone::Idle, "計測中");
                                 } else if info.problems().is_empty() {
-                                    ui.colored_label(egui::Color32::GREEN, "OK");
+                                    tone_label(ui, Tone::Good, "OK");
                                 } else {
-                                    ui.colored_label(egui::Color32::RED, "要確認");
+                                    tone_label(ui, Tone::Bad, "要確認");
                                 }
                             }
                             _ => {
-                                ui.colored_label(egui::Color32::GRAY, "待機中");
+                                tone_label(ui, Tone::Idle, "待機中");
                             }
                         }
                         ui.end_row();
@@ -580,24 +632,26 @@ impl eframe::App for TomyouApp {
             ui.columns(2, |columns| {
                 columns[0].group(|ui| {
                     ui.label(egui::RichText::new("Edamame（主系）").strong());
-                    ui.label(if self.edamame_output {
-                        "送信中"
+                    let (text, tone) = if self.edamame_output {
+                        ("送信中", Tone::Good)
                     } else if self.session.is_some() {
-                        "接続待ち / 再接続中"
+                        ("接続待ち / 再接続中", Tone::Warn)
                     } else {
-                        "停止"
-                    });
+                        ("停止", Tone::Idle)
+                    };
+                    tone_label(ui, tone, text);
                     ui.label(format!("送信先: {}", self.config.publisher.rtmp_url));
                 });
                 columns[1].group(|ui| {
                     ui.label(egui::RichText::new("ImageFlux（予備系）").strong());
-                    ui.label(if self.imageflux_output {
-                        "WHIP 送信中"
+                    let (text, tone) = if self.imageflux_output {
+                        ("WHIP 送信中", Tone::Good)
                     } else if self.session.is_some() {
-                        "接続待ち / 再接続中"
+                        ("接続待ち / 再接続中", Tone::Warn)
                     } else {
-                        "停止"
-                    });
+                        ("停止", Tone::Idle)
+                    };
+                    tone_label(ui, tone, text);
                     if let Some(channel) = &self.imageflux_channel {
                         ui.label(format!("チャンネル: {channel}"));
                     }
@@ -610,24 +664,25 @@ impl eframe::App for TomyouApp {
                             }
                         });
                     }
-                    let (fallback_status, fallback_color) =
+                    let (fallback_status, fallback_tone) =
                         if !self.config.stream_credentials.enabled() {
-                            ("未設定", egui::Color32::GRAY)
+                            ("未設定", Tone::Idle)
                         } else if self.fallback_error.is_some() {
-                            ("失敗", egui::Color32::RED)
+                            ("失敗", Tone::Bad)
                         } else if self.fallback_registered {
-                            ("登録済み", egui::Color32::GREEN)
+                            ("登録済み", Tone::Good)
                         } else if self.session.is_some() {
-                            ("待機中", egui::Color32::YELLOW)
+                            ("待機中", Tone::Warn)
                         } else {
-                            ("未登録", egui::Color32::GRAY)
+                            ("未登録", Tone::Idle)
                         };
-                    ui.colored_label(
-                        fallback_color,
+                    tone_label(
+                        ui,
+                        fallback_tone,
                         format!("fallback 登録: {fallback_status}"),
                     );
                     if let Some(error) = &self.fallback_error {
-                        ui.colored_label(egui::Color32::RED, error);
+                        tone_label(ui, Tone::Bad, error.clone());
                     }
                 });
             });
@@ -645,7 +700,7 @@ impl eframe::App for TomyouApp {
                     status.skipped_frames
                 ));
                 if status.reconnecting {
-                    ui.colored_label(egui::Color32::YELLOW, "OBS が再接続中です");
+                    tone_label(ui, Tone::Warn, "OBS が再接続中です");
                 }
             }
         });
