@@ -183,7 +183,7 @@ NVEnc では NVIDIA Container Toolkit を用意して `--gpus all` を追加し�
 SRT は UDP、RTMP は TCP を使う。
 host ネットワークを使わない場合は入力用ポートを対応するプロトコルで公開し、controller への到達先もコンテナから接続できる URL に変える。
 
-## 動作と運用上の契約
+## 動作と運用上の注意点
 
 ### セグメントと暗号鍵
 

@@ -1,19 +1,19 @@
 # controller
 
-controller は、publisher が送るセグメントの正規データをメモリに保存し、採番、worker の管理、プレイリストの生成を担当する。
+controller は、publisher が送るセグメントの原本をメモリに保存し、採番、worker の管理、プレイリストの生成を担当する。
 セグメントの暗号化と鍵の配信は行わない。
 client が取得するセグメントの URL には worker の公開 URL を使い、worker 不在時に controller 自身を代替の配信先にはしない。
 
 ## 必要な環境
 
-- publisher と worker から controller の待ち受けへ到達できること
-- client からプレイリストの URL へ到達できること
-- `--public-url` が各 peer、worker、client から到達でき、このインスタンス固有の URL であること
+- publisher と worker から controller の待ち受けアドレスへ接続できること
+- client からプレイリストの URL へ接続できること
+- `--public-url` が各 peer、worker、client から接続でき、このインスタンス固有の URL であること
 - セグメントの保持に必要なメモリを確保すること（[容量の見積もり](./operations.md#パラメータ設計とメモリ見積もり)）
 
 controller は HTTP で待ち受ける。
 `--public-url` を HTTPS にしても TLS は有効にならないため、HTTPS で公開する場合は TLS 終端を別途用意する。
-認証のない GET と sync もあるため、公開範囲を決めてから起動する（[信頼境界](./operations.md#通信保護と信頼境界)）。
+認証のない GET と sync もあるため、公開する範囲を決めてから起動する（[通信の保護](./operations.md#通信の保護と公開範囲)）。
 
 ## 最小起動
 
@@ -42,7 +42,7 @@ curl --fail --show-error http://127.0.0.1:9000/internal/cluster/health
 
 `/health` はステータス `200` と本文 `ok` を返す。
 役割の確認には `/internal/cluster/health` の `role` と `leader_url` を使う。
-起動直後は leader が未確定で、業務 API が一時的に `503` を返すことがある。
+起動直後は leader が未確定で、配信用の API が一時的に `503` を返すことがある。
 worker と publisher を起動するまでは、応答できても映像を配信できる状態ではない。
 
 ## 設定
@@ -76,7 +76,7 @@ URL は `--bind` から自動生成しない。
 - 最初の PUT で channel と quality を作り、channel ごとにセグメント番号を `0` から割り当てる
 - 同じ時間帯の映像は全 quality で同じ `identifier` を使い、同じ番号にそろえる。
   異なる時間帯の映像に同じ識別子を使い回さない
-- 同じ quality に保存済みの識別子で同じバイト列を再 PUT すると既存の番号を返し、異なるバイト列は拒否する（暗号化指定の更新や属性の固定条件を含む再 PUT の契約は [HTTP API](./api.md#セグメント属性の一貫性と再登録の扱い) を参照する）
+- 同じ quality に保存済みの識別子で同じバイト列を再 PUT すると既存の番号を返し、異なるバイト列は拒否する（暗号化指定の更新や属性の固定条件を含む再 PUT の扱いは [HTTP API](./api.md#セグメント属性の一貫性と再登録の扱い) を参照する）
 - 同じ channel の `duration_ms` と、同じ quality の `bandwidth` は固定する。
   `resolution` は未設定なら後から指定できるが、一度決まった値は変更できない
 - channel の最初の `duration_ms` を秒に直して切り上げた値が、HLS の `#EXT-X-TARGETDURATION` になる
@@ -153,13 +153,13 @@ channel に外部のマスタープレイリスト URL を 1 つ登録すると�
 - 接続元の TCP の IP と channel から決まる値を割合と比較するため、リクエストごとの独立した乱数選択ではない。
   同じ IP と channel なら、割合が同じ間は同じ結果になる
 - `Forwarded` と `X-Forwarded-For` は参照しないため、NAT やリバースプロキシの配下では同じ接続元 IP の client が同じ判定になる
-- 外部 URL の到達性や配信状態は確認しない。
+- 外部 URL に接続できるかや配信状態は確認しない。
   外部配信を止めるときは登録を解除する
 
 ## 再起動と失敗時の扱い
 
 セグメント、採番、channel / quality の属性、暗号化指定、worker の登録、外部配信の登録はメモリにだけ保持する。
-再起動または leader 交代が起きたときの各主体の動作は次のとおりである。
+再起動または leader 交代が起きたときのそれぞれの動作は次のとおりである。
 
 - controller：保持していた状態をすべて失い、採番も `0` から始まる
 - worker：sync の `404` で再登録して手元のキャッシュを捨て、新しいセグメントを取り直す
@@ -167,7 +167,7 @@ channel に外部のマスタープレイリスト URL を 1 つ登録すると�
 - client：番号のリセットに追従できないプレイヤーは、再生を開始し直す
 
 publisher の停止と controller の再起動は、影響が異なる。
-publisher が止まっても controller は保存済みのセグメントを時刻だけで削除したり、公開範囲を自動的に失効させたりはしない。
+publisher が止まっても controller は保存済みのセグメントを時刻だけで削除したり、公開範囲を自動的に取り下げたりはしない。
 worker が最後の公開範囲を保持していれば、controller はその範囲のプレイリストを返し続ける場合がある。
 新規映像の到着は [メトリクス](./observability.md) で監視する。
 

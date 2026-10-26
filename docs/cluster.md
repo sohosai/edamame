@@ -82,7 +82,7 @@ metric が同じ場合は、正規化後の public URL の文字列を比較し�
 各 controller は同じ URL を自分と同じインスタンスとして扱うため、public URL を共有しない。
 
 cluster の起動直後は follower とし、最初の heartbeat の送信が 1 回分完了するまで leader URL を確定しない。
-この間の業務 API は `503 Service Unavailable` と `Retry-After: 1` を返す。
+この間の配信用 API は `503 Service Unavailable` と `Retry-After: 1` を返す。
 接触先が空なら追加の待ち時間は設けず、最初の選出で自分を leader にする。
 seed がすべて停止していても、初回の送信が完了すれば自分を leader にできる。
 
@@ -125,7 +125,7 @@ HTTPS の URL を指定する場合は、その URL で TLS 接続を受け付�
 
 ## 交代時の状態と復旧
 
-leader から follower に降格すると、処理中の業務リクエストの完了を待ってから、保存していた状態を全消去する。
+leader から follower に降格すると、処理中のリクエストの完了を待ってから、保存していた状態を全消去する。
 古い採番やセグメントファイルを、次の昇格後に持ち越さない。
 新しい leader は空の状態から始まり、セグメント番号は 0 からになる。
 暗号化の指定、外部配信の登録、worker の登録も失われるため、publisher と worker が登録し直す。

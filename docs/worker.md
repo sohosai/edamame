@@ -3,11 +3,11 @@
 worker は controller からセグメントファイルを取得し、メモリ上のキャッシュから client へ配信する。
 プレイリストの生成、公開範囲の決定、配信先の選択は controller が担当し、worker は登録と同期で自身の設定とキャッシュ状況を報告する。
 
-## 必要な環境と到達性
+## 必要な環境とネットワーク条件
 
 - ソースから起動する場合は、[導入手順](../README.md) に記載した Rust 環境を用意する
-- worker から `--controller-url` と、follower が転送先として返す leader の公開 URL に到達できること
-- client から `--public-url` に到達できること。
+- worker から `--controller-url` と、follower が転送先として返す leader の公開 URL へ接続できること
+- client から `--public-url` へ接続できること。
   `--bind` は待ち受けアドレスであり、公開 URL ではない
 - controller と同じ認証トークンを用意し、worker ごとに異なる `--worker-id` を指定すること
 
@@ -101,7 +101,7 @@ controller 側の公開条件は [controller の公開範囲の決定](./control
 - キャッシュはメモリ上だけに保持し、worker を再起動すると失われる
 - `--cache-limit` は `(channel_id, quality)` ごとのセグメント件数であり、上限を超えると番号の小さいものから削除する
 - 取得した古い番号が保存直後に上限超過で削除された場合は、その channel / quality のキャッシュをすべて捨てて取り直せるようにする
-- client が要求したセグメントがキャッシュにない場合は `404` を返し、そのリクエストを契機に controller へ取りに行くことはない。
+- client が要求したセグメントがキャッシュにない場合は `404` を返し、その場で controller へ取りに行くことはない。
   controller との通信が途切れても、キャッシュ済みのセグメントは引き続き配信する
 - この上限はバイト数でも、worker 全体のメモリ上限でもない。
   channel / quality の数、セグメントのサイズ、取得中のデータ、配信中に参照されるデータによって実際の使用量が変わる

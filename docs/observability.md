@@ -1,19 +1,19 @@
 # 可観測性
 
-controller と worker は、OpenTelemetry のメトリクスを OTLP/gRPC で送信し、HTTP の `/health` で死活監視に応答する。
-publisher の計装とトレースの出力には対応していない。
+controller と worker は、OpenTelemetry のメトリクスを OTLP/gRPC で送信し、HTTP の `/health` でヘルスチェックに応答する。
+publisher のメトリクス送信とトレースの出力には対応していない。
 ダッシュボード、アラートの閾値、通知先は利用する監視基盤で設定する。
 
 ## メトリクスの送信
 
-送信先を指定した場合だけ計装を有効にする。
+送信先を指定した場合だけメトリクスの送信を有効にする。
 アプリ自体は Prometheus 用の `/metrics` を提供しないため、Prometheus で収集する場合は OpenTelemetry Collector などで変換する。
 
 - 送信方式は OTLP/gRPC とし、OTLP/HTTP には切り替わらない
 - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` を優先し、未設定の場合だけ `OTEL_EXPORTER_OTLP_ENDPOINT` を使う
 - 選ばれた送信先が空の場合、または `OTEL_SDK_DISABLED=true` の場合は送信しない
 - 初期化に失敗しても controller と worker の動作は継続し、標準エラーへ警告を出す
-- アプリ終了時は未送信のメトリクスの送信を試みてから計装を終了する
+- アプリ終了時は未送信のメトリクスの送信を試みてから終了する
 
 ### 環境変数
 
@@ -66,7 +66,7 @@ Gauge は現在の状態、Counter はプロセス内の累計を表し、再起
 | `edamame.controller.errors` | Counter | なし | `operation` | `ingest` / `register` / `sync` / `external` の処理エラー数 |
 
 worker と channel の Gauge は、controller が現在保持する登録情報と配信情報について記録する。
-follower は業務リクエストを転送するため、leader と同じ worker / channel の Gauge があるとは限らない。
+follower は配信用のリクエストを転送するため、leader と同じ worker / channel の Gauge があるとは限らない。
 公開遅延は実際の映像の撮影時刻やプレイヤーの再生位置を測った値ではない。
 まだ何も公開していない quality では、保持している先頭番号の 1 つ前を公開末尾として扱うが、番号が `0` の場合は `0` とする。
 
@@ -88,10 +88,10 @@ cache の Gauge は、キャッシュ内にセグメントがある channel / qu
 ### 監視するときの制約
 
 `up` は稼働中に `1` を記録するが、停止時に `0` を送るものではない。
-Collector や監視基盤に最後の値が残ることがあるため、直近のサンプル時刻や `/health` への到達性も確認する。
+Collector や監視基盤に最後の値が残ることがあるため、直近のサンプル時刻や `/health` へ接続できるかも確認する。
 同期遅延と配信停止は、`last_sync_age`、`last_success_age`、`last_ingest_age`、`published_lag` を使って判断する。
 
-## 死活監視用の HTTP API
+## ヘルスチェック用の HTTP API
 
 controller と worker は、HTTP リクエストを受け付けられる場合にステータス `200`、本文 `ok` を返す。
 認証とメトリクスの送信設定は不要である。
@@ -180,7 +180,7 @@ OTEL_METRIC_EXPORT_INTERVAL=5000 \
 ### 受信を確認する
 
 アプリの起動ログに `OpenTelemetry metrics enabled` があることを確認する。
-このログは計装の初期化成功を示すが、Collector への送信成功を保証しないため、出力も確認する。
+このログはメトリクス送信の初期化成功を示すが、Collector への送信成功を保証しないため、出力も確認する。
 
 ```bash
 curl --fail --show-error http://127.0.0.1:9000/health
@@ -217,5 +217,5 @@ docker compose --env-file /dev/null -f compose.observability.yaml down
 - アプリの標準エラーに `[telemetry]` の警告が出ていないか確認する
 - `docker compose --env-file /dev/null -f compose.observability.yaml logs otel-collector` で Collector の起動失敗や受信エラーを確認する
 - `4317` / `4318` / `8889` 番ポートが既存プロセスと競合していないか確認する
-- `/metrics` に系列があって監視画面にない場合は、収集先への到達性と監視基盤側のラベル、収集間隔、表示時間範囲を確認する
+- `/metrics` に系列があって監視画面にない場合は、収集先へ接続できるかと監視基盤側のラベル、収集間隔、表示時間範囲を確認する
 - プロセス停止後も最後の値が残る場合は、Collector の保持設定と監視基盤の古いサンプルの扱いを確認する

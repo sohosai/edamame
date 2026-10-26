@@ -26,10 +26,10 @@ flowchart LR
 ## 必要な環境
 
 - Rust 1.99.1（edition 2024）でビルドを確認済み。より古い版は未検証
-- ネットワークの到達性：
-  - `publisher` と `worker` から、`controller` の HTTP アドレスへ到達できること
-  - `client` から、`controller` のアドレス（プレイリスト取得用）へ到達できること
-  - `client` から、`worker` の公開 URL（`--public-url`、セグメント取得用）へ到達できること
+- ネットワークの接続条件：
+  - `publisher` と `worker` から、`controller` の HTTP アドレスへ接続できること
+  - `client` から、`controller` のアドレス（プレイリスト取得用）へ接続できること
+  - `client` から、`worker` の公開 URL（`--public-url`、セグメント取得用）へ接続できること
 - `edamame-publisher` を動かす場合は、SRT と RTMP に対応した `ffmpeg` と `ffprobe`、およびエンコーダに応じた GPU 環境：
   - NVEnc（`h264_nvenc`）を使う場合：NVIDIA の GPU とドライバ
   - QSV（`h264_qsv`）を使う場合：Intel の GPU、VA-API ドライバ、oneVPL の GPU ランタイム
@@ -202,7 +202,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## 運用上の契約と制約
+## 運用上の注意点と制約
 
 - **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。プロセスの再起動や leader の交代で、これらのデータは失われる。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
 - **容量上限と自動削除** ：`controller` は、メモリ上のセグメントの合計サイズが `--storage-capacity` を超えると、書き込んだ順に古いセグメントから削除する。プレイリストの公開範囲にあるセグメントまで削除されると、プレイリストの取得には `422 Unprocessable Entity` が返る。必要なメモリ容量は [運用](./docs/operations.md) の計算式で見積もり、余裕を持たせて設定する。

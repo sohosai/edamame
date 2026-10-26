@@ -9,11 +9,11 @@
 | --- | --- | --- | --- | --- |
 | controller | `GET /internal/cluster/health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
 | controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
-| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
+| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | セグメント原本の登録と連番（`sequence`）の採番 |
 | controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（必須） | 外部配信のマスタープレイリスト URL の登録と解除 |
 | controller | `PUT /workers/{worker_id}` | worker | Bearer（必須） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
 | controller | `POST /workers/{worker_id}/sync` | worker | なし | キャッシュ状況の報告と不足セグメント（`fetch_segments`）の取得指示 |
-| controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | 正規セグメントファイルの取得（キャッシュ用） |
+| controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | セグメント原本の取得（キャッシュ用） |
 | controller | `GET /channels/{channel_id}/master.m3u8` | client / publisher | なし | マスタープレイリストの取得（または外部配信への `302` リダイレクト） |
 | controller | `GET /channels/{channel_id}/{quality}.m3u8` | client / publisher | なし | 画質（`quality`）別のメディアプレイリストの取得 |
 | worker | `GET /segments/{channel_id}/{quality}/{filename}` | client | なし | キャッシュ済みセグメントファイルの配信 |
@@ -48,9 +48,9 @@
 - leader での基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
 - 予期しない内部エラーは `500 Internal Server Error` を返す
 
-## 死活監視
+## ヘルスチェック
 
-controller と worker は、死活監視用の `GET /health` を提供する。
+controller と worker は、ヘルスチェック用の `GET /health` を提供する。
 
 | プロセス | パス | 応答 |
 | --- | --- | --- |
@@ -149,7 +149,7 @@ client は 307 に追従し、sync では POST と JSON body を保持する。
 Authorization、Content-Type、body を保持し、leader の status、応答ヘッダー、body を返す。
 入力の検証と採番は leader が行い、follower は保存しない。
 
-leader URL が未確定の間は、各業務 API に次の応答を返す。
+leader URL が未確定の間は、各配信用 API に次の応答を返す。
 PUT の認証はこの判定より先に行う。
 PUT の中継失敗でも同じ 503 を返し、heartbeat の再確認を要求する。
 
@@ -168,7 +168,7 @@ worker は sync の 404 で再登録し、client はプレイリストの 404 �
 PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}&iv={iv}
 ```
 
-`publisher` が正規セグメントファイルを登録する。
+`publisher` がセグメントファイルの原本を登録する。
 `channel_id` と `quality` を事前に作成する専用の API はなく、最初のセグメントファイルを `PUT` した時点で自動的に作られる。
 `Authorization: Bearer {token}` ヘッダに、`controller` と同じ token を必ず付ける。
 
@@ -388,7 +388,7 @@ sequenceDiagram
 GET /segments/{channel_id}/{quality}/{filename}
 ```
 
-`worker` が `sync` の `fetch_segments` に従って正規セグメントファイルを取得するときに使う。
+`worker` が `sync` の `fetch_segments` に従ってセグメントファイルの原本を取得するときに使う。
 `controller` はメモリに保存しているセグメントファイルを返す。
 容量を超えて削除されたセグメントファイルと、`controller` の再起動で失われたセグメントファイルは `404 Not Found` になる。
 
