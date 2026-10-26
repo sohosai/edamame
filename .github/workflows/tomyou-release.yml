@@ -1,0 +1,158 @@
+name: tomyou release
+
+on:
+  push:
+    tags:
+      - "tomyou-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (example: tomyou-v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tomyou-linux-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: tomyou-windows-x86_64.zip
+          - name: macos-universal
+            os: macos-latest
+            target: universal
+            archive: tomyou-macos-universal.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libx11-dev libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libssl-dev \
+            libxkbcommon-x11-0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS targets
+        if: matrix.target == 'universal'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "universal" ]; then
+            cargo build --release -p tomyou --target aarch64-apple-darwin
+            cargo build --release -p tomyou --target x86_64-apple-darwin
+            lipo -create \
+              -output tomyou \
+              target/aarch64-apple-darwin/release/tomyou \
+              target/x86_64-apple-darwin/release/tomyou
+          else
+            cargo build --release -p tomyou --target "${{ matrix.target }}"
+          fi
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" tomyou
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}" tomyou
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/tomyou.exe" -DestinationPath "dist/${{ matrix.archive }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set release tag
+        id: release
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          version="${tag#tomyou-v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Rename assets
+        shell: bash
+        run: |
+          cd dist
+          version="${{ steps.release.outputs.version }}"
+          for file in tomyou-linux-x86_64.tar.gz tomyou-windows-x86_64.zip tomyou-macos-universal.tar.gz; do
+            mv "$file" "tomyou-${version}${file#tomyou}"
+          done
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: tomyou ${{ steps.release.outputs.version }}
+          body: |
+            tomyou の Windows / macOS / Linux バイナリです。
+
+            - Linux: x86_64
+            - Windows: x86_64
+            - macOS: Universal (Apple Silicon / Intel)
+
+            GStreamer は同梱していません。各 OS に GStreamer と `whipclientsink` を用意してください。
+            導入手順と運用上の注意は [docs/tomyou.md](https://github.com/${{ github.repository }}/blob/${{ steps.release.outputs.tag }}/docs/tomyou.md) を参照してください。
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

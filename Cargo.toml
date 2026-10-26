@@ -5,22 +5,32 @@ members = [
   "crates/edamame-controller",
   "crates/edamame-worker",
   "crates/edamame-publisher",
+  "crates/tomyou",
 ]
 resolver = "3"
+exclude = ["vendor/shiguredo_rtmp"]
+
+[patch.crates-io]
+# flashVer を省略する再接続を拒否しない受信処理を使う。
+shiguredo_rtmp = { path = "vendor/shiguredo_rtmp" }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [workspace.dependencies]
 aes = "0.8"
+anyhow = "1"
 axum = "0.8"
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 bytes = "1"
 cbc = { version = "0.1", features = ["alloc"] }
 clap = { version = "4", features = ["derive", "env"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
 getrandom = "0.3"
 libc = "0.2"
+obws = "0.15"
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "metrics"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "rt-tokio"] }
@@ -29,11 +39,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "tokio", "ring", "tls12", "webpki-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+shiguredo_rtmp = "2026.1.0-canary.6"
 signal-hook = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs"] }
 tokio-rustls = "0.26"
 tokio-stream = "0.1"
+thiserror = "2"
 toml = "0.9"
 tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 webpki-roots = "1"
+winit = { version = "0.30", features = ["x11", "wayland"] }

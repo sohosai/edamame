@@ -557,7 +557,7 @@ pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str,
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let health: serde_json::Value = client
-            .get(format!("{base_url}/health"))
+            .get(format!("{base_url}/internal/cluster/health"))
             .send()
             .await
             .unwrap()

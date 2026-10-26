@@ -11,83 +11,60 @@ Edamame は、ライブ HLS 配信用のインメモリ配信サーバである�
 - **worker** は、一定間隔で `controller` と同期（`sync`）し、不足しているセグメントファイルを取得してメモリ上にキャッシュする。`client` が再生する `.ts` ファイルの配信を担当し、複数台並べることで配信帯域の負荷を分散する。
 - **client** は、視聴者が使う HLS プレイヤーである。`controller` からプレイリスト（`.m3u8`）を取得し、その中に書かれた `worker` の URL からセグメントファイル（`.ts`）を取得して再生する。
 
-```text
-publisher ─── PUT セグメント ──────────────────────> controller
-worker    ─── PUT 登録 / POST sync / GET セグメント ─> controller
-client    ─── GET プレイリスト (.m3u8) ────────────> controller
-client    ─── GET セグメント (.ts) ────────────────> worker
+```mermaid
+flowchart LR
+    encoder["映像送信側<br>SRT / RTMP"] -->|"ライブ映像"| publisher
+    publisher -->|"PUT セグメント (.ts)"| controller
+    worker -->|"PUT 登録 / POST sync / GET セグメント"| controller
+    client -->|"GET プレイリスト (.m3u8)"| controller
+    client -->|"GET セグメント (.ts)"| worker
+    client -.->|"GET 暗号鍵（key_uri 使用時）"| keys["外部の鍵配信サーバー"]
 ```
 
-設計、HTTP API、運用、暗号化の仕組みは [docs/README.md](./docs/README.md) で説明する。
+各コンポーネントの設定と動作、HTTP API、運用の詳細は [ドキュメント案内](./docs/README.md) から辿れる。
 
 ## 必要な環境
 
-- Rust 1.85 以降（edition 2024）
-- ネットワークの到達性：
-  - `publisher` と `worker` から、`controller` の HTTP アドレスへ到達できること
-  - `client` から、`controller` のアドレス（プレイリスト取得用）へ到達できること
-  - `client` から、`worker` の公開 URL（`--public-url`、セグメント取得用）へ到達できること
+- Rust 1.99.1（edition 2024）でビルドを確認済み。`tomyou` は Rust 1.93 以降を要求する
+- ネットワークの接続条件：
+  - `publisher` と `worker` から、`controller` の HTTP アドレスへ接続できること
+  - `client` から、`controller` のアドレス（プレイリスト取得用）へ接続できること
+  - `client` から、`worker` の公開 URL（`--public-url`、セグメント取得用）へ接続できること
 - `edamame-publisher` を動かす場合は、SRT と RTMP に対応した `ffmpeg` と `ffprobe`、およびエンコーダに応じた GPU 環境：
   - NVEnc（`h264_nvenc`）を使う場合：NVIDIA の GPU とドライバ
   - QSV（`h264_qsv`）を使う場合：Intel の GPU、VA-API ドライバ、oneVPL の GPU ランタイム
   - ソフトウェアエンコード（`libx264`）や映像コピー（`copy`）だけで動かす場合は GPU 不要
 
-## ビルド
-
-```bash
-cargo build --workspace
-```
-
 ## 最短での起動手順
 
-1 つ目のターミナルで `controller` を起動する。
+リポジトリのルートで `compose.yaml` を使い、`controller` と `worker` を起動する。
+ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使い、ポートもホストの `127.0.0.1` にだけ公開する。
 
 ```bash
-cargo run -p edamame-controller -- \
-  --bind 127.0.0.1:9000 \
-  --public-url http://127.0.0.1:9000 \
-  --storage-capacity 512MiB \
-  --playlist-segments 6 \
-  --sync-interval-ms 1000 \
-  --sync-timeout-ms 10000 \
-  --publish-wait-ms 2000 \
-  --auth-token example-token \
-  --cors-origin '*'
+docker compose up -d
+docker compose ps
 ```
 
-2 つ目のターミナルで `worker` を起動する。
+起動を確認する。
 
 ```bash
-cargo run -p edamame-worker -- \
-  --worker-id worker-a \
-  --bind 127.0.0.1:9001 \
-  --public-url http://127.0.0.1:9001 \
-  --controller-url http://127.0.0.1:9000 \
-  --cache-limit 12 \
-  --auth-token example-token \
-  --cors-origin '*'
+curl --fail --show-error http://127.0.0.1:9000/health
+curl --fail --show-error http://127.0.0.1:9001/health
 ```
+
+停止する場合は `docker compose down` を使う。
+別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更し、`ports` の `127.0.0.1` を外す。
+`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[controller の冗長化](./docs/cluster.md#起動と-dns-の設定)）。
+
+ソースから直接起動する場合は [controller](./docs/controller.md#最小起動) と [worker](./docs/worker.md#最小の起動) の手順を使う。
 
 ### 必須条件と任意条件
 
-`controller` のオプションは次のとおりである。
+各オプションの必須、任意、既定値、制約は、コンポーネントごとの文書にまとめている。
 
-- 必須：`--bind`、`--public-url`、`--auth-token`、`--storage-capacity`、`--playlist-segments`（直近 6 セグメント以上）、`--sync-interval-ms`、`--sync-timeout-ms`
-- 任意：
-  - `--publish-wait-ms`：新しいセグメントをプレイリストに載せる前の待ち時間。省略すると `2000`（ミリ秒）を使い、起動時に警告を出す
-  - `--metric`：leader の優先度。省略すると `100` になる
-  - `--seed`：最初に接触する controller の URL。省略した機体も後からの参加を受け付ける
-  - `--cors-origin`：ブラウザからの `GET` を許可する origin。省略すると CORS ヘッダを返さず、起動時に警告を出す
-  - `--external-min-percent`：外部配信を登録したときに振り分ける最小の割合（%）。省略すると `1` になる
-
-`worker` のオプションは次のとおりである。
-
-- 必須：`--worker-id`、`--bind`、`--public-url`（プレイリストに載せる `client` 向けの公開 URL）、`--controller-url`、`--cache-limit`
-- 任意：
-  - `--weight`：複数 `worker` 間の配信比率。省略すると `1` になる
-  - `--auth-token`：CLI は省略を受け付けるが、`controller` への登録には必須の token
-  - `--cors-origin`：ブラウザからの `GET` を許可する origin
-  - `--tls-cert` / `--tls-key`、または `--acme` 系オプション：`worker` 自身で TLS を終端する場合に指定する
+- controller：[設定](./docs/controller.md#設定)
+- worker：[CLI と環境変数](./docs/worker.md#cli-と環境変数)
+- publisher：[設定リファレンス](./docs/publisher.md#設定リファレンス)
 
 各オプションは環境変数でも指定できる。
 環境変数の名前は、オプション名の `-` を `_` に変えて先頭に `EDAMAME_` を付けたものにする（例：`--bind` は `EDAMAME_BIND`）。
@@ -96,17 +73,17 @@ cargo run -p edamame-worker -- \
 `controller` の `--auth-token` は必須であり、`worker` と `publisher` にも同じ token を設定する。
 `--public-url` には、peer、worker、client のすべてから到達できる機体固有の URL を指定する。
 cluster の処理は常に有効であり、seed を省略した場合は自分 1 台で始まる。
-全オプションの詳細と TLS の設定手順は [運用](./docs/operations.md) で説明する。
 
 複数台に増やすときは、参加する機体の `--seed` に起動済みの controller の URL を指定する。
 leader の優先度を変える場合は `--metric` を指定する。
-DNS の共有名から各機へ到達させる起動例は [運用](./docs/operations.md#controller-を冗長化する)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
+DNS の共有名から各機へ到達させる起動例は [controller の冗長化](./docs/cluster.md#起動と-dns-の設定)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
 
 ## publisher
 
 `crates/edamame-publisher` は、SRT または RTMP で受け取ったライブ映像を処理するプロセスである。
 `ffmpeg` で複数画質（`quality`）の MPEG-TS セグメントに変換し、AES-128-CBC で暗号化して `controller` へ `PUT` し続ける。
 GPU と `ffmpeg` を使うため、通常は `controller` や `worker` とは別のホストで動かす。
+GPU と入力の設定が必要なため、既定の `compose.yaml` には含めていない。
 
 ```bash
 cargo run --release -p edamame-publisher -- \
@@ -118,49 +95,27 @@ cargo run --release -p edamame-publisher -- \
 設定ファイルの書き方、暗号化と鍵登録の仕組み、失敗時の扱いは [publisher](./docs/publisher.md) で説明する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
 
-## Docker での起動
+## tomyou
 
-`controller` と `worker` を Docker Compose で動かす最小構成（`compose.yaml`）の例を示す。
-ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使う。
+`crates/tomyou` は、拠点の OBS から Edamame と ImageFlux へ同時に映像を送る GUI アプリである。
+OBS の配信先をローカルの RTMP サーバへ変更し、Edamame 向けの RTMP と ImageFlux 向けの WHIP を別プロセスで送る。
 
-```yaml
-services:
-  controller:
-    image: ghcr.io/sohosai/edamame-controller:latest
-    environment:
-      EDAMAME_BIND: 0.0.0.0:9000
-      EDAMAME_PUBLIC_URL: http://127.0.0.1:9000
-      EDAMAME_STORAGE_CAPACITY: "512MiB"
-      EDAMAME_PLAYLIST_SEGMENTS: 6
-      EDAMAME_SYNC_INTERVAL_MS: 1000
-      EDAMAME_SYNC_TIMEOUT_MS: 10000
-      EDAMAME_PUBLISH_WAIT_MS: 2000
-      EDAMAME_AUTH_TOKEN: example-token
-      EDAMAME_CORS_ORIGIN: "*"
-    ports:
-      - "9000:9000"
-
-  worker:
-    image: ghcr.io/sohosai/edamame-worker:latest
-    depends_on:
-      - controller
-    environment:
-      EDAMAME_WORKER_ID: worker-a
-      EDAMAME_BIND: 0.0.0.0:9001
-      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
-      EDAMAME_CONTROLLER_URL: http://controller:9000
-      EDAMAME_CACHE_LIMIT: 12
-      EDAMAME_AUTH_TOKEN: example-token
-      EDAMAME_CORS_ORIGIN: "*"
-    ports:
-      - "9001:9001"
+```bash
+cargo run --release -p tomyou
+cargo run --release -p tomyou -- --config /path/to/config.toml
 ```
 
-別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更する。
-`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[運用](./docs/operations.md#controller-を冗長化する)）。
+設定、OBS の条件、入力チェック、GStreamer の必要機能、ImageFlux の扱い、fallback 登録、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
+`tomyou-v*` タグを push すると GitHub Actions が Windows / macOS / Linux のバイナリをビルドし、GitHub Release に添付する。
+ImageFlux のプレイリストと鍵は、live2025-server へ fallback として登録する。
+fallback 登録を使う場合は、`[stream_credentials]` に live2025-server のベース URL と `STREAM_INGEST_TOKEN` を指定する。
+通常用の URL と鍵の登録は、既存の `publisher` の設定を使う。
+
+## publisher のコンテナイメージ
 
 `publisher` のコンテナイメージには `ffmpeg` と Intel の GPU ドライバが含まれるため、Dockerfile の `publisher` ターゲットを指定してビルドする。
 NVIDIA の GPU は NVIDIA Container Toolkit（`--gpus all`）で、Intel の GPU は `--device /dev/dri:/dev/dri` でコンテナに割り当てる。
+起動例と設定は [publisher](./docs/publisher.md) を参照する。
 
 ```bash
 docker build --target publisher -t edamame-publisher .
@@ -173,39 +128,47 @@ docker build --target publisher -t edamame-publisher .
 
 1. テスト用のセグメントファイルを `controller` に `PUT` する。URL 末尾の `segment-1` は、`publisher` がセグメントごとに付ける任意の識別子である。
 
-```bash
-printf 'segment-1' > /tmp/segment-1.ts
-curl -i -X PUT \
-  -H 'Authorization: Bearer example-token' \
-  --data-binary @/tmp/segment-1.ts \
-  'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
-```
+   ```bash
+   printf 'segment-1' > /tmp/segment-1.ts
+   curl -i -X PUT \
+     -H 'Authorization: Bearer example-token' \
+     --data-binary @/tmp/segment-1.ts \
+     'http://127.0.0.1:9000/segments/live/720p/segment-1?duration_ms=6000&bandwidth=3000000&resolution=1280x720'
+   ```
 
-`controller` は新しい識別子に `0` 始まりのセグメント番号を割り当て、レスポンス JSON の `sequence`（この例では `{"sequence": 0}`）として返す。
+   `controller` は新しい識別子に `0` 始まりのセグメント番号を割り当て、レスポンス JSON の `sequence`（この例では `{"sequence": 0}`）として返す。
 
 2. `controller` からプレイリストを取得する。
 
-`PUT` したセグメントは、すぐにはプレイリストに出ない。
-`--publish-wait-ms`（上の例では 2000 ミリ秒）が過ぎ、さらに `worker` が `sync` でそのセグメントを取得し終えるとプレイリストに反映される。
-反映される前のリクエストには `503 Service Unavailable` が返るため、`--retry` を付けて取得する。
+   `PUT` したセグメントは、すぐにはプレイリストに出ない。
+   `--publish-wait-ms`（上の例では 2000 ミリ秒）が過ぎ、さらに `worker` が `sync` でそのセグメントを取得し終えるとプレイリストに反映される。
+   反映される前のリクエストには `503 Service Unavailable` が返るため、`--retry` を付けて取得する。
 
-```bash
-curl -i --retry 30 --retry-delay 1 --retry-connrefused \
-  http://127.0.0.1:9000/channels/live/master.m3u8
+   ```bash
+   curl -i --retry 30 --retry-delay 1 --retry-connrefused \
+     http://127.0.0.1:9000/channels/live/master.m3u8
 
-curl -i --retry 30 --retry-delay 1 --retry-connrefused \
-  http://127.0.0.1:9000/channels/live/720p.m3u8
-```
+   curl -i --retry 30 --retry-delay 1 --retry-connrefused \
+     http://127.0.0.1:9000/channels/live/720p.m3u8
+   ```
 
 3. メディアプレイリスト（`720p.m3u8`）に `worker` の公開 URL（`http://127.0.0.1:9001/segments/live/720p/0.ts`）が出力されていることを確認する。続けて、その URL からセグメントファイルを取得する。
 
-```bash
-curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
-```
+   ```bash
+   curl -i http://127.0.0.1:9001/segments/live/720p/0.ts
+   ```
 
 `503` が解消しない場合は、`worker` が起動しており、`--controller-url` と `--auth-token` が `controller` の設定と一致しているかを確認する。
 
 ## 開発
+
+ソースからビルドする場合は次のコマンドを使う。
+
+```bash
+cargo build --workspace
+```
+
+変更後は、整形、静的解析、テストを実行する。
 
 ```bash
 cargo fmt --check
@@ -213,7 +176,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## 運用上の契約と制約
+## 運用上の注意点と制約
 
 - **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。プロセスの再起動や leader の交代で、これらのデータは失われる。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
 - **容量上限と自動削除** ：`controller` は、メモリ上のセグメントの合計サイズが `--storage-capacity` を超えると、書き込んだ順に古いセグメントから削除する。プレイリストの公開範囲にあるセグメントまで削除されると、プレイリストの取得には `422 Unprocessable Entity` が返る。必要なメモリ容量は [運用](./docs/operations.md) の計算式で見積もり、余裕を持たせて設定する。
