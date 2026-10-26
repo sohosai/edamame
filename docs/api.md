@@ -1,19 +1,19 @@
 # HTTP API
 
 この文書では、`controller` と `worker` が提供する HTTP API の仕様を説明する。
-全体構成と用語の定義は [docs/README.md](./README.md) で説明する。
+全体構成と各文書の役割は [ドキュメント案内](./README.md) を参照する。
 
 ## エンドポイント一覧
 
 | 提供元 | メソッドとパス | 呼び出し元 | 認証 | 用途 |
 | --- | --- | --- | --- | --- |
-| controller | `GET /health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
+| controller | `GET /internal/cluster/health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
 | controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
-| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | 正規セグメントファイルの登録と連番（`sequence`）の採番 |
+| controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | セグメント原本の登録と連番（`sequence`）の採番 |
 | controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（必須） | 外部配信のマスタープレイリスト URL の登録と解除 |
 | controller | `PUT /workers/{worker_id}` | worker | Bearer（必須） | `worker` の公開 URL と重みの登録、および `sync` 間隔の取得 |
 | controller | `POST /workers/{worker_id}/sync` | worker | なし | キャッシュ状況の報告と不足セグメント（`fetch_segments`）の取得指示 |
-| controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | 正規セグメントファイルの取得（キャッシュ用） |
+| controller | `GET /segments/{channel_id}/{quality}/{filename}` | worker | なし | セグメント原本の取得（キャッシュ用） |
 | controller | `GET /channels/{channel_id}/master.m3u8` | client / publisher | なし | マスタープレイリストの取得（または外部配信への `302` リダイレクト） |
 | controller | `GET /channels/{channel_id}/{quality}.m3u8` | client / publisher | なし | 画質（`quality`）別のメディアプレイリストの取得 |
 | worker | `GET /segments/{channel_id}/{quality}/{filename}` | client | なし | キャッシュ済みセグメントファイルの配信 |
@@ -48,12 +48,24 @@
 - leader での基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
 - 予期しない内部エラーは `500 Internal Server Error` を返す
 
+## ヘルスチェック
+
+controller と worker は、ヘルスチェック用の `GET /health` を提供する。
+
+| プロセス | パス | 応答 |
+| --- | --- | --- |
+| controller | `/health` | `200 ok` |
+| worker | `/health` | `200 ok` |
+| worker（`path_prefix` あり） | `{path_prefix}/health` | `200 ok` |
+
+認証は不要で、プロセスが HTTP リクエストを受け付けられることだけを返す。依存先の状態は確認しない。
+
 ## controller の API
 
 ### インスタンスの役割を取得する
 
 ```http
-GET /health
+GET /internal/cluster/health
 ```
 
 認証なしで常に 200 と、そのインスタンス自身の状態を返す。
@@ -118,7 +130,7 @@ JSON body の上限は 4 MiB とする。
 
 ### follower の転送と leader 未確定時の応答
 
-`/health` と heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
+`/health`、`/internal/cluster/health`、heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
 Location は leader の public URL に元の API の path と query を連結する。
 HTTP と HTTPS の両方を許可する。
 public URL に接頭辞がある場合、API はその下に公開され、転送では leader の接頭辞に置き換わる。
@@ -137,7 +149,7 @@ client は 307 に追従し、sync では POST と JSON body を保持する。
 Authorization、Content-Type、body を保持し、leader の status、応答ヘッダー、body を返す。
 入力の検証と採番は leader が行い、follower は保存しない。
 
-leader URL が未確定の間は、各業務 API に次の応答を返す。
+leader URL が未確定の間は、各配信用 API に次の応答を返す。
 PUT の認証はこの判定より先に行う。
 PUT の中継失敗でも同じ 503 を返し、heartbeat の再確認を要求する。
 
@@ -156,7 +168,7 @@ worker は sync の 404 で再登録し、client はプレイリストの 404 �
 PUT /segments/{channel_id}/{quality}/{identifier}?duration_ms={duration_ms}&bandwidth={bandwidth}&resolution={width}x{height}&key_uri={key_uri}&iv={iv}
 ```
 
-`publisher` が正規セグメントファイルを登録する。
+`publisher` がセグメントファイルの原本を登録する。
 `channel_id` と `quality` を事前に作成する専用の API はなく、最初のセグメントファイルを `PUT` した時点で自動的に作られる。
 `Authorization: Bearer {token}` ヘッダに、`controller` と同じ token を必ず付ける。
 
@@ -315,18 +327,16 @@ POST /workers/{worker_id}/sync
 `sync` は `worker` が開始する pull 方式の同期処理である。
 `controller` から `worker` へセグメントファイルのバイト列を直接 `PUT` することはない。
 
-```text
-worker                           controller
-  |                                       |
-  |-- POST /workers/{id}/sync ----------->|
-  |   cached_segments, fetching_segments  |
-  |                                       |  公開範囲を評価する
-  |<-- fetch_segments --------------------|
-  |                                       |
-  |-- GET /segments/... ----------------->|
-  |<-- bytes -----------------------------|
-  |                                       |
-  |   次の sync でキャッシュ内容を報告する |
+```mermaid
+sequenceDiagram
+    participant W as worker
+    participant C as controller
+    W->>C: POST /workers/{id}/sync（cached_segments, fetching_segments）
+    C->>C: 公開範囲を評価する
+    C-->>W: fetch_segments
+    W->>C: GET /segments/...
+    C-->>W: バイト列
+    Note over W: 次の sync でキャッシュ内容を報告する
 ```
 
 リクエスト：
@@ -364,7 +374,7 @@ worker                           controller
 `worker` は再取得したバイト列でキャッシュを上書きする。
 
 `controller` は `sync` を受け取るたびに、各 `quality` の公開範囲を再評価する。
-最初の未公開セグメントファイルが `PUT` された時刻から `--publish-wait-ms` の公開待ちが経過したセグメントを公開可能とし、`sync` が `--sync-timeout-ms` 以内に届いている `worker` が連続してキャッシュしている最新の公開可能範囲を、その `quality` の公開範囲にする。
+公開待ちと連続範囲の選び方は [controller の公開範囲の決定](./controller.md#公開範囲の決定) を参照する。
 
 ステータス：
 
@@ -378,7 +388,7 @@ worker                           controller
 GET /segments/{channel_id}/{quality}/{filename}
 ```
 
-`worker` が `sync` の `fetch_segments` に従って正規セグメントファイルを取得するときに使う。
+`worker` が `sync` の `fetch_segments` に従ってセグメントファイルの原本を取得するときに使う。
 `controller` はメモリに保存しているセグメントファイルを返す。
 容量を超えて削除されたセグメントファイルと、`controller` の再起動で失われたセグメントファイルは `404 Not Found` になる。
 
