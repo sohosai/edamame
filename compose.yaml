@@ -1,0 +1,30 @@
+services:
+  controller:
+    image: ghcr.io/sohosai/edamame-controller:latest
+    environment:
+      EDAMAME_BIND: 0.0.0.0:9000
+      EDAMAME_PUBLIC_URL: http://127.0.0.1:9000
+      EDAMAME_STORAGE_CAPACITY: "512MiB"
+      EDAMAME_PLAYLIST_SEGMENTS: "6"
+      EDAMAME_SYNC_INTERVAL_MS: "1000"
+      EDAMAME_SYNC_TIMEOUT_MS: "10000"
+      EDAMAME_PUBLISH_WAIT_MS: "2000"
+      EDAMAME_AUTH_TOKEN: example-token
+      EDAMAME_CORS_ORIGIN: "*"
+    ports:
+      - "127.0.0.1:9000:9000"
+
+  worker:
+    image: ghcr.io/sohosai/edamame-worker:latest
+    depends_on:
+      - controller
+    environment:
+      EDAMAME_WORKER_ID: worker-a
+      EDAMAME_BIND: 0.0.0.0:9001
+      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
+      EDAMAME_CONTROLLER_URL: http://controller:9000
+      EDAMAME_CACHE_LIMIT: "12"
+      EDAMAME_AUTH_TOKEN: example-token
+      EDAMAME_CORS_ORIGIN: "*"
+    ports:
+      - "127.0.0.1:9001:9001"

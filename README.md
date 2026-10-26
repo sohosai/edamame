@@ -35,41 +35,28 @@ flowchart LR
   - QSV（`h264_qsv`）を使う場合：Intel の GPU、VA-API ドライバ、oneVPL の GPU ランタイム
   - ソフトウェアエンコード（`libx264`）や映像コピー（`copy`）だけで動かす場合は GPU 不要
 
-## ビルド
-
-```bash
-cargo build --workspace
-```
-
 ## 最短での起動手順
 
-1 つ目のターミナルで `controller` を起動する。
+リポジトリのルートで `compose.yaml` を使い、`controller` と `worker` を起動する。
+ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使い、ポートもホストの `127.0.0.1` にだけ公開する。
 
 ```bash
-cargo run -p edamame-controller -- \
-  --bind 127.0.0.1:9000 \
-  --public-url http://127.0.0.1:9000 \
-  --storage-capacity 512MiB \
-  --playlist-segments 6 \
-  --sync-interval-ms 1000 \
-  --sync-timeout-ms 10000 \
-  --publish-wait-ms 2000 \
-  --auth-token example-token \
-  --cors-origin '*'
+docker compose up -d
+docker compose ps
 ```
 
-2 つ目のターミナルで `worker` を起動する。
+起動を確認する。
 
 ```bash
-cargo run -p edamame-worker -- \
-  --worker-id worker-a \
-  --bind 127.0.0.1:9001 \
-  --public-url http://127.0.0.1:9001 \
-  --controller-url http://127.0.0.1:9000 \
-  --cache-limit 12 \
-  --auth-token example-token \
-  --cors-origin '*'
+curl --fail --show-error http://127.0.0.1:9000/health
+curl --fail --show-error http://127.0.0.1:9001/health
 ```
+
+停止する場合は `docker compose down` を使う。
+別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更し、`ports` の `127.0.0.1` を外す。
+`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[controller の冗長化](./docs/cluster.md#起動と-dns-の設定)）。
+
+ソースから直接起動する場合は [controller](./docs/controller.md#最小起動) と [worker](./docs/worker.md#最小の起動) の手順を使う。
 
 ### 必須条件と任意条件
 
@@ -96,6 +83,7 @@ DNS の共有名から各機へ到達させる起動例は [controller の冗長
 `crates/edamame-publisher` は、SRT または RTMP で受け取ったライブ映像を処理するプロセスである。
 `ffmpeg` で複数画質（`quality`）の MPEG-TS セグメントに変換し、AES-128-CBC で暗号化して `controller` へ `PUT` し続ける。
 GPU と `ffmpeg` を使うため、通常は `controller` や `worker` とは別のホストで動かす。
+GPU と入力の設定が必要なため、既定の `compose.yaml` には含めていない。
 
 ```bash
 cargo run --release -p edamame-publisher -- \
@@ -107,49 +95,11 @@ cargo run --release -p edamame-publisher -- \
 設定ファイルの書き方、暗号化と鍵登録の仕組み、失敗時の扱いは [publisher](./docs/publisher.md) で説明する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
 
-## Docker での起動
-
-`controller` と `worker` を Docker Compose で動かす最小構成（`compose.yaml`）の例を示す。
-ホスト上の `client` から再生する前提で、公開 URL には `127.0.0.1` を使う。
-
-```yaml
-services:
-  controller:
-    image: ghcr.io/sohosai/edamame-controller:latest
-    environment:
-      EDAMAME_BIND: 0.0.0.0:9000
-      EDAMAME_PUBLIC_URL: http://127.0.0.1:9000
-      EDAMAME_STORAGE_CAPACITY: "512MiB"
-      EDAMAME_PLAYLIST_SEGMENTS: 6
-      EDAMAME_SYNC_INTERVAL_MS: 1000
-      EDAMAME_SYNC_TIMEOUT_MS: 10000
-      EDAMAME_PUBLISH_WAIT_MS: 2000
-      EDAMAME_AUTH_TOKEN: example-token
-      EDAMAME_CORS_ORIGIN: "*"
-    ports:
-      - "9000:9000"
-
-  worker:
-    image: ghcr.io/sohosai/edamame-worker:latest
-    depends_on:
-      - controller
-    environment:
-      EDAMAME_WORKER_ID: worker-a
-      EDAMAME_BIND: 0.0.0.0:9001
-      EDAMAME_PUBLIC_URL: http://127.0.0.1:9001
-      EDAMAME_CONTROLLER_URL: http://controller:9000
-      EDAMAME_CACHE_LIMIT: 12
-      EDAMAME_AUTH_TOKEN: example-token
-      EDAMAME_CORS_ORIGIN: "*"
-    ports:
-      - "9001:9001"
-```
-
-別ホストの `client` から再生する場合は、`worker` の `EDAMAME_PUBLIC_URL` を `client` から到達できるホスト名または IP アドレスに変更する。
-`controller` を複数台で動かす場合は、各 controller の `EDAMAME_PUBLIC_URL` を peer、worker、client のすべてから到達できる名前にする（[controller の冗長化](./docs/cluster.md#起動と-dns-の設定)）。
+## publisher のコンテナイメージ
 
 `publisher` のコンテナイメージには `ffmpeg` と Intel の GPU ドライバが含まれるため、Dockerfile の `publisher` ターゲットを指定してビルドする。
 NVIDIA の GPU は NVIDIA Container Toolkit（`--gpus all`）で、Intel の GPU は `--device /dev/dri:/dev/dri` でコンテナに割り当てる。
+起動例と設定は [publisher](./docs/publisher.md) を参照する。
 
 ```bash
 docker build --target publisher -t edamame-publisher .
@@ -195,6 +145,14 @@ docker build --target publisher -t edamame-publisher .
 `503` が解消しない場合は、`worker` が起動しており、`--controller-url` と `--auth-token` が `controller` の設定と一致しているかを確認する。
 
 ## 開発
+
+ソースからビルドする場合は次のコマンドを使う。
+
+```bash
+cargo build --workspace
+```
+
+変更後は、整形、静的解析、テストを実行する。
 
 ```bash
 cargo fmt --check

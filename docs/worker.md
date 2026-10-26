@@ -18,6 +18,8 @@ controller との内部通信は信頼できるネットワーク内に置く。
 
 ## 最小の起動
 
+controller と worker をまとめて起動する場合は、リポジトリのルートで `docker compose up -d` を実行する（[compose.yaml](../compose.yaml)）。
+以下では worker だけをソースから起動する。
 リポジトリのルートで実行する。
 次の例は、同じホストの `http://127.0.0.1:9000` で controller が待ち受け、認証トークンが `example-token` の場合である。
 別ホストの client から利用する場合は、待ち受けアドレスと公開 URL を環境に合わせる。

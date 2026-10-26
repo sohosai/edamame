@@ -17,6 +17,8 @@ controller は HTTP で待ち受ける。
 
 ## 最小起動
 
+controller と worker をまとめて起動する場合は、リポジトリのルートで `docker compose up -d` を実行する（[compose.yaml](../compose.yaml)）。
+以下では controller だけをソースから起動する。
 リポジトリのルートで起動する。
 この例は同一ホスト上の検証用であり、外部の client には `127.0.0.1` の代わりに到達可能な名前を使う。
 
