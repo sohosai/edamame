@@ -71,6 +71,8 @@ ImageFlux の要素だけが足りない場合は Edamame の送信を継続す�
 Edamame の要素が足りない場合は配信を開始しない。
 
 GStreamer の実行ファイルは、設定の `gstreamer.path`、`TOMYOU_GST_LAUNCH`、PATH、OS 標準の場所の順に探す。
+Windows では GUI から起動する `gst-inspect-1.0` と `gst-launch-1.0` を `CREATE_NO_WINDOW` 付きで起動し、コンソールウィンドウを開かない。
+機能検査だけで十数回起動するため、抑止しないと起動のたびにウィンドウが並ぶ。
 
 ## 入力チェック
 

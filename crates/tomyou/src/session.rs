@@ -526,6 +526,8 @@ async fn run_output(
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // 中継のたびにコンソールウィンドウが開かないようにする
+        gstreamer::hide_console_window(command.as_std_mut());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

@@ -10,6 +10,25 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tracing::info;
 
+/// GUI アプリから起動した GStreamer のコンソールアプリに、ウィンドウを開かせない
+///
+/// コンソールを持たないプロセスからコンソールアプリを起動すると、
+/// Windows は子プロセス用に新しいコンソールウィンドウを作る。
+/// 機能検査とパイプラインの起動のたびに窓が開くため、作成を抑止する。
+pub(crate) fn hide_console_window(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // CREATE_NO_WINDOW
+        command.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
+}
+
 /// AAC を Opus に変換する前に使うデコーダ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDecoder {
@@ -344,14 +363,18 @@ fn choose_audio_decoder(has_avdec: bool, has_faad: bool) -> Option<AudioDecoder>
 }
 
 fn has_element(inspect: &Path, element: &str) -> bool {
-    Command::new(inspect)
+    let mut command = Command::new(inspect);
+    hide_console_window(&mut command);
+    command
         .arg(element)
         .output()
         .is_ok_and(|output| output.status.success())
 }
 
 fn whip_pads_ok(inspect: &Path) -> bool {
-    let Ok(output) = Command::new(inspect).arg("whipclientsink").output() else {
+    let mut command = Command::new(inspect);
+    hide_console_window(&mut command);
+    let Ok(output) = command.arg("whipclientsink").output() else {
         return false;
     };
     let text = String::from_utf8_lossy(&output.stdout);
