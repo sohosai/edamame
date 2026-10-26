@@ -296,8 +296,8 @@ bandwidth = 12000000
 }
 
 #[test]
-fn restarts_the_channel_with_non_aac_audio() {
-    // 入力の不備でチャンネルが止まっても、待ち受けを再開して次の入力を待つことを確かめる
+fn rejects_non_aac_audio_without_stopping_the_channel() {
+    // 入力の不備を受けても channel を止めず、次の入力を待つことを確かめる
     let dir = TestDir::new("non-aac");
     let first_port = free_port();
     let second_port = free_port();
@@ -333,20 +333,23 @@ preset = "ultrafast"
     let _first = Sender::start(first_port, "640x360", 30, 30, "aac", 60);
     let _second = Sender::start(second_port, "640x360", 30, 30, "mp2", 60);
 
-    let stopped = publisher.wait_for_log(
-        "channel=1B stopped: audio codec must be aac",
+    let rejected = publisher.wait_for_log(
+        "channel=1B rejected the input: audio codec must be aac",
         Duration::from_secs(30),
     );
     assert!(
-        stopped,
-        "aac 以外の音声で 1B が止まりません: {}",
+        rejected,
+        "aac 以外の音声で 1B が拒否されません: {}",
         publisher.log()
     );
-    // 止まったチャンネルは待ち受けを再開し、次の入力を待つ
-    let restarted = publisher.wait_for_log(
-        "channel=1B restarting the channel after",
-        Duration::from_secs(10),
+    assert!(
+        !publisher.log().contains("channel=1B stopped"),
+        "aac 以外の音声で 1B が止まりました: {}",
+        publisher.log()
     );
+    // 拒否した channel は ffmpeg を起動し直し、次の入力を待つ
+    let restarted =
+        publisher.wait_for_log("channel=1B starting ffmpeg run=2", Duration::from_secs(10));
     assert!(
         restarted,
         "1B の待ち受けが再開しません: {}",
@@ -370,14 +373,14 @@ preset = "ultrafast"
     assert_eq!(
         status.code(),
         Some(0),
-        "channel を再起動したときの終了コード: {status}"
+        "入力の拒否後に publisher が終了しました: {status}"
     );
 }
 
 #[test]
 fn recovers_after_rejecting_an_input_that_does_not_match_the_rendition() {
-    // 設定と違う解像度の入力でチャンネルが止まったあと、
-    // 正しい解像度の入力で配信を再開できることを確かめる
+    // 設定と違う解像度の入力で ffmpeg を起動し直したあと、
+    // publisher を止めずに正しい解像度で配信を再開できることを確かめる
     let dir = TestDir::new("recover-resolution");
     let srt_port = free_port();
     let controller = Controller::start("test-token");
@@ -410,24 +413,31 @@ preset = "ultrafast"
         publisher.log()
     );
 
-    // レンディションと違う解像度を送り、チャンネルが止まるのを待つ
+    // レンディションと違う解像度を送り、入力が拒否されるのを待つ
     let wrong = Sender::start(srt_port, "320x180", 30, 30, "aac", 20);
-    let stopped = publisher.wait_for_log(
-        "channel=1A stopped: copied video resolution must be 640x360",
+    let rejected = publisher.wait_for_log(
+        "channel=1A rejected the input: copied video resolution must be 640x360",
         Duration::from_secs(30),
     );
     assert!(
-        stopped,
-        "解像度が合わない入力で 1A が止まりません: {}",
+        rejected,
+        "解像度が合わない入力で 1A が拒否されません: {}",
+        publisher.log()
+    );
+    assert!(
+        !publisher.log().contains("channel=1A stopped"),
+        "解像度が合わない入力で 1A が止まりました: {}",
         publisher.log()
     );
     drop(wrong);
-
-    // 待ち受けが再開したら、正しい解像度を送る
-    let restarted = publisher.wait_for_log(
-        "channel=1A restarting the channel after",
-        Duration::from_secs(10),
+    assert!(
+        controller.sequences("1A", "main").is_empty(),
+        "拒否した解像度のセグメントが保存されています"
     );
+
+    // ffmpeg が起動し直したら、正しい解像度を送る
+    let restarted =
+        publisher.wait_for_log("channel=1A starting ffmpeg run=2", Duration::from_secs(10));
     assert!(
         restarted,
         "1A の待ち受けが再開しません: {}",
@@ -444,6 +454,95 @@ preset = "ultrafast"
         "正しい解像度の入力で配信が再開しません: {}",
         publisher.log()
     );
+    assert!(publisher.is_running(), "publisher が終了しました");
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+#[test]
+fn publishes_after_rejecting_an_rtmp_input_that_does_not_match_the_rendition() {
+    // RTMP で解像度が合わない入力を拒否したあとも、正しい入力で publish できることを確かめる
+    let dir = TestDir::new("recover-rtmp-resolution");
+    let rtmp_port = free_port();
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1B"
+input_url = "rtmp://127.0.0.1:{rtmp_port}/live/1B"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 12000000
+"#
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+
+    let wrong = Sender::start_rtmp(rtmp_port, "1B", "320x180", 30, 30, "aac", 20);
+    let rejected = publisher.wait_for_log(
+        "channel=1B rejected the input: copied video resolution must be 640x360",
+        Duration::from_secs(30),
+    );
+    assert!(
+        rejected,
+        "RTMP の解像度が合わない入力で 1B が拒否されません: {}",
+        publisher.log()
+    );
+    assert!(
+        !publisher.log().contains("channel=1B stopped"),
+        "RTMP の解像度が合わない入力で 1B が止まりました: {}",
+        publisher.log()
+    );
+    drop(wrong);
+    assert!(
+        controller.sequences("1B", "main").is_empty(),
+        "拒否した解像度のセグメントが保存されています"
+    );
+
+    let restarted =
+        publisher.wait_for_log("channel=1B starting ffmpeg run=2", Duration::from_secs(10));
+    assert!(
+        restarted,
+        "1B の RTMP の待ち受けが再開しません: {}",
+        publisher.log()
+    );
+    let _right = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 120);
+
+    let published = wait_for(
+        || !controller.sequences("1B", "main").is_empty(),
+        Duration::from_secs(40),
+    );
+    assert!(
+        published,
+        "正しい解像度の RTMP 入力で配信が再開しません: {}",
+        publisher.log()
+    );
+    assert!(publisher.is_running(), "publisher が終了しました");
 
     let status = publisher.stop();
     assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
