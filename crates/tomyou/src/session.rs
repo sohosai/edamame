@@ -344,7 +344,10 @@ async fn prepare_imageflux(
         ui.clone(),
     );
 
-    let channel_id = created.channel_id.clone();
+    // プレイリストの取得には ImageFlux のチャンネル ID を使い、
+    // fallback 登録には live2025-server が知っているチャンネル名を使う
+    let imageflux_channel_id = created.channel_id.clone();
+    let registration_channel_id = config.channel_id.clone();
     let playlist_client = client.clone();
     let registration = config
         .stream_credentials
@@ -353,14 +356,17 @@ async fn prepare_imageflux(
     let registration_enabled = registration.is_some();
     let registration_stop = stop_rx;
     tokio::spawn(async move {
-        match playlist_client.wait_for_playlist(&channel_id).await {
+        match playlist_client
+            .wait_for_playlist(&imageflux_channel_id)
+            .await
+        {
             Ok(url) => {
                 let _ = ui.send(SessionEvent::ImageFluxPlaylist(url.clone()));
                 if let Some(settings) = registration {
                     register_fallback(
                         playlist_client,
                         settings,
-                        channel_id,
+                        registration_channel_id,
                         url,
                         registration_stop,
                         ui,
