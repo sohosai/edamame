@@ -1,315 +1,221 @@
 # 可観測性
 
-Edamame の controller と worker は OpenTelemetry metrics と health endpoint を実装済みです。
-publisher の計装と traces は Phase 2 で対応します。
+controller と worker は、OpenTelemetry のメトリクスを OTLP/gRPC で送信し、HTTP の `/health` でヘルスチェックに応答する。
+publisher のメトリクス送信とトレースの出力には対応していない。
+ダッシュボード、アラートの閾値、通知先は利用する監視基盤で設定する。
 
-## 現在の構成
+## メトリクスの送信
 
-```text
-edamame-controller ─┐
-                    ├─ OTLP/gRPC ─> OTel Collector ─> Prometheus ─> Grafana
-edamame-worker ─────┘                 (iromono)
-```
+送信先を指定した場合だけメトリクスの送信を有効にする。
+アプリ自体は Prometheus 用の `/metrics` を提供しないため、Prometheus で収集する場合は OpenTelemetry Collector などで変換する。
 
-- controller / worker は OTLP/gRPC で metrics を送る
-- OTel Collector は Prometheus exporter で metrics を公開する
-- Prometheus の `edamame` job が Collector を scrape する
-- Prometheus の `edamame-health` job が blackbox_exporter 経由で controller / worker の `/health` を probe する
-- Grafana の `Edamame` フォルダで可視化する
-- 通知は既存の Discord contact point `infra 死活監視` を使う
-- traces と publisher metrics はまだない
+- 送信方式は OTLP/gRPC とし、OTLP/HTTP には切り替わらない
+- `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` を優先し、未設定の場合だけ `OTEL_EXPORTER_OTLP_ENDPOINT` を使う
+- 選ばれた送信先が空の場合、または `OTEL_SDK_DISABLED=true` の場合は送信しない
+- 初期化に失敗しても controller と worker の動作は継続し、標準エラーへ警告を出す
+- アプリ終了時は未送信のメトリクスの送信を試みてから終了する
 
-本番の送信先:
-
-```text
-OTEL_EXPORTER_OTLP_ENDPOINT=http://iromono:4317
-```
-
-Grafana:
-
-```text
-http://iromono:3000/d/edamame-overview
-```
-
-## メトリクス
-
-### Controller
-
-| メトリクス | 種類 | ラベル | 説明 |
-| --- | --- | --- | --- |
-| `edamame.controller.up` | Gauge | なし | controller の稼働状態 |
-| `edamame.controller.worker.last_sync_age` | Gauge (s) | `worker_id` | worker の最終同期からの経過時間 |
-| `edamame.controller.worker.weight` | Gauge | `worker_id` | worker の重み |
-| `edamame.controller.channel.last_ingest_age` | Gauge (s) | `channel_id` | channel の最終セグメント受信からの経過時間 |
-| `edamame.controller.channel.target_duration` | Gauge (s) | `channel_id` | channel のセグメント長 |
-| `edamame.controller.channel.published_lag` | Gauge (s) | `channel_id` | 公開遅延。最終受信からの経過時間と未公開セグメント数から算出する |
-| `edamame.controller.segments.ingested` | Counter | `channel_id`, `quality` | 新規に取り込んだセグメント数 |
-| `edamame.controller.segments.published` | Counter | `channel_id`, `quality` | 新規に公開したセグメント数 |
-| `edamame.controller.errors` | Counter | `operation` | controller のエラー数。`operation` は `ingest` / `register` / `sync` / `external` |
-
-### Worker
-
-| メトリクス | 種類 | ラベル | 説明 |
-| --- | --- | --- | --- |
-| `edamame.worker.up` | Gauge | なし | worker の稼働状態 |
-| `edamame.worker.controller.last_success_age` | Gauge (s) | なし | controller への登録または sync が最後に成功してからの経過時間 |
-| `edamame.worker.cache.head_sequence` | Gauge | `channel_id`, `quality` | キャッシュしている最新セグメントの sequence |
-| `edamame.worker.cache.segments` | Gauge | `channel_id`, `quality` | キャッシュしているセグメント数 |
-| `edamame.worker.segments.downloaded` | Counter | `channel_id`, `quality` | controller から取得したセグメント数 |
-| `edamame.worker.segments.served` | Counter | `channel_id`, `quality` | 視聴者へ配信したセグメント数 |
-| `edamame.worker.errors` | Counter | `operation` | worker のエラー数。`operation` は `register` / `sync` / `download` |
-
-Prometheus 上では、OTel の counter に `_total` が付き、unit `s` は `_seconds` になります。
-例えば `edamame.worker.cache.segments` は `edamame_worker_cache_segments`、`edamame.controller.errors` は `edamame_controller_errors_total` になります。
-
-### リソース属性
-
-| 属性 | Prometheus での扱い |
-| --- | --- |
-| `service.name` | Collector が `job` に変換する |
-| `service.instance.id` | Collector が `instance` に変換する |
-| `service.version` | `service_version` として残る |
-| `env` | Prometheus の scrape 設定で `dev` を付与する |
-
-worker の `service.instance.id` は `worker_id` です。
-controller の `service.instance.id` は `EDAMAME_INSTANCE_ID`、`HOSTNAME`、`COMPUTERNAME` の順で決まります。
-
-## Health endpoint
-
-controller と worker は、死活監視用の HTTP endpoint を提供します。
-
-| プロセス | パス | 応答 |
-| --- | --- | --- |
-| controller | `GET /health` | `200 ok` |
-| worker | `GET /health` | `200 ok` |
-| worker（path prefix あり） | `GET {path_prefix}/health` | `200 ok` |
-
-- 認証は不要です。プロセスが HTTP リクエストを受け付けられることだけを返します。
-- controller は `--bind` の port（既定の例では 9000）、worker は `--bind` の port（既定の例では 9001）で待ち受けます。
-- worker の `path_prefix` は `--public-url` のパスから決まります。リバースプロキシが prefix を付ける構成では、prefix 付きの health も利用できます。
-- health は依存先（controller、storage、ffmpeg など）の readiness ではありません。worker の同期遅延や channel の停止は metrics のアラートで検知します。
-- blackbox_exporter の `http_2xx` module が 200 を成功として扱います。自己署名証明書の worker を一時的に監視する場合だけ `http_2xx_insecure` を使います。
-
-### Probe 対象の設定
-
-Prometheus の `edamame-health` job は `prometheus/targets/edamame-health.yml` を file_sd で読みます。
-blackbox_exporter から到達できる URL を設定してください。
-
-```yaml
-- targets: ["http://controller.example:9000/health"]
-  labels:
-    env: "prod"
-    device: "edamame-controller"
-- targets: ["http://worker.example:9001/health"]
-  labels:
-    env: "prod"
-    device: "edamame-worker"
-```
-
-- `device` は Discord 通知とダッシュボードの表示名に使います。
-- 自己署名証明書を使う場合だけ `probe_module: "http_2xx_insecure"` を追加します。通常は指定しません。
-- `targets` が空の場合、health probe は実行されません。対象を追加するまで health アラートは no data のため発火しません。
-
-## Grafana ダッシュボード
-
-- フォルダ: `Edamame`
-- UID: `edamame-overview`
-- データソース: Prometheus `cfyat2m83vbpcd`
-- 変数: `env`、`channel_id`、`quality`
-
-パネルの構成:
-
-- 概要: controller up、同期中の worker 数、ingest / publish レート、error レート
-- Controller: worker の最終同期経過時間、weight、channel の最終受信・公開遅延・セグメント長、channel / quality ごとの流量、operation ごとのエラー
-- Worker: worker up、controller への最終成功からの経過時間、cache の head sequence とセグメント数、download / serve レート、operation ごとのエラー
-- Health: blackbox_exporter から見た controller / worker の `/health` 応答
-
-## アラート
-
-`Edamame` フォルダに以下のルールを provisioning しています。
-通知先は既存の Discord contact point `infra 死活監視` です。
-
-| UID | 条件 | 継続時間 | 重要度 |
-| --- | --- | --- | --- |
-| `edamame-collector-down` | Prometheus が OTel Collector を scrape できない | 2 分 | critical |
-| `edamame-controller-down` | controller の稼働状態が停止、またはメトリクスを取得できない | 2 分 | critical |
-| `edamame-worker-sync-stale` | controller から見て worker の最終同期が 60 秒以上前 | 3 分 | critical |
-| `edamame-channel-ingest-stale` | channel の最終受信が、セグメント長の 5 倍 + 30 秒を超えている | 5 分 | warning |
-| `edamame-published-lag` | channel の公開遅延が、セグメント長の 10 倍 + 30 秒を超えている | 5 分 | warning |
-| `edamame-errors` | controller / worker のエラー回数が直近 5 分で増加している | 1 分 | warning |
-| `edamame-health-probe` | blackbox_exporter から `/health` を取得できない | 2 分 | critical |
-
-補足:
-
-- `edamame-controller-down` 以外は、メトリクスが存在しない場合を `OK` として扱い、空のメトリクスで通知しない
-- `edamame-health-probe` も、probe 対象が未設定でメトリクスが存在しない場合は `OK` として扱う
-- worker のプロセス停止は、worker の `up` ではなく controller 側の `worker.last_sync_age` で検知する
-- controller の停止は Collector が最後の値を保持するため、検知が遅れる場合がある
-- health probe は controller / worker の HTTP 応答だけを確認する。worker の同期遅延や channel の停止は metrics のアラートで検知する
-- 通知メッセージは `device` → `worker_id` → `channel_id` → `instance` → `job` の順で対象を表示する
-- 意図した発火テストは未実施。通知が実際に Discord へ送られるため、実施する場合は事前に確認する
-
-## ローカル確認用スタック
-
-Grafana と OTLP の受け口（Tempo と Prometheus を含む）を 1 つのコンテナで動かす、開発用のスタックを用意している。
-`grafana/otel-lgtm` を使う。
-
-```bash
-docker compose -f compose.observability.yaml up -d
-```
-
-公開する port:
-
-| 用途 | アドレス |
-| --- | --- |
-| Grafana | http://127.0.0.1:3001 |
-| OTLP (gRPC) | 127.0.0.1:4317 |
-| OTLP (HTTP) | 127.0.0.1:4318 |
-
-- ホストの `127.0.0.1` にだけ公開する
-- Grafana はログイン不要
-- 既存の Grafana と競合する場合は `GRAFANA_PORT` で変更する（既定は 3001）
-- データは `lgtm-data` ボリュームに残る
-
-起動の確認:
-
-```bash
-docker ps --filter name=edamame-lgtm
-curl http://127.0.0.1:3001/api/health
-```
-
-停止と削除:
-
-```bash
-docker compose -f compose.observability.yaml stop   # 停止（データは残る）
-docker compose -f compose.observability.yaml down   # コンテナとネットワークを削除
-```
-
-ローカルの Grafana は iromono の Grafana とは別物です。
-`compose.observability.yaml` のスタックには `Edamame` ダッシュボードを provisioning していないため、ローカルでは Explore でメトリクスを確認します。
-
-## アプリの送信先をローカルに向ける
-
-アプリを起動する前に、送信先をローカルの OTLP 受け口に上書きする。
-外部サービス向けの `OTEL_EXPORTER_OTLP_ENDPOINT` が既に設定されている環境では、上書きしないとローカルには届かない。
-
-PowerShell:
-
-```powershell
-$env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:4317"
-$env:OTEL_METRIC_EXPORT_INTERVAL = "5000"
-edamame-controller --bind 127.0.0.1:9000 --storage-capacity 512MiB --playlist-segments 6 --sync-interval-ms 1000 --sync-timeout-ms 10000
-```
-
-```powershell
-$env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:4317"
-$env:OTEL_METRIC_EXPORT_INTERVAL = "5000"
-edamame-worker --worker-id worker-a --bind 127.0.0.1:9001 --public-url http://127.0.0.1:9001 --controller-url http://127.0.0.1:9000 --cache-limit 12
-```
-
-bash:
-
-```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
-OTEL_METRIC_EXPORT_INTERVAL=5000 \
-  edamame-controller ...
-```
-
-環境変数:
+### 環境変数
 
 | 環境変数 | 説明 |
 | --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | 送信先。`http://iromono:4317` のように scheme と port まで含める。未指定または空のときは送信しない |
-| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics 専用の送信先。指定時は `OTEL_EXPORTER_OTLP_ENDPOINT` より優先される |
-| `OTEL_SDK_DISABLED` | `true` を指定すると送信しない |
-| `OTEL_METRIC_EXPORT_INTERVAL` | metrics の送信間隔（ミリ秒）。アプリの既定は 10000 |
-| `OTEL_SERVICE_NAME` | `service.name` の上書き（省略時は `edamame-controller` / `edamame-worker`） |
-| `OTEL_EXPORTER_OTLP_HEADERS` | 送信先が要求するヘッダー（`key=value` をカンマ区切り） |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 共通の送信先。例：`http://127.0.0.1:4317`。metrics 専用の送信先が未設定の場合に使う |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics 専用の送信先。空文字を指定すると、共通の送信先が設定されていても送信しない |
+| `OTEL_SDK_DISABLED` | 前後の空白を除き、大文字小文字を区別せず `true` の場合に送信を無効にする |
+| `OTEL_METRIC_EXPORT_INTERVAL` | 送信間隔をミリ秒で指定する。既定は `10000`。未設定、整数でない値、`100` 未満の値は既定値を使う |
+| `OTEL_SERVICE_NAME` | `service.name` を上書きする。未設定または空の場合は `edamame-controller` / `edamame-worker` を使う |
+| `EDAMAME_INSTANCE_ID` | controller の `service.instance.id` を指定する。worker では使わない |
+| `OTEL_EXPORTER_OTLP_HEADERS` | 送信時のヘッダーを `key=value` のカンマ区切りで指定する |
+| `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | metrics 専用のヘッダー。指定時は `OTEL_EXPORTER_OTLP_HEADERS` より優先される |
 
-`OTEL_EXPORTER_OTLP_ENDPOINT` に scheme がない場合は `http://` が補われる。
+送信先には scheme、ホスト、ポートを含める。
+scheme がない場合は `http://` を補う。
+ローカル確認で送信先を切り替える場合は、優先される `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` を設定する。
 
-## 確認する
+### リソース属性
 
-### Grafana
+| 属性 | 値 |
+| --- | --- |
+| `service.name` | `edamame-controller` または `edamame-worker`。`OTEL_SERVICE_NAME` で上書きできる |
+| `service.instance.id` | controller は下記の環境変数、worker は `--worker-id` の値 |
+| `service.version` | アプリのパッケージバージョン |
 
-1. http://iromono:3000 を開く
-2. `Edamame` フォルダの `Edamame` ダッシュボードを開く
-3. `env`、`channel`、`quality` を必要に応じて絞り込む
-4. controller / worker を起動し、セグメントを流して値が動くことを確認する
+controller の instance ID は、最初に設定されている `EDAMAME_INSTANCE_ID`、`HOSTNAME`、`COMPUTERNAME` の値から決める。
+選ばれた値が空白だけの場合や、すべて未設定の場合は `controller` を使う。
+複数の controller を監視する場合は、各機で異なる `EDAMAME_INSTANCE_ID` を指定する。
+`env` などの環境識別用ラベルはアプリから送らない。
 
-### Prometheus API で確認する
+## メトリクス一覧
+
+表の名前は OpenTelemetry で送信する名前である。
+Gauge は現在の状態、Counter はプロセス内の累計を表し、再起動するとリセットされる。
+状態を表す Gauge は 5 秒ごとに記録し、送信は `OTEL_METRIC_EXPORT_INTERVAL` の間隔で行う。
+
+### controller
+
+| メトリクス | 種類 | 単位 | ラベル | 説明 |
+| --- | --- | --- | --- | --- |
+| `edamame.controller.up` | Gauge | なし | なし | 記録時に `1` を出す |
+| `edamame.controller.worker.last_sync_age` | Gauge | 秒 | `worker_id` | worker の最終同期からの経過時間 |
+| `edamame.controller.worker.weight` | Gauge | なし | `worker_id` | worker の重み |
+| `edamame.controller.channel.last_ingest_age` | Gauge | 秒 | `channel_id` | channel で最後にセグメントを新規保存してからの経過時間 |
+| `edamame.controller.channel.target_duration` | Gauge | 秒 | `channel_id` | channel の設定されたセグメント長。HLS の整数の `#EXT-X-TARGETDURATION` とは異なり、ミリ秒を秒に換算した値 |
+| `edamame.controller.channel.published_lag` | Gauge | 秒 | `channel_id` | 最終保存からの経過時間に、各 quality の最新番号と公開末尾の番号差の最大値 × セグメント長を加えた値 |
+| `edamame.controller.segments.ingested` | Counter | なし | `channel_id`, `quality` | 新規に取り込んだセグメント数 |
+| `edamame.controller.segments.published` | Counter | なし | `channel_id`, `quality` | 公開範囲の更新で新たに範囲へ入ったセグメント数 |
+| `edamame.controller.errors` | Counter | なし | `operation` | `ingest` / `register` / `sync` / `external` の処理エラー数 |
+
+worker と channel の Gauge は、controller が現在保持する登録情報と配信情報について記録する。
+follower は配信用のリクエストを転送するため、leader と同じ worker / channel の Gauge があるとは限らない。
+公開遅延は実際の映像の撮影時刻やプレイヤーの再生位置を測った値ではない。
+まだ何も公開していない quality では、保持している先頭番号の 1 つ前を公開末尾として扱うが、番号が `0` の場合は `0` とする。
+
+### worker
+
+| メトリクス | 種類 | 単位 | ラベル | 説明 |
+| --- | --- | --- | --- | --- |
+| `edamame.worker.up` | Gauge | なし | なし | 記録時に `1` を出す |
+| `edamame.worker.controller.last_success_age` | Gauge | 秒 | なし | controller への登録または sync が最後に成功してからの経過時間。初回成功前は worker の状態を初期化してからの経過時間 |
+| `edamame.worker.cache.head_sequence` | Gauge | なし | `channel_id`, `quality` | キャッシュしている最新のセグメント番号 |
+| `edamame.worker.cache.segments` | Gauge | なし | `channel_id`, `quality` | キャッシュしているセグメント数 |
+| `edamame.worker.segments.downloaded` | Counter | なし | `channel_id`, `quality` | controller から取得してキャッシュに保存した回数 |
+| `edamame.worker.segments.served` | Counter | なし | `channel_id`, `quality` | キャッシュからセグメントの成功応答を生成した回数。client が最後まで受信したことは保証しない |
+| `edamame.worker.errors` | Counter | なし | `operation` | `register` / `sync` / `download` の処理エラー数 |
+
+cache の Gauge は、キャッシュ内にセグメントがある channel / quality について記録する。
+まだ処理が発生していない Counter や、対象が存在しない Gauge は、値が `0` の系列として取得できるとは限らない。
+
+### 監視するときの制約
+
+`up` は稼働中に `1` を記録するが、停止時に `0` を送るものではない。
+Collector や監視基盤に最後の値が残ることがあるため、直近のサンプル時刻や `/health` へ接続できるかも確認する。
+同期遅延と配信停止は、`last_sync_age`、`last_success_age`、`last_ingest_age`、`published_lag` を使って判断する。
+
+## ヘルスチェック用の HTTP API
+
+controller と worker は、HTTP リクエストを受け付けられる場合にステータス `200`、本文 `ok` を返す。
+認証とメトリクスの送信設定は不要である。
+
+| プロセス | パス |
+| --- | --- |
+| controller（パス接頭辞なし） | `GET /health` |
+| controller（パス接頭辞あり） | `GET {path_prefix}/health`。接頭辞なしの `/health` は公開しない |
+| worker | `GET /health` |
+| worker（パス接頭辞あり） | `GET {path_prefix}/health` でも取得できる |
+
+`path_prefix` は `--public-url` のパスから決まり、待ち受けアドレスは `--bind` で指定する。
+worker が TLS を終端する構成では、同じ TLS の待ち受けで取得する。
+`/health` は controller への登録、同期、証明書の信頼性、セグメントの配信可否を保証する readiness ではない。
+controller の役割と leader の確認には、別の `GET /internal/cluster/health` を使う（[HTTP API](./api.md)）。
+
+## ローカルでメトリクスを確認する
+
+### Collector を起動する
+
+リポジトリのルートで、[Compose 設定](../compose.observability.yaml) を使って Collector を起動する。
+Docker Compose と、アプリのビルドに必要な Rust 環境が必要になる。
+この構成は Grafana、Prometheus、Tempo を起動せず、メトリクスも永続化しない。
 
 ```bash
-curl -s 'http://iromono:9090/api/v1/query?query=edamame_controller_up'
-curl -s 'http://iromono:9090/api/v1/query?query=edamame_worker_up'
-curl -s 'http://iromono:9090/api/v1/query?query=probe_success%7Bjob%3D%22edamame-health%22%7D'
+docker compose --env-file /dev/null -f compose.observability.yaml up -d
+docker compose --env-file /dev/null -f compose.observability.yaml ps
 ```
 
-health probe が設定されていれば、`probe_success` が 1 になります。`targets/edamame-health.yml` が空の場合は系列自体が存在しません。
+公開するポートはホストの `127.0.0.1` に限定する。
 
-メトリクス名の一覧:
+| 用途 | アドレス |
+| --- | --- |
+| OTLP/gRPC の受信 | `127.0.0.1:4317` |
+| OTLP/HTTP の受信 | `127.0.0.1:4318`。Edamame のアプリは使わない |
+| Prometheus 形式の出力 | `http://127.0.0.1:8889/metrics` |
+
+[Collector 設定](../otel/collector.yaml) は metrics のパイプラインだけを持つ。
+出力する Prometheus メトリクスでは名前の `.` を `_` に置き換え、Counter に `_total`、秒単位のメトリクスに `_seconds` が付く。
+`service.name` と `service.instance.id` は `job` と `instance` に使われ、設定によりリソース属性もラベルへ付加される。
+ラベル名や単位の変換は Collector の設定に依存するため、実際の `/metrics` の出力で確認する。
+
+### アプリを起動する
+
+以下は bash の例であり、各プロセスを別のターミナルで起動する。
+既存の送信先より metrics 専用の送信先を優先し、ローカルに送る。
+既存のヘッダーはローカル確認に不要な認証情報を送らないよう解除する。
+送信間隔を短くしても、Gauge の記録間隔は 5 秒のままである。
+
+controller を起動する。
 
 ```bash
-curl -s 'http://iromono:9090/api/v1/label/__name__/values' | jq -r '.data[] | select(startswith("edamame_"))'
+unset OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_METRICS_HEADERS
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+OTEL_SDK_DISABLED=false \
+OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  cargo run --locked -p edamame-controller -- \
+    --bind 127.0.0.1:9000 \
+    --public-url http://127.0.0.1:9000 \
+    --storage-capacity 512MiB \
+    --playlist-segments 6 \
+    --sync-interval-ms 1000 \
+    --sync-timeout-ms 10000 \
+    --publish-wait-ms 2000 \
+    --auth-token example-token \
+    --cors-origin none
 ```
 
-### アラートの確認
+worker を起動する。
 
-- Grafana の Alerting で `Edamame` フォルダのルールを確認する
-- UID が `edamame-` で始まっていることを確認する
-- 通知先が `infra 死活監視` であることを確認する
-- 実際の発火テストは Discord に通知が飛ぶため、実施前に確認する
+```bash
+unset OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_METRICS_HEADERS
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4317 \
+OTEL_SDK_DISABLED=false \
+OTEL_METRIC_EXPORT_INTERVAL=5000 \
+  cargo run --locked -p edamame-worker -- \
+    --worker-id worker-a \
+    --bind 127.0.0.1:9001 \
+    --public-url http://127.0.0.1:9001 \
+    --controller-url http://127.0.0.1:9000 \
+    --cache-limit 12 \
+    --auth-token example-token \
+    --cors-origin none
+```
+
+### 受信を確認する
+
+アプリの起動ログに `OpenTelemetry metrics enabled` があることを確認する。
+このログはメトリクス送信の初期化成功を示すが、Collector への送信成功を保証しないため、出力も確認する。
+
+```bash
+curl --fail --show-error http://127.0.0.1:9000/health
+curl --fail --show-error http://127.0.0.1:9001/health
+curl --fail --show-error http://127.0.0.1:8889/metrics
+```
+
+通常の既定値では送信は 10 秒間隔、上の例では 5 秒間隔になる。
+起動直後に系列が出ない場合は、最初の送信と Collector の処理を待ってから取得し直す。
+次の系列に値が出ることを確認する。
+
+- `edamame_controller_up` と `edamame_worker_up` が `1` である
+- `edamame_controller_worker_last_sync_age_seconds` に `worker_id="worker-a"` がある
+- `edamame_worker_controller_last_success_age_seconds` の経過時間が継続的に増え続けず、同期に伴って小さい値へ戻る
+
+セグメント数や channel の系列を確認する場合は、[導入手順](../README.md#動作を確認する) に従ってセグメントを送り、プレイリストと worker の取得を確認する。
+ここでの手順はメトリクスの送受信確認であり、映像の再生確認ではない。
+
+Prometheus を使う場合は、Prometheus 自身から到達できる Collector の `8889` 番ポートを収集先に設定する。
+ホストで動く Prometheus は `127.0.0.1:8889` を使えるが、別コンテナの `127.0.0.1` はそのコンテナ自身を指す。
+Grafana のデータソース、ダッシュボード、通知は別途設定する。
+
+確認が終わったら、アプリを `Ctrl+C` で停止してから Collector を停止する。
+
+```bash
+docker compose --env-file /dev/null -f compose.observability.yaml down
+```
 
 ## データが届かないとき
 
-- 送信先が正しいか。本番は `http://iromono:4317`、ローカルは `http://127.0.0.1:4317`
-- アプリの標準エラーに `[telemetry]` の警告が出ていないか
-- `OTEL_SDK_DISABLED=true` になっていないか
-- metrics はアプリの既定で 10 秒間隔。確認中は `OTEL_METRIC_EXPORT_INTERVAL=5000` などで短くする
-- Prometheus の `edamame` target が UP か確認する
-- health probe を使う場合は、`edamame-health` target が UP か、`probe_success{job="edamame-health"}` が 1 か確認する
-- blackbox_exporter から target の URL に到達できるか確認する。`targets/edamame-health.yml` の URL は blackbox_exporter のコンテナから解決できる必要がある
-- 自己署名証明書の場合は `http_2xx_insecure` を明示する。通常の `http_2xx` では証明書エラーになる
-- Collector の Prometheus exporter が `otel-collector:8889` で動いているか確認する
-- Grafana の時間範囲を広げる
-- collector の metric expiration は既定の 5 分。プロセス停止直後は最後の値が残ることがある
-- コンテナは起動しているのに port に繋がらない場合は、Docker Desktop の port 公開が壊れていることがある。`docker desktop restart` で直ることがある
-- port が競合していないか確認する（Grafana 3000、OTLP 4317 / 4318）
-
-## Phase 2
-
-Phase 2 では、publisher を含む End-to-End の可観測性と traces を追加します。
-
-### 1. Publisher metrics
-
-- `edamame-publisher` に `edamame-telemetry` を組み込み、controller / worker と同じ Collector へ OTLP metrics を送る
-- channel / quality / input ごとに以下を計装する
-  - publisher の稼働状態と最終 publish 成功からの経過時間
-  - encode したセグメント数、encode 時間、encode エラー
-  - ffmpeg プロセスの起動回数、異常終了、再接続
-  - controller への upload 時間、upload エラー、再試行
-  - 内部 queue の深さ、未送信セグメント数
-- publisher 用のダッシュボードとアラートを追加する
-  - publisher down、publish stale、encode error rate、upload error rate、queue backlog
-- Windows では publisher のビルド・実行が難しいため、Linux / WSL で検証する
-
-### 2. Traces
-
-- OTel Collector に traces pipeline を追加し、Tempo へ送る
-- Grafana に Tempo datasource を追加する
-- controller / worker / publisher に span を追加する
-  - controller: segment ingest、storage write、playlist publish、worker register / sync
-  - worker: controller sync、segment download、cache put、client への segment 配信
-  - publisher: encode、segment upload、playlist 更新
-- HTTP リクエスト間で W3C Trace Context を伝播する
-- サンプリング方針（通常時と障害時）を決める
-- metrics から traces へ移動できるよう exemplar / trace ID を連携する
-- 遅延・エラーを trace で調査できるダッシュボードを追加する
-
-### 3. 運用と検証
-
-- 実際の channel で End-to-End の負荷試験・長時間試験を行う
-- Phase 1 のアラート閾値を実データで調整する
-- publisher を含む通知の意図した発火テストを行う
-- 障害時の調査手順を runbook として docs に追加する
-- Phase 1 の health probe target を本番・検証環境の URL に更新する
+- metrics 専用と共通の送信先を両方確認する。metrics 専用の値が優先され、空文字でも共通の値には戻らない
+- `OTEL_SDK_DISABLED=true` になっていないか確認する
+- 送信先が OTLP/gRPC を受け付けるか確認する。ローカル構成では `4317` を使い、`4318` には送らない
+- アプリの標準エラーに `[telemetry]` の警告が出ていないか確認する
+- `docker compose --env-file /dev/null -f compose.observability.yaml logs otel-collector` で Collector の起動失敗や受信エラーを確認する
+- `4317` / `4318` / `8889` 番ポートが既存プロセスと競合していないか確認する
+- `/metrics` に系列があって監視画面にない場合は、収集先へ接続できるかと監視基盤側のラベル、収集間隔、表示時間範囲を確認する
+- プロセス停止後も最後の値が残る場合は、Collector の保持設定と監視基盤の古いサンプルの扱いを確認する
