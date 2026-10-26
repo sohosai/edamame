@@ -20,7 +20,7 @@ use crate::{
     credentials,
     gstreamer::{self, OutputSpec},
     imageflux::{ImageFluxClient, whip_url},
-    obs::{ObsClient, StreamSnapshot},
+    obs::{ObsClient, PreviousStream, StreamSnapshot},
     relay::{self, RelayEvent},
     state::State,
     stream_info::StreamInfo,
@@ -265,7 +265,7 @@ async fn run(
         warn!("failed to stop OBS: {error:#}");
     }
     if obs.is_local_rtmp(&server, &key).await
-        && let Err(error) = obs.restore(&previous).await
+        && let Err(error) = restore_stream_settings(&obs, &previous).await
     {
         warn!("failed to restore OBS stream settings: {error:#}");
     }
@@ -296,6 +296,25 @@ async fn run(
     tokio::time::sleep(Duration::from_millis(300)).await;
     info!("session stopped");
     Ok(())
+}
+
+/// OBS の配信先を元へ戻す
+///
+/// OBS は停止要求を受理してから実際に出力が止まるまで配信先を変更できない。
+/// 停止直後に戻そうとすると OutputRunning で失敗するため、少しの間だけ再試行する。
+async fn restore_stream_settings(obs: &ObsClient, previous: &PreviousStream) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match obs.restore(previous).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
 }
 
 async fn prepare_imageflux(
