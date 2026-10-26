@@ -35,12 +35,14 @@ pub struct RtmpServerConnection {
 impl RtmpServerConnection {
     /// 新しい RTMP サーバー接続を作成する
     pub fn new() -> Self {
+        let options = RtmpConnectionOptions::default();
+        let message_channel = RtmpMessageChannel::with_ack_window_size(&options);
         let mut this = Self {
-            options: RtmpConnectionOptions::default(),
+            options,
             state: RtmpConnectionState::default(),
             event_queue: VecDeque::new(),
             handshake: RtmpServerHandshake::new(),
-            message_channel: RtmpMessageChannel::default(),
+            message_channel,
             connect_command: None,
             pending_transaction_id: None,
         };
@@ -285,7 +287,9 @@ impl RtmpServerConnection {
     /// クライアントへのデータ送信が成功した場合には、
     /// その送信バイト数を `RtmpServerConnection::advance_send_buf()` を呼び出して反映する必要がある
     pub fn send_buf(&self) -> &[u8] {
-        if self.state == RtmpConnectionState::Handshaking {
+        // ハンドシェイクの S0/S1/S2 が送信待ちのうちは、状態が進んでいてもそちらが先。
+        // （C2 までをまとめて送ってくる相手では、ハンドシェイク完了と同時に状態が変わる）
+        if !self.handshake.is_send_complete() {
             self.handshake.send_buf()
         } else {
             self.message_channel.send_buf()
@@ -475,5 +479,62 @@ impl RtmpServerConnection {
 impl Default for RtmpServerConnection {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn does_not_disconnect_when_ack_is_sent_before_connect() {
+        // librtmp はハンドシェイク (C2) と connect コマンドを続けて送る。
+        // 読み取りの区切り次第では、connect コマンドが揃う前のデータだけで
+        // ACK を返すことになるが、そこで切断してはならない。
+        let mut server = RtmpServerConnection::new();
+
+        // C0 + C1
+        let mut c0_c1 = vec![3u8];
+        c0_c1.extend_from_slice(&[0; 1536]);
+        server.feed_recv_buf(&c0_c1).expect("C0/C1 を受理できる");
+
+        // S0 + S1 + S2
+        let handshake = server.send_buf().to_vec();
+        assert_eq!(handshake.len(), 1 + 1536 * 2);
+        server.advance_send_buf(handshake.len());
+        assert!(server.send_buf().is_empty());
+
+        // C2 + connect コマンドの途中まで
+        let mut c2_and_partial_command = handshake[1..1 + 1536].to_vec();
+        c2_and_partial_command.extend_from_slice(&partial_command_chunk());
+        server
+            .feed_recv_buf(&c2_and_partial_command)
+            .expect("C2 と connect の先頭を受理できる");
+
+        assert_eq!(server.state(), RtmpConnectionState::Connecting);
+
+        let pending = server.send_buf().len();
+        server.advance_send_buf(pending);
+        assert_ne!(
+            server.state(),
+            RtmpConnectionState::Disconnecting,
+            "ACK が届いていないと誤判定して切断してはならない"
+        );
+    }
+
+    fn partial_command_chunk() -> Vec<u8> {
+        // chunk stream ID 3 の F0 チャンクで、メッセージ長 255 の AMF0 コマンド。
+        // メッセージが揃う前に届く状況を作るため、ペイロードは途中までしか入れない。
+        let mut buf = Vec::new();
+        buf.push(3);
+        buf.extend_from_slice(&[0, 0, 0]); // timestamp
+        buf.extend_from_slice(&[0, 0, 255]); // message length
+        buf.push(20); // AMF0 command
+        buf.extend_from_slice(&[0, 0, 0, 0]); // message stream ID
+        buf.extend_from_slice(b"connect");
+        buf
     }
 }

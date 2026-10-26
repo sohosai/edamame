@@ -214,12 +214,14 @@ impl RtmpClientConnection {
         let mut event_queue = VecDeque::new();
         event_queue.push_back(RtmpConnectionEvent::StateChanged(initial_state));
 
+        let options = RtmpConnectionOptions::default();
+        let message_channel = RtmpMessageChannel::with_ack_window_size(&options);
         Self {
-            options: RtmpConnectionOptions::default(),
+            options,
             state: initial_state,
             event_queue,
             handshake: RtmpClientHandshake::new(),
-            message_channel: RtmpMessageChannel::default(),
+            message_channel,
             next_transaction_id: TransactionId::NON_RESERVED_START,
             url,
         }

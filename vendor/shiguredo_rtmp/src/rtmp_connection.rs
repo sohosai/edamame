@@ -236,6 +236,18 @@ impl RtmpMessageChannel {
         self.last_ack_received = HANDSHAKE_BYTE_COUNT;
     }
 
+    /// 接続時のオプションを反映した状態で作る
+    ///
+    /// connect コマンドを受け取る前でも相手へ ACK を返すことはある。
+    /// 確認応答の間隔が 0 のままだと、その最初の小さな送信で
+    /// 「ACK が届いていない」と誤判定して切断してしまうため、最初から既定値を入れておく。
+    pub(crate) fn with_ack_window_size(options: &RtmpConnectionOptions) -> Self {
+        let mut this = Self::default();
+        this.local_ack_window_size = options.ack_window_size;
+        this.peer_ack_window_size = options.ack_window_size;
+        this
+    }
+
     pub fn feed_recv_buf(&mut self, buf: &[u8]) -> Result<Option<u32>, Error> {
         self.decoder.feed_buf(buf);
         self.total_bytes_received = self.total_bytes_received.wrapping_add(buf.len() as u32);
@@ -269,8 +281,12 @@ impl RtmpMessageChannel {
         self.total_bytes_sent = self.total_bytes_sent.wrapping_add(n as u32);
         self.send_buf.advance(n);
 
+        // 相手の確認応答の間隔が分からないうちは、届いていないとは判断できない
+        if self.local_ack_window_size == 0 {
+            return true;
+        }
         let unacked_bytes = self.total_bytes_sent.wrapping_sub(self.last_ack_received);
-        if unacked_bytes > self.local_ack_window_size * 2 {
+        if unacked_bytes > self.local_ack_window_size.saturating_mul(2) {
             // 必要な間隔で相手から ACK が送られて来ていない（* 2 は念のために若干のバッファを持たせている）
             //
             // 呼び出し元で、送信を止めるなり、切断するなりの対処が必要
