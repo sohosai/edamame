@@ -71,6 +71,7 @@ ImageFlux の要素だけが足りない場合は Edamame の送信を継続す�
 Edamame の要素が足りない場合は配信を開始しない。
 
 GStreamer の実行ファイルは、設定の `gstreamer.path`、`TOMYOU_GST_LAUNCH`、PATH、OS 標準の場所の順に探す。
+Windows では `C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe` も標準の場所として探す。
 Windows では GUI から起動する `gst-inspect-1.0` と `gst-launch-1.0` を `CREATE_NO_WINDOW` 付きで起動し、コンソールウィンドウを開かない。
 機能検査だけで十数回起動するため、抑止しないと起動のたびにウィンドウが並ぶ。
 
@@ -243,7 +244,7 @@ RTMP のチャンネル名は大文字小文字を区別する。
 
 GStreamer は外部ランタイムとし、アプリには同梱しない。
 
-- Windows: 利用者が GStreamer の MSVC ランタイムと `whipclientsink` を用意する。`tomyou.exe` は PATH または設定のパスから `gst-launch-1.0.exe` を探す。
+- Windows: 利用者が GStreamer の MSVC ランタイムと `whipclientsink` を用意する。`tomyou.exe` は PATH、設定のパス、`C:\Program Files\gstreamer\1.0\msvc_x86_64\bin` などから `gst-launch-1.0.exe` を探す。
 - macOS: GStreamer framework または Homebrew の GStreamer を使う。`whipclientsink` を含むことを確認する。
 - Linux: 既存の GStreamer 環境を使う。導入手順はこの文書に含めない。
 

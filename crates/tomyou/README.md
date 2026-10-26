@@ -74,6 +74,7 @@ fallback 登録を有効にする場合は、`[stream_credentials]` に live2025
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
 `gstreamer.path` を空欄にすると、PATH、`TOMYOU_GST_LAUNCH`、標準的なインストール先の順に探す。
+Windows では `C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe` も探す。
 
 ## fallback 登録
 

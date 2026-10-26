@@ -435,14 +435,21 @@ fn standard_paths() -> Vec<PathBuf> {
         paths.push(PathBuf::from("/usr/local/bin/gst-launch-1.0"));
     }
     if cfg!(windows) {
-        for root in [
-            "C:\\gstreamer\\1.0\\msvc_x86_64",
-            "C:\\gstreamer\\1.0\\mingw_x86_64",
-        ] {
-            paths.push(PathBuf::from(root).join("bin/gst-launch-1.0.exe"));
-        }
+        paths.extend(windows_standard_paths());
     }
     paths
+}
+
+/// Windows で GStreamer を探す標準的なインストール先
+fn windows_standard_paths() -> Vec<PathBuf> {
+    [
+        "C:\\Program Files\\gstreamer\\1.0\\msvc_x86_64",
+        "C:\\gstreamer\\1.0\\msvc_x86_64",
+        "C:\\gstreamer\\1.0\\mingw_x86_64",
+    ]
+    .into_iter()
+    .map(|root| PathBuf::from(root).join("bin").join("gst-launch-1.0.exe"))
+    .collect()
 }
 
 #[cfg(test)]
@@ -555,6 +562,19 @@ mod tests {
         let capabilities = capabilities(&["rtmpsrc", "flvdemux"], Some(AudioDecoder::AvdecAac));
         assert!(!capabilities.edamame_ready());
         assert!(capabilities.edamame_missing().contains(&"flvmux"));
+    }
+
+    #[test]
+    fn includes_program_files_gstreamer() {
+        let paths = windows_standard_paths();
+        assert!(
+            paths.iter().any(|path| {
+                path.to_string_lossy().replace('/', "\\").ends_with(
+                    "Program Files\\gstreamer\\1.0\\msvc_x86_64\\bin\\gst-launch-1.0.exe",
+                )
+            }),
+            "Program Files の GStreamer を探索対象に含めていない: {paths:?}"
+        );
     }
 
     #[test]
