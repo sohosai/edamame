@@ -25,7 +25,7 @@ flowchart LR
 
 ## 必要な環境
 
-- Rust 1.99.1（edition 2024）でビルドを確認済み。より古い版は未検証
+- Rust 1.99.1（edition 2024）でビルドを確認済み。`tomyou` は Rust 1.93 以降を要求する
 - ネットワークの接続条件：
   - `publisher` と `worker` から、`controller` の HTTP アドレスへ接続できること
   - `client` から、`controller` のアドレス（プレイリスト取得用）へ接続できること
@@ -94,6 +94,22 @@ cargo run --release -p edamame-publisher -- \
 
 設定ファイルの書き方、暗号化と鍵登録の仕組み、失敗時の扱いは [publisher](./docs/publisher.md) で説明する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
+
+## tomyou
+
+`crates/tomyou` は、拠点の OBS から Edamame と ImageFlux へ同時に映像を送る GUI アプリである。
+OBS の配信先をローカルの RTMP サーバへ変更し、Edamame 向けの RTMP と ImageFlux 向けの WHIP を別プロセスで送る。
+
+```bash
+cargo run --release -p tomyou
+cargo run --release -p tomyou -- --config /path/to/config.toml
+```
+
+設定、OBS の条件、入力チェック、GStreamer の必要機能、ImageFlux の扱い、fallback 登録、障害時の動作は [tomyou](./docs/tomyou.md) で説明する。
+`tomyou-v*` タグを push すると GitHub Actions が Windows / macOS / Linux のバイナリをビルドし、GitHub Release に添付する。
+ImageFlux のプレイリストと鍵は、live2025-server へ fallback として登録する。
+fallback 登録を使う場合は、`[stream_credentials]` に live2025-server のベース URL と `STREAM_INGEST_TOKEN` を指定する。
+通常用の URL と鍵の登録は、既存の `publisher` の設定を使う。
 
 ## publisher のコンテナイメージ
 

@@ -10,6 +10,7 @@ Edamame は、ライブ HLS 配信のセグメントをメモリに保持する�
 | [controller](./controller.md) | 起動と設定、保存と採番、公開範囲、worker 選択、外部配信 |
 | [worker](./worker.md) | 起動と設定、登録と同期、キャッシュ、再取得、TLS / ACME |
 | [publisher](./publisher.md) | ライブ入力、エンコード、暗号化、鍵登録、検証用 publisher |
+| [tomyou](./tomyou.md) | OBS の映像を Edamame と ImageFlux へ中継する GUI アプリ。入力チェックと fallback 登録 |
 | [運用](./operations.md) | パラメータの調整、メモリ見積もり、通信の保護、再生確認、障害切り分け |
 | [controller の冗長化](./cluster.md) | 複数台の起動、DNS、leader 選出、転送、交代と通信分断時の制約 |
 | [HTTP API](./api.md) | エンドポイント、認証、リクエストとレスポンス、再 PUT、ステータス |
