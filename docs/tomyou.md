@@ -234,6 +234,13 @@ RTMP のチャンネル名は大文字小文字を区別する。
 
 ## 配布
 
+`tomyou-v<version>` タグを push すると、GitHub Actions が Windows / macOS / Linux 向けのバイナリをビルドし、GitHub Release に添付する。
+
+- Linux: `tomyou-<version>-linux-x86_64.tar.gz` (`x86_64-unknown-linux-gnu`)
+- Windows: `tomyou-<version>-windows-x86_64.zip` (`x86_64-pc-windows-msvc`)
+- macOS: `tomyou-<version>-macos-universal.tar.gz` (Apple Silicon / Intel の Universal)
+- `SHA256SUMS.txt`
+
 GStreamer は外部ランタイムとし、アプリには同梱しない。
 
 - Windows: 利用者が GStreamer の MSVC ランタイムと `whipclientsink` を用意する。`tomyou.exe` は PATH または設定のパスから `gst-launch-1.0.exe` を探す。

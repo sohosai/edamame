@@ -114,6 +114,18 @@ FLV の音声ヘッダーのサンプリングレートは AAC では固定値�
 
 B フレームは FLV の CTS offset とフレーム種別による目安であり、デコード結果を完全に保証するものではない。
 
+## リリース
+
+`tomyou-v<version>` タグを push すると、GitHub Actions が次の OS 向けバイナリをビルドし、GitHub Release に添付する。
+
+- Linux: `x86_64-unknown-linux-gnu`
+- Windows: `x86_64-pc-windows-msvc`
+- macOS: Universal (Apple Silicon / Intel)
+
+ファイル名は `tomyou-<version>-linux-x86_64.tar.gz`、`tomyou-<version>-windows-x86_64.zip`、`tomyou-<version>-macos-universal.tar.gz` になる。
+`SHA256SUMS.txt` も添付する。
+GStreamer は同梱しない。各 OS に GStreamer と `whipclientsink` を用意する。
+
 ## GStreamer の機能
 
 起動時に次の要素を確認する。
