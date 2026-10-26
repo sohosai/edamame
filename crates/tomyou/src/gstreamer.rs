@@ -149,15 +149,17 @@ impl OutputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputSpec {
     pub kind: OutputKind,
+    /// 送信先。画面に出すときだけ使う
+    pub target: Option<String>,
     pub args: Vec<String>,
 }
 
 impl OutputSpec {
-    fn new(kind: OutputKind, pipeline: Vec<String>) -> Self {
+    fn new(kind: OutputKind, target: Option<String>, pipeline: Vec<String>) -> Self {
         // gst-launch は引数内の空白を引用扱いにするため、処理列全体を 1 引数にできない。
         let mut args = vec!["-e".to_owned()];
         args.extend(pipeline);
-        Self { kind, args }
+        Self { kind, target, args }
     }
 }
 
@@ -336,13 +338,18 @@ fn rtmp_location(input: &str) -> String {
 
 /// Edamame 向けの出力定義
 pub fn edamame_spec(input: &str, publisher: &str) -> OutputSpec {
-    OutputSpec::new(OutputKind::Edamame, edamame_pipeline(input, publisher))
+    OutputSpec::new(
+        OutputKind::Edamame,
+        Some(publisher.to_owned()),
+        edamame_pipeline(input, publisher),
+    )
 }
 
 /// ImageFlux 向けの出力定義
 pub fn imageflux_spec(input: &str, endpoint: &str, decoder: AudioDecoder) -> OutputSpec {
     OutputSpec::new(
         OutputKind::ImageFlux,
+        None,
         imageflux_pipeline(input, endpoint, decoder),
     )
 }
@@ -461,6 +468,19 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_destination_for_the_gui() {
+        // 送信先を切り替えたときに画面へ出せるよう、出力定義に送信先を持たせる。
+        let spec = edamame_spec("rtmp://127.0.0.1:1935/live/1A", "rtmp://publisher/live/1A");
+        assert_eq!(spec.target.as_deref(), Some("rtmp://publisher/live/1A"));
+        let spec = imageflux_spec(
+            "rtmp://127.0.0.1:1935/live/1A",
+            "https://sora.example/whip/abc",
+            AudioDecoder::AvdecAac,
+        );
+        assert_eq!(spec.target, None);
+    }
+
+    #[test]
     fn imageflux_pipeline_connects_audio_before_video() {
         let pipeline = imageflux_pipeline(
             "rtmp://127.0.0.1:1935/live/1A",
@@ -493,6 +513,7 @@ mod tests {
         };
         let spec = OutputSpec::new(
             OutputKind::Edamame,
+            None,
             ["fakesrc", "num-buffers=1", "!", "fakesink"]
                 .into_iter()
                 .map(str::to_owned)

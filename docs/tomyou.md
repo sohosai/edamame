@@ -216,6 +216,12 @@ fallback 登録を使う場合は、`[stream_credentials]` に live2025-server �
 
 ## publisher の RTMP URL
 
+publisher の RTMP URL は `publisher.rtmp_urls` に複数指定できる。
+上から順に使い、送信が終了したら次の URL へ切り替える。
+最後まで失敗したら、1 秒から 30 秒のバックオフを空けて先頭へ戻る。
+送信先が 1 つだけなら `publisher.rtmp_url` でも指定できる。
+両方ある場合は `rtmp_urls` を使う。
+
 publisher の RTMP URL は、`tomyou` を動かすホストから到達できる必要がある。
 
 到達性はホスト名、ポート、ファイアウォール、NAT、VPN/ACL に依存する。

@@ -126,8 +126,11 @@ pub struct TomyouApp {
     show_settings: bool,
     show_license: bool,
     gstreamer_path_draft: String,
+    publisher_urls_draft: String,
     obs_snapshot: Option<StreamSnapshot>,
     stream_info: Option<StreamInfo>,
+    /// 今 Edamame へ送っている送信先
+    edamame_destination: Option<String>,
 }
 
 impl TomyouApp {
@@ -147,6 +150,7 @@ impl TomyouApp {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
+        let publisher_urls_draft = config.publisher.urls().join("\n");
         Self {
             config,
             config_path,
@@ -169,8 +173,10 @@ impl TomyouApp {
             show_settings: false,
             show_license: false,
             gstreamer_path_draft,
+            publisher_urls_draft,
             obs_snapshot: None,
             stream_info: None,
+            edamame_destination: None,
         }
     }
 
@@ -201,6 +207,8 @@ impl TomyouApp {
         self.publisher_connected = false;
         self.imageflux_output = false;
         self.edamame_output = false;
+        self.edamame_destination = None;
+        self.obs_snapshot = None;
         self.status = Status::Starting;
         self.log("配信を開始します");
         let _guard = self.runtime.enter();
@@ -314,6 +322,11 @@ impl TomyouApp {
                 }
                 self.log(format!("{name} の送信が終了: {message}"));
             }
+            SessionEvent::EdamameDestination(destination) => {
+                if self.session.is_some() {
+                    self.edamame_destination = Some(destination);
+                }
+            }
             SessionEvent::Error(error) => {
                 self.status = Status::Error;
                 self.error = Some(error.clone());
@@ -328,6 +341,7 @@ impl TomyouApp {
                 self.publisher_connected = false;
                 self.imageflux_output = false;
                 self.edamame_output = false;
+                self.edamame_destination = None;
                 self.fallback_registered = false;
                 self.fallback_error = None;
                 self.stream_info = None;
@@ -352,6 +366,16 @@ impl TomyouApp {
         } else {
             Some(PathBuf::from(self.gstreamer_path_draft.trim()))
         };
+        // 画面では 1 行に 1 つ並べているので、空行を落として保存する
+        self.config.publisher.rtmp_urls = self
+            .publisher_urls_draft
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        // 保存後は rtmp_urls に一本化する
+        self.config.publisher.rtmp_url.clear();
         let path = self.config_path_from_draft();
         match self.config.save(&path) {
             Ok(()) => {
@@ -406,6 +430,7 @@ impl TomyouApp {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
+                self.publisher_urls_draft = config.publisher.urls().join("\n");
                 self.config = config;
                 self.config_path = path.clone();
                 self.config_path_draft = path.display().to_string();
@@ -640,7 +665,23 @@ impl eframe::App for TomyouApp {
                         ("停止", Tone::Idle)
                     };
                     tone_label(ui, tone, text);
-                    ui.label(format!("送信先: {}", self.config.publisher.rtmp_url));
+                    let urls = self.config.publisher.urls();
+                    let destination = self
+                        .edamame_destination
+                        .clone()
+                        .or_else(|| urls.first().cloned())
+                        .unwrap_or_default();
+                    if destination.is_empty() {
+                        ui.label("送信先: 未設定");
+                    } else if urls.len() > 1 {
+                        ui.label(format!(
+                            "送信先: {destination}（{} 件中 {} 番目）",
+                            urls.len(),
+                            urls.iter().position(|url| *url == destination).map_or(1, |index| index + 1)
+                        ));
+                    } else {
+                        ui.label(format!("送信先: {destination}"));
+                    }
                 });
                 columns[1].group(|ui| {
                     ui.label(egui::RichText::new("ImageFlux（予備系）").strong());
@@ -769,10 +810,16 @@ impl TomyouApp {
                                 .password(true),
                         );
                         ui.end_row();
-                        ui.label("publisher RTMP URL");
-                        ui.text_edit_singleline(&mut self.config.publisher.rtmp_url);
-                        ui.end_row();
                     });
+                ui.add_space(4.0);
+                ui.label("publisher RTMP URL（上から順に試し、失敗したら次へ切り替える）");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.publisher_urls_draft)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("rtmp://publisher.example.test:1935/live/uni"),
+                );
+                ui.label("1 行に 1 つ。上から順に使い、失敗したら次の送信先へ移ります。");
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("fallback 登録").strong());
                 egui::Grid::new("settings-stream-credentials")

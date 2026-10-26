@@ -48,6 +48,8 @@ pub enum SessionEvent {
     FallbackRegistrationFailed(String),
     OutputStarted(String),
     OutputExited(String, String),
+    /// Edamame で今送っている送信先
+    EdamameDestination(String),
     Error(String),
     Log(String),
     Stopped,
@@ -85,7 +87,7 @@ async fn run(
 ) -> anyhow::Result<()> {
     let _ = ui.send(SessionEvent::Starting);
     if !config.edamame_enabled() {
-        anyhow::bail!("publisher.rtmp_url が未設定です。Edamame へ送信できません");
+        anyhow::bail!("publisher の送信先が未設定です。Edamame へ送信できません");
     }
 
     let gst_launch = gstreamer::resolve(config.gstreamer.path.as_deref())?;
@@ -116,8 +118,15 @@ async fn run(
     let _ = ui.send(SessionEvent::RelayListening(bind.to_string()));
 
     let (output_stop_tx, output_stop_rx) = watch::channel(false);
+    // 送信先は上から順に試し、失敗したら次の送信先へ切り替える
+    let edamame_specs: Vec<OutputSpec> = config
+        .publisher
+        .urls()
+        .iter()
+        .map(|publisher_url| gstreamer::edamame_spec(&input_url, publisher_url))
+        .collect();
     spawn_output(
-        gstreamer::edamame_spec(&input_url, &config.publisher.rtmp_url),
+        edamame_specs,
         gst_launch.clone(),
         output_stop_rx.clone(),
         ui.clone(),
@@ -357,7 +366,7 @@ async fn prepare_imageflux(
     });
 
     spawn_output(
-        gstreamer::imageflux_spec(input_url, &whip, decoder),
+        vec![gstreamer::imageflux_spec(input_url, &whip, decoder)],
         gst_launch.to_path_buf(),
         stop_rx.clone(),
         ui.clone(),
@@ -497,81 +506,109 @@ async fn fetch_encrypt_key_with_retry(
 }
 
 fn spawn_output(
-    spec: OutputSpec,
+    specs: Vec<OutputSpec>,
     gst_launch: PathBuf,
     stop_rx: watch::Receiver<bool>,
     ui: Sender<SessionEvent>,
 ) {
     tokio::spawn(async move {
-        run_output(spec, gst_launch, stop_rx, ui).await;
+        run_output(specs, gst_launch, stop_rx, ui).await;
     });
 }
 
+/// 出力を起動し、終了したら次の送信先へ切り替える
+///
+/// 送信先が複数ある場合は上から順に試し、すべて失敗したら間隔を空けて先頭へ戻る。
 async fn run_output(
-    spec: OutputSpec,
+    specs: Vec<OutputSpec>,
     gst_launch: PathBuf,
     mut stop_rx: watch::Receiver<bool>,
     ui: Sender<SessionEvent>,
 ) {
-    let name = spec.kind.name().to_owned();
+    let Some(first) = specs.first() else {
+        return;
+    };
+    let name = first.kind.name().to_owned();
+    let mut index = 0_usize;
     let mut backoff = 1_u64;
     loop {
         if *stop_rx.borrow() {
             return;
         }
-        let mut command = Command::new(&gst_launch);
-        command
-            .args(&spec.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // 中継のたびにコンソールウィンドウが開かないようにする
-        gstreamer::hide_console_window(command.as_std_mut());
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = ui.send(SessionEvent::OutputExited(
-                    name.clone(),
-                    format!("起動できません: {error}"),
-                ));
-                if wait_backoff(&mut stop_rx, backoff).await {
-                    return;
-                }
-                backoff = (backoff * 2).min(30);
-                continue;
-            }
-        };
-        let _ = ui.send(SessionEvent::OutputStarted(name.clone()));
-        if let Some(stderr) = child.stderr.take() {
-            let ui = ui.clone();
-            let name = name.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if is_useful_gst_line(&line) {
-                        let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
-                    }
-                }
-            });
+        let spec = &specs[index];
+        if let Some(target) = &spec.target {
+            let _ = ui.send(SessionEvent::EdamameDestination(target.clone()));
         }
-        let status = tokio::select! {
-            result = child.wait() => result,
-            _ = stop_rx.changed() => {
-                let _ = child.kill().await;
-                return;
-            }
-        };
-        let message = match status {
-            Ok(status) => format!("終了: {status}"),
-            Err(error) => format!("待機に失敗: {error}"),
-        };
-        let _ = ui.send(SessionEvent::OutputExited(name.clone(), message));
-        if wait_backoff(&mut stop_rx, backoff).await {
+        if run_once(spec, &gst_launch, &mut stop_rx, &ui, &name).await {
             return;
         }
-        backoff = (backoff * 2).min(30);
+        // 失敗したので次の送信先へ。ひと回りしたら間隔を空ける
+        index += 1;
+        if index >= specs.len() {
+            index = 0;
+            if wait_backoff(&mut stop_rx, backoff).await {
+                return;
+            }
+            backoff = (backoff * 2).min(30);
+        }
     }
+}
+
+/// 出力を 1 回起動して終了まで待つ
+///
+/// 停止要求を受けた場合だけ `true` を返す。
+async fn run_once(
+    spec: &OutputSpec,
+    gst_launch: &Path,
+    stop_rx: &mut watch::Receiver<bool>,
+    ui: &Sender<SessionEvent>,
+    name: &str,
+) -> bool {
+    let mut command = Command::new(gst_launch);
+    command
+        .args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // 中継のたびにコンソールウィンドウが開かないようにする
+    gstreamer::hide_console_window(command.as_std_mut());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = ui.send(SessionEvent::OutputExited(
+                name.to_owned(),
+                format!("起動できません: {error}"),
+            ));
+            return false;
+        }
+    };
+    let _ = ui.send(SessionEvent::OutputStarted(name.to_owned()));
+    if let Some(stderr) = child.stderr.take() {
+        let ui = ui.clone();
+        let name = name.to_owned();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if is_useful_gst_line(&line) {
+                    let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
+                }
+            }
+        });
+    }
+    let status = tokio::select! {
+        result = child.wait() => result,
+        _ = stop_rx.changed() => {
+            let _ = child.kill().await;
+            return true;
+        }
+    };
+    let message = match status {
+        Ok(status) => format!("終了: {status}"),
+        Err(error) => format!("待機に失敗: {error}"),
+    };
+    let _ = ui.send(SessionEvent::OutputExited(name.to_owned(), message));
+    false
 }
 
 /// 画面に出す価値のある GStreamer のエラー行か
@@ -602,6 +639,58 @@ fn is_useful_gst_line(line: &str) -> bool {
 async fn wait_backoff(stop_rx: &mut watch::Receiver<bool>, seconds: u64) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(seconds)) => false,
-        _ = stop_rx.changed() => *stop_rx.borrow(),
+        // 送信側が落ちた場合も、これ以上再試行しない
+        changed = stop_rx.changed() => changed.is_err() || *stop_rx.borrow(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gstreamer::OutputKind;
+
+    fn spec(target: &str) -> OutputSpec {
+        OutputSpec {
+            kind: OutputKind::Edamame,
+            target: Some(target.to_owned()),
+            args: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn switches_to_the_next_destination_after_a_failure() {
+        // 起動できない実行ファイルを指定し、送信先が順に切り替わることを確かめる。
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_output(
+            vec![
+                spec("rtmp://first.example.test/live/1A"),
+                spec("rtmp://second.example.test/live/1A"),
+            ],
+            PathBuf::from("tomyou-gst-launch-does-not-exist"),
+            stop_rx,
+            tx,
+        ));
+
+        let mut destinations = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while destinations.len() < 2 && tokio::time::Instant::now() < deadline {
+            while let Ok(event) = rx.try_recv() {
+                if let SessionEvent::EdamameDestination(destination) = event {
+                    destinations.push(destination);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+
+        assert_eq!(
+            destinations,
+            vec![
+                "rtmp://first.example.test/live/1A".to_owned(),
+                "rtmp://second.example.test/live/1A".to_owned()
+            ]
+        );
     }
 }

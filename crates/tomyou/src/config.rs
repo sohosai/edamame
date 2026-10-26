@@ -45,9 +45,34 @@ pub struct ObsConfig {
 /// edamame-publisher の RTMP 入力
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PublisherConfig {
+    /// 送信先が 1 つだけのときの指定
+    ///
     /// 例: rtmp://publisher.example.test:1935/live/uni
     #[serde(default)]
     pub rtmp_url: String,
+    /// 複数の送信先。上から順に試し、失敗したら次の送信先へ切り替える
+    #[serde(default)]
+    pub rtmp_urls: Vec<String>,
+}
+
+impl PublisherConfig {
+    /// 送信先を上から順に返す
+    ///
+    /// `rtmp_urls` を優先し、無ければ `rtmp_url` を使う。
+    /// 前後の空白と空行は無視する。
+    pub fn urls(&self) -> Vec<String> {
+        let candidates = if self.rtmp_urls.is_empty() {
+            vec![self.rtmp_url.as_str()]
+        } else {
+            self.rtmp_urls.iter().map(String::as_str).collect()
+        };
+        candidates
+            .into_iter()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 /// ImageFlux を fallback 配信として登録する live2025-server の設定
@@ -352,11 +377,12 @@ impl Config {
             .bind
             .parse::<std::net::SocketAddr>()
             .context("relay.bind は IP:ポート の形式で指定してください")?;
-        if !self.publisher.rtmp_url.trim().is_empty() {
-            let url = url::Url::parse(&self.publisher.rtmp_url)
-                .context("publisher.rtmp_url が URL として不正です")?;
+        for publisher_url in self.publisher.urls() {
+            let url = url::Url::parse(&publisher_url).with_context(|| {
+                format!("publisher の送信先が URL として不正です: {publisher_url}")
+            })?;
             if url.scheme() != "rtmp" {
-                bail!("publisher.rtmp_url は rtmp:// で始めてください");
+                bail!("publisher の送信先は rtmp:// で始めてください: {publisher_url}");
             }
         }
         if let Some(path) = &self.gstreamer.path
@@ -406,7 +432,7 @@ impl Config {
 
     /// Edamame 側の送信設定がそろっているか
     pub fn edamame_enabled(&self) -> bool {
-        !self.publisher.rtmp_url.trim().is_empty()
+        !self.publisher.urls().is_empty()
     }
 }
 
@@ -433,6 +459,55 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         Config::default().validate().expect("既定値は有効");
+    }
+
+    #[test]
+    fn publisher_urls_use_the_list_in_order() {
+        let mut config = Config::default();
+        config.publisher.rtmp_url = "rtmp://single.example.test/live/1A".to_owned();
+        config.publisher.rtmp_urls = vec![
+            "rtmp://first.example.test/live/1A".to_owned(),
+            "  rtmp://second.example.test/live/1A  ".to_owned(),
+            "   ".to_owned(),
+        ];
+        assert_eq!(
+            config.publisher.urls(),
+            vec![
+                "rtmp://first.example.test/live/1A",
+                "rtmp://second.example.test/live/1A"
+            ]
+        );
+        assert!(config.edamame_enabled());
+        config.validate().expect("複数の送信先も有効");
+    }
+
+    #[test]
+    fn publisher_urls_fall_back_to_a_single_url() {
+        let mut config = Config::default();
+        config.publisher.rtmp_url = " rtmp://single.example.test/live/1A ".to_owned();
+        assert_eq!(
+            config.publisher.urls(),
+            vec!["rtmp://single.example.test/live/1A"]
+        );
+        assert!(config.edamame_enabled());
+    }
+
+    #[test]
+    fn rejects_non_rtmp_publisher_url() {
+        let mut config = Config::default();
+        config.publisher.rtmp_urls = vec![
+            "rtmp://first.example.test/live/1A".to_owned(),
+            "https://second.example.test/live/1A".to_owned(),
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn disables_edamame_without_publisher_url() {
+        let mut config = Config::default();
+        config.publisher.rtmp_url.clear();
+        config.publisher.rtmp_urls = vec!["  ".to_owned()];
+        assert!(!config.edamame_enabled());
     }
 
     #[test]
