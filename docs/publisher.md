@@ -106,12 +106,27 @@ video_bitrate = 3000000
 [複数入力の設定例](../crates/edamame-publisher/publisher.example.toml) は GPU、複数 channel、外部の鍵配信 URL を前提とする。
 そのままローカルで再生できる最小設定ではないため、入力、エンコーダ、配信 URL、鍵の設定を環境に合わせる。
 
+## 複数 controller への fan-out
+
+複数 controller を指定した場合、publisher は各セグメントを全 controller へ並列に PUT する。
+1 台が遅い、または接続できない場合も、ほかの controller への送信は続ける。
+
+- controller ごとに 5 秒の PUT timeout を設け、超えた controller はそのチャンネルの fan-out 対象から外す
+- 400、401、409 は設定エラーとしてチャンネルを止める
+- 起動時の次のセグメント番号は、全 controller の最大値から始める
+- 1 セグメントを全 controller に送ってから次のセグメントへ進む
+- timeout や通信分断で一部の controller だけが欠けることはある。成功した controller はそのまま配信を続ける
+
+live2025-server へ登録する `candidate_live_urls` は全 controller の `live_url` を含む。
+server は 1 台を選び、client はその controller を使う。controller 間の負荷分散は行わない。
+segment は worker から取得するため、worker の weight による配信先の分散は維持される。
+
 ## 設定リファレンス
 
 ### TOML
 
 設定ファイルの 1 本の `[[input]]` が 1 つの channel に対応し、その中の `[[input.rendition]]` が quality を表す。
-`[[controller]]` は送信先の controller を表し、`url` と `metric` を持つ。複数台を指定でき、`metric` が小さい順に使う。
+`[[controller]]` は送信先の controller を表し、`url` と `metric` を持つ。複数台を指定でき、publisher は全台へ並列にセグメントを送る。`metric` は live2025-server に登録する候補の順序であり、送信先の優先順位ではない。
 
 | 項目 | 必須条件と説明 |
 | --- | --- |
@@ -119,11 +134,11 @@ video_bitrate = 3000000
 | `backlog_limit` | 必須。正の整数。未送信セットを保持する期限は `segment_duration_ms × backlog_limit` ミリ秒 |
 | `encoder.codec` | 必須。ffmpeg の映像エンコーダ。`h264_nvenc`、`h264_qsv`、`libx264` など |
 | `encoder.preset` | 必須。エンコーダに対応するプリセット。NVEnc は `p1` から `p7`、QSV は `veryfast` から `veryslow` など |
-| `controller.url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可。設定内で重複不可 |
-| `controller.metric` | 必須。0 以上の優先度。小さいほど先に使う。設定内で重複不可 |
+| `controller.url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可。設定内で重複不可。全 controller を列挙する |
+| `controller.metric` | 必須。0 以上の候補順。live2025-server へ登録する `candidate_live_urls` の順序に使い、小さいほど優先される。publisher の送信順ではない。設定内で重複不可 |
 | `input.channel_id` | 必須。`[A-Za-z0-9_-]` の 1 から 64 文字。同じ設定内で重複不可 |
 | `input.input_url` | 必須。`srt://` または `rtmp://`。SRT は URL の `mode` で接続方式を指定し、RTMP は publisher が待ち受ける。RTMP の app と stream は送信側とそろえる |
-| `input.live_url` | 任意。先頭 controller の公開マスタープレイリスト URL の上書き。未指定なら `{controller.url}/channels/{channel_id}/master.m3u8` を導出する。先頭以外の controller は常に導出する |
+| `input.live_url` | 任意。先頭 controller の公開マスタープレイリスト URL の上書き。未指定なら `{controller.url}/channels/{channel_id}/master.m3u8` を導出する。先頭以外の controller は常に導出する。全 controller の `live_url` が `candidate_live_urls` に登録される |
 | `input.key_uri` | 任意。鍵を取得する HTTP または HTTPS の絶対 URL。通常の HLS プレイヤーで再生する場合は必要 |
 | `input.rendition.quality` | 必須。quality の識別子。同じ channel 内で重複不可。`master` は使用不可 |
 | `input.rendition.mode` | 任意。省略時は `encode`。`copy` は映像を再エンコードしない。音声はどちらもコピーする |
@@ -153,11 +168,11 @@ controller は TOML の `[[controller]]` または 1 台だけの `--controller-
 ### 外部サービスへの登録
 
 `--stream-credentials-url` を指定すると、channel ごとに `POST /internal/stream-credentials` へ `candidates` の配列を 1 回で送る。
-各要素は `metric`、`live_url`、hex 形式の `encryption_key` で、`metric` は controller の優先度で小さいほど優先され、`live_url` は先頭 controller の上書きまたは `{controller.url}/channels/{channel_id}/master.m3u8` から導出した URL である。
+各要素は `metric`、`live_url`、hex 形式の `encryption_key` で、`metric` は live2025-server の候補順で小さいほど優先され、`live_url` は先頭 controller の上書きまたは `{controller.url}/channels/{channel_id}/master.m3u8` から導出した URL である。
 `--stream-ingest-token` が必要になる。
 この一括登録は `candidates` に対応した live2025-server が必要になる。
 未対応の server はリクエストを 400 で拒否し、publisher は設定エラーとして登録を打ち切るため、server を先に更新する。
-全 controller を 1 リクエストで登録するため、途中の controller だけが欠けることはない。
+全 controller を 1 リクエストで登録する。live2025-server と client は 1 台の controller を選び、publisher の fan-out とは独立して動く。
 登録の完了を待たずにセグメントの送信を始めるため、PUT の成功だけでは鍵の登録成功を判断しない。
 外部サービスの鍵配信と公開 URL の設定は別途確認する。
 

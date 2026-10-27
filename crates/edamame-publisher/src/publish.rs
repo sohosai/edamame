@@ -20,9 +20,11 @@ use crate::ffmpeg::{self, Ffmpeg, PLAYLIST_NAME};
 /// 作業ディレクトリを走査する間隔
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// 1 回の PUT の制限時間
-const PUT_TIMEOUT: Duration = Duration::from_secs(10);
+const PUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// PUT を再試行するまでの待ち時間
 const PUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// 1 controller への PUT を諦めるまでの時間。全 controller の完了を待ち続けない
+const FANOUT_DEADLINE: Duration = Duration::from_secs(5);
 /// ffmpeg を起動し直すときの待ち時間
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(10);
@@ -405,7 +407,7 @@ fn register_stream_credentials(
 }
 
 /// 起動時に controller のプレイリストから次のセグメント番号を求める。
-/// プレイリストを取得できない場合は 0 から始める
+/// 全 controller の最大値を採用し、番号の再利用を避ける
 fn starting_sequence(context: &ChannelContext) -> u64 {
     let client = match Client::builder().timeout(PLAYLIST_TIMEOUT).build() {
         Ok(client) => client,
@@ -417,27 +419,31 @@ fn starting_sequence(context: &ChannelContext) -> u64 {
             return 0;
         }
     };
+    let mut next_sequence = 0;
     let mut last_error = None;
     for controller in &context.settings.controllers {
         match fetch_next_sequence(&client, &controller.url, context.channel_id()) {
             Ok(sequence) => {
-                println!(
-                    "channel={} starting from sequence {sequence}",
-                    context.channel_id()
-                );
-                return sequence;
+                next_sequence = next_sequence.max(sequence);
             }
             Err(message) => {
                 last_error = Some(message);
             }
         }
     }
-    println!(
-        "channel={} failed to read the playlist ({}); starting from 0",
-        context.channel_id(),
-        last_error.unwrap_or_else(|| "no controller".to_owned())
-    );
-    0
+    if next_sequence == 0 {
+        println!(
+            "channel={} failed to read the playlist ({}); starting from 0",
+            context.channel_id(),
+            last_error.unwrap_or_else(|| "no controller".to_owned())
+        );
+    } else {
+        println!(
+            "channel={} starting from sequence {next_sequence}",
+            context.channel_id()
+        );
+    }
+    next_sequence
 }
 
 /// channel 全体の次のセグメント番号を返す
@@ -1003,7 +1009,16 @@ fn run_publisher(
     Ok(())
 }
 
-/// 1 セット分のセグメントを暗号化して PUT する
+/// 1 controller への fan-out の結果
+enum ControllerResult {
+    Success,
+    Skipped,
+    Stopped,
+    Expired,
+    Fatal(String),
+}
+
+/// 1 セット分のセグメントを、全 controller へ並列に PUT する
 fn publish_set(
     client: &Client,
     context: &ChannelContext,
@@ -1035,57 +1050,102 @@ fn publish_set(
         let encrypted = encrypt_segment(&context.key, &iv, &plaintext);
         let iv_hex = hex_encode(&iv);
 
-        loop {
-            if stop.load(Ordering::Relaxed) || channel_stop.load(Ordering::Relaxed) {
-                return Err(PublishError::Abandoned("stopping".to_owned()));
-            }
-            if set.enqueued_at.elapsed() > max_age {
-                return Err(PublishError::Abandoned("expired".to_owned()));
-            }
-            let mut retry_message = None;
-            let mut published = false;
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(context.settings.controllers.len());
             for controller in &context.settings.controllers {
-                let url = segment_url(
-                    &controller.url,
-                    context.channel_id(),
-                    &rendition.quality,
-                    &set.identifier,
-                );
-                match put_segment(client, context, rendition, &url, &iv_hex, encrypted.clone()) {
-                    Ok(sequence) => {
-                        println!(
-                            "channel={} published index={} quality={} identifier={} sequence={sequence} controller={}",
-                            context.channel_id(),
-                            set.index,
-                            file.quality,
-                            set.identifier,
-                            controller.url
-                        );
-                        published = true;
-                        break;
+                let encrypted = encrypted.clone();
+                let iv_hex = iv_hex.clone();
+                handles.push(scope.spawn(move || {
+                    let url = segment_url(
+                        &controller.url,
+                        context.channel_id(),
+                        &rendition.quality,
+                        &set.identifier,
+                    );
+                    let started = Instant::now();
+                    loop {
+                        if stop.load(Ordering::Relaxed) || channel_stop.load(Ordering::Relaxed) {
+                            return ControllerResult::Stopped;
+                        }
+                        if set.enqueued_at.elapsed() > max_age {
+                            return ControllerResult::Expired;
+                        }
+                        match put_segment(client, context, rendition, &url, &iv_hex, encrypted.clone()) {
+                            Ok(sequence) => {
+                                println!(
+                                    "channel={} published index={} quality={} identifier={} sequence={sequence} controller={}",
+                                    context.channel_id(),
+                                    set.index,
+                                    file.quality,
+                                    set.identifier,
+                                    controller.url
+                                );
+                                return ControllerResult::Success;
+                            }
+                            Err(PutError::Retryable(message)) => {
+                                if started.elapsed() >= FANOUT_DEADLINE {
+                                    println!(
+                                        "channel={} skipping controller={} index={} quality={} after {message}",
+                                        context.channel_id(),
+                                        controller.url,
+                                        set.index,
+                                        file.quality
+                                    );
+                                    return ControllerResult::Skipped;
+                                }
+                                println!(
+                                    "channel={} retrying controller={} index={} quality={}: {message}",
+                                    context.channel_id(),
+                                    controller.url,
+                                    set.index,
+                                    file.quality
+                                );
+                                sleep_interruptible(PUT_RETRY_INTERVAL, stop, channel_stop);
+                            }
+                            Err(PutError::Fatal(message)) => {
+                                return ControllerResult::Fatal(format!(
+                                    "failed to publish index={} quality={} controller={}: {message}",
+                                    set.index, file.quality, controller.url
+                                ));
+                            }
+                        }
                     }
-                    Err(PutError::Retryable(message)) => {
-                        retry_message = Some(message);
-                    }
-                    Err(PutError::Fatal(message)) => {
-                        return Err(PublishError::Fatal(format!(
-                            "failed to publish index={} quality={}: {message}",
-                            set.index, file.quality
-                        )));
-                    }
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("fan-out thread panicked"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut success = false;
+        let mut skipped = false;
+        let mut stopped = false;
+        let mut expired = false;
+        for result in results {
+            match result {
+                ControllerResult::Success => success = true,
+                ControllerResult::Skipped => skipped = true,
+                ControllerResult::Stopped => stopped = true,
+                ControllerResult::Expired => expired = true,
+                ControllerResult::Fatal(message) => {
+                    return Err(PublishError::Fatal(message));
                 }
             }
-            if published {
-                break;
+        }
+        if !success {
+            if stopped {
+                return Err(PublishError::Abandoned("stopping".to_owned()));
             }
-            println!(
-                "channel={} retrying index={} quality={}: {}",
-                context.channel_id(),
-                set.index,
-                file.quality,
-                retry_message.unwrap_or_else(|| "no controller succeeded".to_owned())
-            );
-            sleep_interruptible(PUT_RETRY_INTERVAL, stop, channel_stop);
+            if expired {
+                return Err(PublishError::Abandoned("expired".to_owned()));
+            }
+            if skipped {
+                return Err(PublishError::Abandoned(
+                    "all controllers were skipped".to_owned(),
+                ));
+            }
+            return Err(PublishError::Abandoned("no controller".to_owned()));
         }
         let _ = fs::remove_file(&file.path);
     }
@@ -1118,7 +1178,7 @@ fn put_segment(
     if let Some(token) = &context.settings.auth_token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let response = match request.send() {
+    let response = match request.timeout(PUT_TIMEOUT).send() {
         Ok(response) => response,
         Err(error) => return Err(PutError::Retryable(format!("request failed: {error}"))),
     };

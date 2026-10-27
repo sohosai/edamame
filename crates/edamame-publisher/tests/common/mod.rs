@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-use edamame_controller::cluster::{ClusterState, Role};
+use edamame_controller::cluster::ClusterState;
 use edamame_controller::{
     CanonicalStore, ControllerConfig, ControllerState, router as controller_router,
 };
@@ -82,7 +82,6 @@ fn serve(state: Arc<ControllerState>, auth_token: &str) -> String {
                 external_min_percent: 1,
                 cors_origin: vec![],
                 public_url: format!("http://{addr}"),
-                metric: 100,
                 auth_token,
                 seed: vec![],
                 tls_cert: None,
@@ -94,10 +93,6 @@ fn serve(state: Arc<ControllerState>, auth_token: &str) -> String {
             };
             let cluster = ClusterState::new(&config, state.clone()).expect("cluster を作れません");
             tokio::spawn(cluster.clone().run());
-            // publisher が最初の PUT を送る前に、初回の選出を完了させる。
-            while cluster.health().await.role != Role::Leader {
-                tokio::task::yield_now().await;
-            }
             let app = controller_router(state, &cors(), cluster);
             sender
                 .send(listener.local_addr().expect("アドレスを読めません"))
@@ -178,7 +173,7 @@ impl Worker {
                 let cache = Cache::new(12).expect("キャッシュを作れません");
                 let state = WorkerState::new(
                     "worker-test".to_owned(),
-                    controller_url,
+                    vec![controller_url],
                     public_url,
                     1,
                     cache,
@@ -337,6 +332,24 @@ impl Publisher {
         if let Some(token) = auth_token {
             command.arg("--auth-token").arg(token);
         }
+        Self::spawn(command)
+    }
+
+    /// TOML の `[[controller]]` だけを使い、`--controller-url` を渡さずに起動する
+    pub fn start_with_config(config: &Path, auth_token: Option<&str>, work_dir: &Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_edamame-publisher"));
+        command
+            .arg("--config")
+            .arg(config)
+            .arg("--work-dir")
+            .arg(work_dir);
+        if let Some(token) = auth_token {
+            command.arg("--auth-token").arg(token);
+        }
+        Self::spawn(command)
+    }
+
+    fn spawn(mut command: Command) -> Self {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("publisher を起動できません");
         let log = Arc::new(Mutex::new(Vec::new()));
