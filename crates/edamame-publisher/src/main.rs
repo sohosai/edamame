@@ -3,6 +3,7 @@
 mod config;
 mod credentials;
 mod ffmpeg;
+mod metrics;
 mod publish;
 
 use std::fs;
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 
 use crate::config::{Cli, PublisherSettings};
+use crate::metrics::PublisherMetrics;
 use crate::publish::ChannelContext;
 
 fn main() {
@@ -59,6 +61,21 @@ fn run() -> Result<i32, String> {
             .map_err(|error| format!("failed to install the signal handler: {error}"))?;
     }
 
+    // OTel の tonic exporter は Tokio runtime を必要とする。
+    // publisher 本体は同期スレッドで動かすため、telemetry 用の runtime だけを保持する。
+    let telemetry_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create the telemetry runtime: {error}"))?;
+    let _runtime_guard = telemetry_runtime.enter();
+    let instance_id = instance_id();
+    let mut telemetry = edamame_telemetry::init("edamame-publisher", &instance_id);
+    if telemetry.is_enabled() {
+        println!("OpenTelemetry metrics enabled (instance: {instance_id})");
+    }
+    let metrics = Arc::new(PublisherMetrics::new());
+    metrics.record_up();
+
     let failed = Arc::new(AtomicBool::new(false));
     let settings = Arc::new(settings);
     let mut handles = Vec::new();
@@ -68,6 +85,7 @@ fn run() -> Result<i32, String> {
             input_index,
             key,
             work_dir: work_dir.join(format!("channel-{input_index}")),
+            metrics: Arc::clone(&metrics),
         };
         println!(
             "channel={} input_url={} renditions={}",
@@ -86,6 +104,8 @@ fn run() -> Result<i32, String> {
         let _ = handle.join();
     }
 
+    metrics.record_down();
+    telemetry.shutdown();
     println!("stopped");
     if failed.load(Ordering::Relaxed) {
         println!("work directory is kept at {}", work_dir.display());
@@ -113,4 +133,15 @@ fn make_work_dir(requested: Option<PathBuf>) -> Result<PathBuf, String> {
         )
     })?;
     Ok(session)
+}
+
+/// OpenTelemetry の `service.instance.id` に使う値を返す
+fn instance_id() -> String {
+    std::env::var("EDAMAME_INSTANCE_ID")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("publisher-{}", process::id()))
 }

@@ -1,23 +1,24 @@
 # 可観測性
 
-Edamame の controller と worker は OpenTelemetry metrics と health endpoint を実装済みです。
-publisher の計装と traces は Phase 2 で対応します。
+Edamame の controller / worker / publisher は OpenTelemetry metrics を実装済みです。
+controller / worker は health endpoint も提供します。traces は Phase 2 で検討します。
 
 ## 現在の構成
 
 ```text
 edamame-controller ─┐
                     ├─ OTLP/gRPC ─> OTel Collector ─> Prometheus ─> Grafana
-edamame-worker ─────┘                 (iromono)
+edamame-worker ─────┤                 (iromono)
+edamame-publisher ──┘
 ```
 
-- controller / worker は OTLP/gRPC で metrics を送る
+- controller / worker / publisher は OTLP/gRPC で metrics を送る
 - OTel Collector は Prometheus exporter で metrics を公開する
 - Prometheus の `edamame` job が Collector を scrape する
 - Prometheus の `edamame-health` job が blackbox_exporter 経由で controller / worker の `/health` を probe する
 - Grafana の `Edamame` フォルダで可視化する
 - 通知は既存の Discord contact point `infra 死活監視` を使う
-- traces と publisher metrics はまだない
+- traces はまだない。publisher metrics は導入済み
 
 本番の送信先:
 
@@ -59,6 +60,19 @@ http://iromono:3000/d/edamame-overview
 | `edamame.worker.segments.served` | Counter | `channel_id`, `quality` | 視聴者へ配信したセグメント数 |
 | `edamame.worker.errors` | Counter | `operation` | worker のエラー数。`operation` は `register` / `sync` / `download` |
 
+### Publisher
+
+| メトリクス | 種類 | ラベル | 説明 |
+| --- | --- | --- | --- |
+| `edamame.publisher.up` | Gauge | なし | publisher の稼働状態 |
+| `edamame.publisher.segments.encoded` | Counter | `channel_id`, `quality` | encode したセグメント数 |
+| `edamame.publisher.segments.published` | Counter | `channel_id`, `quality` | controller への upload に成功したセグメント数 |
+| `edamame.publisher.upload.errors` | Counter | `channel_id`, `quality`, `kind` | upload のエラー数。`kind` は `retryable` / `fatal` |
+| `edamame.publisher.queue.depth` | Gauge | `channel_id` | publish 待ち queue の深さ |
+
+publisher は最初の導入として、稼働状態・encode / publish 数・upload エラー・queue 深さを送ります。
+publish 成功からの経過時間、encode / upload 時間、ffmpeg の再起動回数は Phase 2 で追加します。
+
 Prometheus 上では、OTel の counter に `_total` が付き、unit `s` は `_seconds` になります。
 例えば `edamame.worker.cache.segments` は `edamame_worker_cache_segments`、`edamame.controller.errors` は `edamame_controller_errors_total` になります。
 
@@ -72,7 +86,8 @@ Prometheus 上では、OTel の counter に `_total` が付き、unit `s` は `_
 | `env` | Prometheus の scrape 設定で `dev` を付与する |
 
 worker の `service.instance.id` は `worker_id` です。
-controller の `service.instance.id` は `EDAMAME_INSTANCE_ID`、`HOSTNAME`、`COMPUTERNAME` の順で決まります。
+controller と publisher の `service.instance.id` は `EDAMAME_INSTANCE_ID`、`HOSTNAME`、`COMPUTERNAME` の順で決まります。
+publisher はどれもない場合、`publisher-<pid>` になります。
 
 ## Health endpoint
 
@@ -223,7 +238,7 @@ OTEL_METRIC_EXPORT_INTERVAL=5000 \
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics 専用の送信先。指定時は `OTEL_EXPORTER_OTLP_ENDPOINT` より優先される |
 | `OTEL_SDK_DISABLED` | `true` を指定すると送信しない |
 | `OTEL_METRIC_EXPORT_INTERVAL` | metrics の送信間隔（ミリ秒）。アプリの既定は 10000 |
-| `OTEL_SERVICE_NAME` | `service.name` の上書き（省略時は `edamame-controller` / `edamame-worker`） |
+| `OTEL_SERVICE_NAME` | `service.name` の上書き（省略時は `edamame-controller` / `edamame-worker` / `edamame-publisher`） |
 | `OTEL_EXPORTER_OTLP_HEADERS` | 送信先が要求するヘッダー（`key=value` をカンマ区切り） |
 
 `OTEL_EXPORTER_OTLP_ENDPOINT` に scheme がない場合は `http://` が補われる。
@@ -278,22 +293,38 @@ curl -s 'http://iromono:9090/api/v1/label/__name__/values' | jq -r '.data[] | se
 
 ## Phase 2
 
-Phase 2 では、publisher を含む End-to-End の可観測性と traces を追加します。
+Phase 2 では、まず publisher の OTLP metrics を導入し、その後 publisher を含む End-to-End の可観測性を追加します。
+traces は要否が未定のため保留中です。
 
 ### 1. Publisher metrics
 
+導入済み:
+
 - `edamame-publisher` に `edamame-telemetry` を組み込み、controller / worker と同じ Collector へ OTLP metrics を送る
-- channel / quality / input ごとに以下を計装する
-  - publisher の稼働状態と最終 publish 成功からの経過時間
-  - encode したセグメント数、encode 時間、encode エラー
+- 次のメトリクスを実装した
+  - `edamame.publisher.up`
+  - `edamame.publisher.segments.encoded`
+  - `edamame.publisher.segments.published`
+  - `edamame.publisher.upload.errors`
+  - `edamame.publisher.queue.depth`
+- publisher は同期スレッドで動くため、OTLP/tonic exporter 用の Tokio runtime を publisher 内で保持する
+- Linux コンテナでコンパイル、ユニットテスト、iromono Collector への OTLP 送信を確認した
+
+残り:
+
+- channel / quality / input ごとに以下を追加する
+  - 最終 publish 成功からの経過時間
+  - encode 時間、encode エラー
   - ffmpeg プロセスの起動回数、異常終了、再接続
-  - controller への upload 時間、upload エラー、再試行
-  - 内部 queue の深さ、未送信セグメント数
+  - controller への upload 時間、再試行
+  - 未送信セグメント数、drop したセグメント数
 - publisher 用のダッシュボードとアラートを追加する
   - publisher down、publish stale、encode error rate、upload error rate、queue backlog
 - Windows では publisher のビルド・実行が難しいため、Linux / WSL で検証する
 
-### 2. Traces
+### 2. Traces（保留）
+
+trace の要否が未定のため、いったん保留にします。実装する場合の候補:
 
 - OTel Collector に traces pipeline を追加し、Tempo へ送る
 - Grafana に Tempo datasource を追加する

@@ -7,12 +7,15 @@ edition.workspace = true
 aes.workspace = true
 cbc.workspace = true
 clap.workspace = true
+edamame-telemetry = { path = "../edamame-telemetry" }
 getrandom.workspace = true
 libc.workspace = true
+opentelemetry.workspace = true
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
@@ -22,4 +25,3 @@ cbc.workspace = true
 edamame-controller = { path = "../edamame-controller" }
 edamame-domain = { path = "../edamame-domain" }
 edamame-worker = { path = "../edamame-worker" }
-tokio.workspace = true
