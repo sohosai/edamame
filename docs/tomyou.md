@@ -274,8 +274,7 @@ hosts = [
 
 `relay.bind` は OBS から `tomyou` への待ち受けポートであり、この表とは別である。
 `1A` でも OBS は `127.0.0.1:1935` へ接続し、`tomyou` から publisher へは 1936 番へ送る。
-同じホストで `tomyou` の RTMP サーバと publisher を動かす場合、`uni` の 1935 番が衝突する。
-その場合は別ホストにするか、どちらかのポートを明示してずらす。
+`tomyou` と publisher は別ホストで動かす前提とし、同じホストでのポート共有は考慮しない。
 
 publisher 側の `input_url` も同じチャンネル別ポートを使う。
 `tomyou` の `channel_id` と publisher の `channel_id` を一致させ、同じポートに接続する。
