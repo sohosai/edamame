@@ -36,7 +36,7 @@ OBS は 30.2 以降の WebSocket 5.5 を使う。
 
 1. 既に配信中でないことを確認する。
 2. 変更前の配信先を保存する。
-3. 配信先を `rtmp_custom` の `rtmp://127.0.0.1:1935/live/<channel>` にする。
+3. 配信先を `rtmp_custom` の `rtmp://<relay.bind>/live/<channel>` にする。
 4. 配信を開始する。
 5. 停止時に、配信先がまだ `tomyou` の設定なら元へ戻す。
 
@@ -49,6 +49,29 @@ OBS のシーン、ソース、解像度を `tomyou` が自動変更すること
 
 OBS が既に配信中の場合は、`tomyou` は開始しない。
 OBS WebSocket だけが切れても、RTMP 入力が続いている間は送信を維持する。
+
+## RTMP の接続情報
+
+`tomyou` の RTMP サーバへ接続するために必要な情報は次の 2 つだけである。
+GUI の「入力」にも同じ内容を表示する。
+
+- URL: `rtmp://<relay.bind>/live/<channel_id>`
+- パスワード: なし
+
+OBS で手動設定する場合は、サーバーに `rtmp://<relay.bind>/live`、ストリームキーに `<channel_id>` を指定する。
+app は `live` で固定し、ストリームキーは設定の `channel_id` と完全に一致させる。
+RTMP 側には認証がないため、パスワード欄は使わない。
+OBS WebSocket のパスワードは RTMP の接続には使わない。
+
+既定の `relay.bind` は `127.0.0.1:1935` である。
+この場合、接続できるのは同じ PC からだけである。
+別端末から接続する場合は `relay.bind` を `0.0.0.0:1935` などに変更し、TCP の 1935 番ポートを開放する。
+`0.0.0.0` は待ち受け専用のアドレスであり、接続先には使えない。
+接続先には `tomyou` を動かす PC の IP アドレスを指定する。
+
+RTMP URL は配信を開始して RTMP サーバが待ち受けを始めてから有効になる。
+表示された URL は到達性を保証しない。
+ホスト名、ポート、ファイアウォール、NAT、VPN/ACL は別途確認する。
 
 ## GStreamer の条件
 
@@ -222,20 +245,45 @@ ImageFlux は Edamame の controller より後ろに置くため、既定の 100
 秘密情報を含むため、設定ファイルを配布したりリポジトリへ commit したりしない。
 ログと画面のコピー機能には秘密情報を出さない。
 
-## publisher の RTMP URL
+## publisher の接続先
 
-publisher の RTMP URL は `publisher.rtmp_urls` に複数指定できる。
-上から順に使い、送信が終了したら次の URL へ切り替える。
+publisher のホストは `publisher.hosts` に複数指定できる。
+上から順に使い、送信が終了したら次のホストへ切り替える。
 最後まで失敗したら、1 秒から 30 秒のバックオフを空けて先頭へ戻る。
-送信先が 1 つだけなら `publisher.rtmp_url` でも指定できる。
-両方ある場合は `rtmp_urls` を使う。
+
+```toml
+[publisher]
+hosts = [
+  "publisher.example.test",
+  "publisher2.example.test",
+]
+```
+
+送信先 URL は `rtmp://<host>:<port>/live/<channel_id>` になる。
+ポートを省略した場合は、チャンネルごとの既定ポートを使う。
+
+| channel_id | ポート |
+| --- | --- |
+| `uni` | 1935 |
+| `1A` | 1936 |
+| `kaikan` | 1937 |
+
+ホストにポートを明示すると、その値で上書きする。
+たとえば `publisher.example.test:4001` は `rtmp://publisher.example.test:4001/live/<channel_id>` になる。
+複数ホストでポートが異なる場合は、各ホストにポートを明示する。
+
+`relay.bind` は OBS から `tomyou` への待ち受けポートであり、この表とは別である。
+`1A` でも OBS は `127.0.0.1:1935` へ接続し、`tomyou` から publisher へは 1936 番へ送る。
+同じホストで `tomyou` の RTMP サーバと publisher を動かす場合、`uni` の 1935 番が衝突する。
+その場合は別ホストにするか、どちらかのポートを明示してずらす。
+
+publisher 側の `input_url` も同じチャンネル別ポートを使う。
+`tomyou` の `channel_id` と publisher の `channel_id` を一致させ、同じポートに接続する。
 
 publisher の RTMP URL は、`tomyou` を動かすホストから到達できる必要がある。
-
 到達性はホスト名、ポート、ファイアウォール、NAT、VPN/ACL に依存する。
 `nc -vz <host> <port>` などで確認する。
 RTMP のチャンネル名は大文字小文字を区別する。
-設定した channel と publisher の入力名を一致させる。
 
 到達できない場合は、ローカルの RTMP 受信先で GStreamer のパイプラインを検証し、環境側の問題として切り分ける。
 アプリは到達性を推測して設定を変更しない。

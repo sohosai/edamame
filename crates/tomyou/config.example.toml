@@ -12,12 +12,14 @@ port = 4455
 # password もこのファイルへ保存される
 
 [publisher]
-# edamame-publisher が待ち受ける RTMP URL。
-# 2 つ以上書くと、上から順に使い、送信が終わったら次の URL へ切り替える。
-# 1 つだけなら rtmp_url = "rtmp://..." でもよい。
-rtmp_urls = [
-  "rtmp://publisher.example.test:1935/live/uni",
-  "rtmp://publisher2.example.test:1935/live/uni",
+# edamame-publisher のホスト。
+# 2 つ以上書くと、上から順に使い、送信が終わったら次のホストへ切り替える。
+# ポートを省略すると、チャンネルごとの既定値を使う。
+# 既定ポート: uni = 1935、1A = 1936、kaikan = 1937。
+# ホストごとにポートを変える場合は publisher.example.test:4001 のように指定する。
+hosts = [
+  "publisher.example.test",
+  "publisher2.example.test",
 ]
 
 [stream_credentials]

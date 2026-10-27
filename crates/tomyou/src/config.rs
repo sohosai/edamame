@@ -42,37 +42,87 @@ pub struct ObsConfig {
     pub password: String,
 }
 
-/// edamame-publisher の RTMP 入力
+/// edamame-publisher の送信先
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublisherConfig {
-    /// 送信先が 1 つだけのときの指定
+    /// publisher のホスト。ポートを省略するとチャンネルごとの既定値を使う
     ///
-    /// 例: rtmp://publisher.example.test:1935/live/uni
+    /// 例: publisher.example.test
     #[serde(default)]
-    pub rtmp_url: String,
-    /// 複数の送信先。上から順に試し、失敗したら次の送信先へ切り替える
-    #[serde(default)]
-    pub rtmp_urls: Vec<String>,
+    pub hosts: Vec<String>,
 }
 
 impl PublisherConfig {
-    /// 送信先を上から順に返す
-    ///
-    /// `rtmp_urls` を優先し、無ければ `rtmp_url` を使う。
-    /// 前後の空白と空行は無視する。
-    pub fn urls(&self) -> Vec<String> {
-        let candidates = if self.rtmp_urls.is_empty() {
-            vec![self.rtmp_url.as_str()]
-        } else {
-            self.rtmp_urls.iter().map(String::as_str).collect()
-        };
-        candidates
-            .into_iter()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(str::to_owned)
+    /// 前後の空白と空行を除いたホストを返す
+    pub fn hosts(&self) -> Vec<&str> {
+        self.hosts
+            .iter()
+            .map(|host| host.trim())
+            .filter(|host| !host.is_empty())
             .collect()
     }
+
+    /// publisher の送信先 URL を上から順に組み立てる
+    pub fn urls(&self, channel_id: &str) -> Result<Vec<String>> {
+        self.hosts()
+            .into_iter()
+            .map(|host| publisher_url(host, channel_id))
+            .collect()
+    }
+}
+
+/// チャンネルごとの publisher 側 RTMP ポート
+///
+/// docs/tomyou.md の表と一致させる。
+fn channel_port(channel_id: &str) -> Option<u16> {
+    match channel_id {
+        "uni" => Some(1935),
+        "1A" => Some(1936),
+        "kaikan" => Some(1937),
+        _ => None,
+    }
+}
+
+/// ホストとチャンネルから publisher の送信先 URL を作る
+fn publisher_url(host: &str, channel_id: &str) -> Result<String> {
+    // URL を組み立てる前に、ホスト以外の要素が混ざっていないか確認する
+    if host.contains("://")
+        || host.chars().any(|character| {
+            character.is_whitespace() || matches!(character, '/' | '?' | '#' | '@')
+        })
+    {
+        bail!("publisher.hosts はホストと任意のポートだけを指定してください: {host}");
+    }
+    let probe = url::Url::parse(&format!("rtmp://{host}/"))
+        .with_context(|| format!("publisher.hosts の値が不正です: {host}"))?;
+    let host_text = probe
+        .host_str()
+        .with_context(|| format!("publisher.hosts にホストがありません: {host}"))?;
+    let port = match probe.port() {
+        Some(0) => bail!("publisher.hosts のポートは 1 以上です: {host}"),
+        Some(port) => port,
+        None => channel_port(channel_id).with_context(|| {
+            format!(
+                "channel {channel_id} の publisher ポートが決まりません。host:port の形式で指定してください: {host}"
+            )
+        })?,
+    };
+    let text = format!("rtmp://{host_text}:{port}/live/{channel_id}");
+    let url = url::Url::parse(&text)
+        .with_context(|| format!("publisher の送信先が URL として不正です: {text}"))?;
+    // 想定外のユーザー情報やパスが混ざっていないことを確認する
+    if url.scheme() != "rtmp"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != format!("/live/{channel_id}")
+    {
+        bail!("publisher の送信先が不正です: {text}");
+    }
+    Ok(text)
 }
 
 /// ImageFlux を fallback 配信として登録する live2025-server の設定
@@ -396,18 +446,17 @@ impl Config {
         if self.obs.port == 0 {
             bail!("OBS のポートが 0 です");
         }
-        self.relay
+        let relay_bind: std::net::SocketAddr = self
+            .relay
             .bind
-            .parse::<std::net::SocketAddr>()
+            .parse()
             .context("relay.bind は IP:ポート の形式で指定してください")?;
-        for publisher_url in self.publisher.urls() {
-            let url = url::Url::parse(&publisher_url).with_context(|| {
-                format!("publisher の送信先が URL として不正です: {publisher_url}")
-            })?;
-            if url.scheme() != "rtmp" {
-                bail!("publisher の送信先は rtmp:// で始めてください: {publisher_url}");
-            }
+        // ポート 0 だと画面に出す URL と実際の待ち受けポートがずれる
+        if relay_bind.port() == 0 {
+            bail!("relay.bind のポートは 1 以上です");
         }
+        // 全ホストについて、URL を組み立てられることを確認する
+        self.publisher.urls(&self.channel_id)?;
         if let Some(path) = &self.gstreamer.path
             && path.as_os_str().is_empty()
         {
@@ -455,7 +504,17 @@ impl Config {
 
     /// Edamame 側の送信設定がそろっているか
     pub fn edamame_enabled(&self) -> bool {
-        !self.publisher.urls().is_empty()
+        !self.publisher.hosts().is_empty()
+    }
+
+    /// OBS に設定する RTMP サーバの URL
+    pub fn relay_server(&self) -> String {
+        format!("rtmp://{}/live", self.relay.bind)
+    }
+
+    /// OBS から tomyou へ接続するときの RTMP URL
+    pub fn relay_url(&self) -> String {
+        format!("{}/{}", self.relay_server(), self.channel_id)
     }
 }
 
@@ -486,19 +545,18 @@ mod tests {
     }
 
     #[test]
-    fn publisher_urls_use_the_list_in_order() {
+    fn publisher_hosts_build_urls_with_channel_ports() {
         let mut config = Config::default();
-        config.publisher.rtmp_url = "rtmp://single.example.test/live/1A".to_owned();
-        config.publisher.rtmp_urls = vec![
-            "rtmp://first.example.test/live/1A".to_owned(),
-            "  rtmp://second.example.test/live/1A  ".to_owned(),
+        config.publisher.hosts = vec![
+            "first.example.test".to_owned(),
+            "  second.example.test:4001  ".to_owned(),
             "   ".to_owned(),
         ];
         assert_eq!(
-            config.publisher.urls(),
+            config.publisher.urls("1A").expect("送信先を組み立てられる"),
             vec![
-                "rtmp://first.example.test/live/1A",
-                "rtmp://second.example.test/live/1A"
+                "rtmp://first.example.test:1936/live/1A",
+                "rtmp://second.example.test:4001/live/1A"
             ]
         );
         assert!(config.edamame_enabled());
@@ -506,32 +564,88 @@ mod tests {
     }
 
     #[test]
-    fn publisher_urls_fall_back_to_a_single_url() {
-        let mut config = Config::default();
-        config.publisher.rtmp_url = " rtmp://single.example.test/live/1A ".to_owned();
-        assert_eq!(
-            config.publisher.urls(),
-            vec!["rtmp://single.example.test/live/1A"]
-        );
-        assert!(config.edamame_enabled());
+    fn publisher_hosts_use_default_port_per_channel() {
+        for (channel, port) in [("uni", 1935), ("1A", 1936), ("kaikan", 1937)] {
+            let config = Config {
+                channel_id: channel.to_owned(),
+                publisher: PublisherConfig {
+                    hosts: vec!["publisher.example.test".to_owned()],
+                },
+                ..Config::default()
+            };
+            assert_eq!(
+                config
+                    .publisher
+                    .urls(channel)
+                    .expect("送信先を組み立てられる"),
+                vec![format!(
+                    "rtmp://publisher.example.test:{port}/live/{channel}"
+                )]
+            );
+            config.validate().expect("既定ポートで有効");
+        }
     }
 
     #[test]
-    fn rejects_non_rtmp_publisher_url() {
+    fn publisher_host_supports_ipv6() {
         let mut config = Config::default();
-        config.publisher.rtmp_urls = vec![
-            "rtmp://first.example.test/live/1A".to_owned(),
-            "https://second.example.test/live/1A".to_owned(),
-        ];
+        config.publisher.hosts = vec!["[::1]".to_owned()];
+        assert_eq!(
+            config.publisher.urls("1A").expect("送信先を組み立てられる"),
+            vec!["rtmp://[::1]:1936/live/1A"]
+        );
+    }
+
+    #[test]
+    fn rejects_publisher_host_with_scheme_or_path() {
+        for host in [
+            "rtmp://publisher.example.test",
+            "publisher.example.test/live/1A",
+            "publisher.example.test?x=1",
+            "publisher.example.test#fragment",
+            "user@publisher.example.test",
+        ] {
+            let mut config = Config::default();
+            config.publisher.hosts = vec![host.to_owned()];
+            assert!(config.validate().is_err(), "受理してはいけない: {host}");
+        }
+    }
+
+    #[test]
+    fn rejects_publisher_host_with_zero_port() {
+        let mut config = Config::default();
+        config.publisher.hosts = vec!["publisher.example.test:0".to_owned()];
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn disables_edamame_without_publisher_url() {
+    fn disables_edamame_without_publisher_host() {
         let mut config = Config::default();
-        config.publisher.rtmp_url.clear();
-        config.publisher.rtmp_urls = vec!["  ".to_owned()];
+        config.publisher.hosts = vec!["  ".to_owned()];
         assert!(!config.edamame_enabled());
+    }
+
+    #[test]
+    fn relay_url_uses_bind_and_channel() {
+        let config = Config::default();
+        assert_eq!(config.relay_server(), "rtmp://127.0.0.1:1935/live");
+        assert_eq!(config.relay_url(), "rtmp://127.0.0.1:1935/live/uni");
+
+        let config = Config {
+            channel_id: "1A".to_owned(),
+            relay: RelayConfig {
+                bind: "0.0.0.0:4001".to_owned(),
+            },
+            ..Config::default()
+        };
+        assert_eq!(config.relay_url(), "rtmp://0.0.0.0:4001/live/1A");
+    }
+
+    #[test]
+    fn rejects_relay_bind_with_zero_port() {
+        let mut config = Config::default();
+        config.relay.bind = "127.0.0.1:0".to_owned();
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -623,6 +737,9 @@ mod tests {
                 ingest_token: "ingest-secret".to_owned(),
                 ..StreamCredentialsConfig::default()
             },
+            publisher: PublisherConfig {
+                hosts: vec!["publisher.example.test".to_owned()],
+            },
             imageflux: ImageFluxConfig {
                 token: "imageflux-secret".to_owned(),
                 ..ImageFluxConfig::default()
@@ -634,6 +751,9 @@ mod tests {
         assert!(text.contains("obs-secret"));
         assert!(text.contains("imageflux-secret"));
         assert!(text.contains("ingest-secret"));
+        assert!(text.contains("publisher.example.test"));
+        let loaded = Config::load(&path).expect("保存した設定を読み込める");
+        assert_eq!(loaded.publisher.hosts, vec!["publisher.example.test"]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -645,6 +765,21 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         fs::remove_file(&path).expect("設定ファイルを消せる");
+    }
+
+    #[test]
+    fn rejects_old_publisher_url_keys() {
+        let text = r#"
+channel_id = "1A"
+
+[publisher]
+rtmp_urls = ["rtmp://publisher.example.test/live/1A"]
+"#;
+        let error = toml::from_str::<Config>(text).expect_err("旧キーは拒否する");
+        assert!(
+            error.to_string().contains("rtmp_urls"),
+            "旧キー名をエラーに含める: {error}"
+        );
     }
 
     #[test]
@@ -680,7 +815,7 @@ mod tests {
 channel_id = "1A"
 
 [publisher]
-rtmp_url = "rtmp://publisher.example.test:1936/live/1A"
+hosts = ["publisher.example.test"]
 
 [[imageflux.hls]]
 duration-seconds = 2

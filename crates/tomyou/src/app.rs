@@ -126,7 +126,7 @@ pub struct TomyouApp {
     show_settings: bool,
     show_license: bool,
     gstreamer_path_draft: String,
-    publisher_urls_draft: String,
+    publisher_hosts_draft: String,
     obs_snapshot: Option<StreamSnapshot>,
     stream_info: Option<StreamInfo>,
     /// 今 Edamame へ送っている送信先
@@ -150,7 +150,7 @@ impl TomyouApp {
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_default();
-        let publisher_urls_draft = config.publisher.urls().join("\n");
+        let publisher_hosts_draft = config.publisher.hosts().join("\n");
         Self {
             config,
             config_path,
@@ -173,7 +173,7 @@ impl TomyouApp {
             show_settings: false,
             show_license: false,
             gstreamer_path_draft,
-            publisher_urls_draft,
+            publisher_hosts_draft,
             obs_snapshot: None,
             stream_info: None,
             edamame_destination: None,
@@ -367,15 +367,13 @@ impl TomyouApp {
             Some(PathBuf::from(self.gstreamer_path_draft.trim()))
         };
         // 画面では 1 行に 1 つ並べているので、空行を落として保存する
-        self.config.publisher.rtmp_urls = self
-            .publisher_urls_draft
+        self.config.publisher.hosts = self
+            .publisher_hosts_draft
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect();
-        // 保存後は rtmp_urls に一本化する
-        self.config.publisher.rtmp_url.clear();
         let path = self.config_path_from_draft();
         match self.config.save(&path) {
             Ok(()) => {
@@ -430,7 +428,7 @@ impl TomyouApp {
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
-                self.publisher_urls_draft = config.publisher.urls().join("\n");
+                self.publisher_hosts_draft = config.publisher.hosts().join("\n");
                 self.config = config;
                 self.config_path = path.clone();
                 self.config_path_draft = path.display().to_string();
@@ -519,6 +517,11 @@ impl eframe::App for TomyouApp {
                 }
             });
             ui.add_space(8.0);
+            let relay_url = self.config.relay_url();
+            let relay_server = self.config.relay_server();
+            // 0.0.0.0 や :: は待ち受け専用で、そのままでは接続先に使えない
+            let relay_bind_is_unspecified = self.config.relay.bind.starts_with("0.0.0.0:")
+                || self.config.relay.bind.starts_with("[::]:");
             ui.group(|ui| {
                 ui.label(egui::RichText::new("入力").strong());
                 egui::Grid::new("input-status")
@@ -540,6 +543,17 @@ impl eframe::App for TomyouApp {
                         } else {
                             "待機中"
                         });
+                        ui.end_row();
+                        ui.label("RTMP URL");
+                        ui.horizontal(|ui| {
+                            ui.monospace(&relay_url);
+                            if ui.button("コピー").clicked() {
+                                ui.ctx().copy_text(relay_url.clone());
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("パスワード");
+                        ui.label("なし（認証なし）");
                         ui.end_row();
                         ui.label("チャンネル");
                         ui.label(&self.config.channel_id);
@@ -652,6 +666,18 @@ impl eframe::App for TomyouApp {
                         }
                         ui.end_row();
                     });
+                ui.label(format!(
+                    "OBS で手動設定する場合は、サーバー {relay_server}、ストリームキー {} を指定します。",
+                    self.config.channel_id
+                ));
+                ui.label("RTMP URL は配信中だけ有効です。");
+                if relay_bind_is_unspecified {
+                    tone_label(
+                        ui,
+                        Tone::Warn,
+                        "0.0.0.0 は待ち受け専用です。接続先にはこの PC の IP を使ってください。",
+                    );
+                }
             });
             ui.add_space(8.0);
             ui.columns(2, |columns| {
@@ -665,7 +691,11 @@ impl eframe::App for TomyouApp {
                         ("停止", Tone::Idle)
                     };
                     tone_label(ui, tone, text);
-                    let urls = self.config.publisher.urls();
+                    let urls = self
+                        .config
+                        .publisher
+                        .urls(&self.config.channel_id)
+                        .unwrap_or_default();
                     let destination = self
                         .edamame_destination
                         .clone()
@@ -812,14 +842,17 @@ impl TomyouApp {
                         ui.end_row();
                     });
                 ui.add_space(4.0);
-                ui.label("publisher RTMP URL（上から順に試し、失敗したら次へ切り替える）");
+                ui.label("publisher ホスト（上から順に試し、失敗したら次へ切り替える）");
                 ui.add(
-                    egui::TextEdit::multiline(&mut self.publisher_urls_draft)
+                    egui::TextEdit::multiline(&mut self.publisher_hosts_draft)
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
-                        .hint_text("rtmp://publisher.example.test:1935/live/uni"),
+                        .hint_text("publisher.example.test"),
                 );
-                ui.label("1 行に 1 つ。上から順に使い、失敗したら次の送信先へ移ります。");
+                ui.label(
+                    "1 行に 1 つ。ポートを省略するとチャンネルごとの既定値を使います。チャンネルは /live/<channel> として自動で付きます。",
+                );
+                ui.label("既定ポート: uni 1935、1A 1936、kaikan 1937。");
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("fallback 登録").strong());
                 egui::Grid::new("settings-stream-credentials")
