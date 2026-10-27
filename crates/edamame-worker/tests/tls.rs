@@ -47,10 +47,10 @@ async fn serves_segments_over_static_tls() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
-    let config = edamame_worker::tls::static_config(cert, key).await.unwrap();
+    let config = edamame_tls::static_config(cert, key).await.unwrap();
     let app = router(state, &CorsOrigins::Disabled);
     tokio::spawn(async move {
-        edamame_worker::tls::serve_static(listener, app, config)
+        edamame_tls::serve_static(listener, app, config)
             .await
             .unwrap();
     });
@@ -99,11 +99,11 @@ async fn static_server_stops_when_shutdown_fires() {
     .unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let config = edamame_worker::tls::static_config(cert, key).await.unwrap();
+    let config = edamame_tls::static_config(cert, key).await.unwrap();
     let app = router(state, &CorsOrigins::Disabled);
     let (shutdown, wait_shutdown) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        edamame_worker::tls::serve_static_until(listener, app, config, async {
+        edamame_tls::serve_static_until(listener, app, config, async {
             let _ = wait_shutdown.await;
         })
         .await
@@ -146,10 +146,10 @@ async fn resumes_previous_session() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
-    let config = edamame_worker::tls::static_config(cert, key).await.unwrap();
+    let config = edamame_tls::static_config(cert, key).await.unwrap();
     let app = router(state, &CorsOrigins::Disabled);
     tokio::spawn(async move {
-        edamame_worker::tls::serve_static(listener, app, config)
+        edamame_tls::serve_static(listener, app, config)
             .await
             .unwrap();
     });

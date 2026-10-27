@@ -339,7 +339,7 @@ python3 scripts/loop-publisher.py \
 | option | 必須条件と説明 |
 | --- | --- |
 | `--source` | 必須。入力 MP4 のパス |
-| `--controller-url` | 必須。controller の HTTP の絶対 URL。HTTPS は初期接続先に指定できず、query と fragment は不可 |
+| `--controller-url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可 |
 | `--channel-id` | 必須。channel の識別子 |
 | `--quality` | 必須。quality の識別子 |
 | `--bandwidth` | 必須。正の整数。音声と多重化を含めた bit/s を宣言する |

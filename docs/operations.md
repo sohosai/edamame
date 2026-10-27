@@ -56,7 +56,7 @@ worker が `--cache-limit 12` で同じ 3 channel を持つと、本体だけで
 
 | 通信 | 必要な前提 |
 | --- | --- |
-| publisher / worker から controller | 同じ Bearer token を設定する。worker の初期接続 URL は HTTP のみ |
+| publisher / worker から controller | 同じ Bearer token を設定する。controller が TLS を終端する場合は証明書を検証できること |
 | controller の peer 間 | 固有 URL へ相互に接続でき、全 peer が信頼できること |
 | client から controller | マスターとメディアプレイリストに接続でき、follower の `307` に追従できること |
 | client から worker | プレイリストに書かれた公開 URL へ接続できること |
@@ -66,8 +66,9 @@ controller の GET と sync には認証がない。
 読み取りを公開しても内部の同期や登録を無条件に公開してよいわけではないため、プライベートネットワーク、ファイアウォール、API ごとのアクセス制御などで制限する。
 CORS はブラウザの読み取り許可であり、API へのアクセス制御や認証の代わりにはならない。
 
-controller は HTTP で待ち受けるため、信頼できないネットワークへ公開する部分は TLS 終端を用意する。
-worker 自身で終端する場合は [TLS / ACME](./worker.md) を参照する。
+controller は HTTP または TLS で待ち受ける。
+TLS を使わずに信頼できないネットワークへ公開する場合は、前段で TLS 終端を用意する。
+controller または worker 自身で終端する場合は [controller の TLS 配信](./controller.md#tls-配信) と [worker の TLS / ACME](./worker.md) を参照する。
 ブラウザのページが HTTPS の場合は、プレイリスト、セグメント、鍵も HTTPS で取得できるようにし、mixed content を避ける。
 
 ブラウザの再生では controller、worker、鍵配信元のすべてに適切な読み取り用 CORS が必要になる。
@@ -120,7 +121,7 @@ HTTP の成功、ffprobe による解析、手動復号の成功だけで再生�
 | プレイリストが `503` | leader、公開待ち、publisher の停止、worker の登録と sync、公開範囲全体のキャッシュ有無。詳細は [controller](./controller.md#公開範囲の決定) |
 | プレイリストが `422` | 公開範囲の原本が容量超過で消えていないか。容量と入力の最大サイズを見直す |
 | worker のセグメントが `404` | プレイリストが古くないか、worker の再起動や再登録でキャッシュを捨てていないか。worker はリクエスト時に原本を取得しない |
-| worker が登録されない | token、初期 URL の HTTP 制約、ネットワークの疎通。ACME の場合は公開ルート CA で有効な証明書を取得できているか |
+| worker が登録されない | token、`--controller-url`、ネットワークの疎通。controller が TLS を終端する場合は証明書を検証できるか。ACME の場合は公開ルート CA で有効な証明書を取得できているか |
 | 同期は成功するが公開が遅れる | バッチの直列取得が詰まっていないか、cache-limit が小さすぎないか、公開待ちが取得に足りるか |
 | 最後の映像から進まない | publisher の入力と PUT、新規保存からの経過時間を確認する。猶予を超えるとその quality は停止中になり、メディアプレイリストは `503`、マスタープレイリストからは除外される。再開しても停止前のセグメントは公開されない |
 | 解像度や音声が設定と違う入力を送った | publisher の拒否ログを確認し、送信側の設定を直して再接続する。拒否では channel は止まらず、ffmpeg を起動し直して次の入力を待つ |

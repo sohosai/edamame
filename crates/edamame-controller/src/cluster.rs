@@ -272,6 +272,22 @@ impl ClusterState {
         inner.leader_url = Some(leader.to_owned());
     }
 
+    /// TLS を終端できなくなった機体を cluster から外す
+    ///
+    /// 自身の公開 URL へ接続できない状態で leader を続けると、client から到達できない
+    /// leader に採番や保存を任せることになる。役割と保持する状態を捨て、復旧後に
+    /// 改めて選出へ参加させる。
+    pub async fn leave_cluster(&self) {
+        let mut inner = self.inner.write().await;
+        if inner.role == Role::Leader {
+            self.controller.clear().await;
+        }
+        inner.role = Role::Follower;
+        inner.leader_url = None;
+        inner.initialized = false;
+        eprintln!("cluster membership reset because tls is unavailable");
+    }
+
     /// 1 秒ごと、または中継失敗の通知時に全 peer を確認して選び直す。
     pub async fn run(self: Arc<Self>) {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -361,6 +377,12 @@ mod tests {
             metric: 10,
             auth_token: "token".to_owned(),
             seed: vec![],
+            tls_cert: None,
+            tls_key: None,
+            acme: false,
+            acme_directory: None,
+            acme_cache_dir: None,
+            acme_contact: None,
         };
         let cluster = ClusterState::new(&config, controller).unwrap();
         let now = Instant::now();
@@ -472,5 +494,42 @@ mod tests {
             select_leader("http://z", 2, [("http://b", 2, Some(now))], now),
             "http://z"
         );
+    }
+
+    #[tokio::test]
+    async fn resets_membership_when_tls_becomes_unavailable() {
+        let controller = ControllerState::new(crate::CanonicalStore::new(1024), 6, 100, 1000, 0, 1);
+        let config = ControllerConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            storage_capacity: 1024,
+            playlist_segments: 6,
+            sync_interval_ms: 100,
+            sync_timeout_ms: 1000,
+            publish_wait_ms: Some(0),
+            external_min_percent: 1,
+            cors_origin: vec![],
+            public_url: "http://a.test".to_owned(),
+            metric: 10,
+            auth_token: "token".to_owned(),
+            seed: vec![],
+            tls_cert: None,
+            tls_key: None,
+            acme: false,
+            acme_directory: None,
+            acme_cache_dir: None,
+            acme_contact: None,
+        };
+        let cluster = ClusterState::new(&config, controller).unwrap();
+        {
+            let mut inner = cluster.inner.write().await;
+            inner.role = Role::Leader;
+            inner.leader_url = Some("http://a.test".to_owned());
+            inner.initialized = true;
+        }
+        cluster.leave_cluster().await;
+        let inner = cluster.inner.read().await;
+        assert_eq!(inner.role, Role::Follower);
+        assert_eq!(inner.leader_url, None);
+        assert!(!inner.initialized);
     }
 }

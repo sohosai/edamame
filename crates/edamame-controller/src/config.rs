@@ -1,9 +1,12 @@
 //! controller の CLI 設定
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::Parser;
 use edamame_domain::{CorsOrigins, EdamameError, normalize_public_url, validate_auth_token};
+
+pub use edamame_tls::TlsMode;
 
 pub const DEFAULT_PUBLISH_WAIT_MS: u64 = 2000;
 
@@ -37,7 +40,7 @@ fn parse_capacity_bytes(value: &str) -> Result<u64, String> {
 #[derive(Debug, Clone, Parser)]
 #[command(name = "edamame-controller", about = "Edamame controller")]
 pub struct ControllerConfig {
-    /// HTTP サーバーの待ち受けアドレス
+    /// HTTP または TLS サーバーの待ち受けアドレス
     #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
@@ -85,6 +88,40 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_SEED", value_delimiter = ',', value_parser = normalize_public_url)]
     pub seed: Vec<String>,
 
+    /// TLS 配信に使う証明書チェーンの PEM ファイル。`--tls-key` と一緒に指定する
+    #[arg(
+        long,
+        env = "EDAMAME_TLS_CERT",
+        requires = "tls_key",
+        conflicts_with = "acme"
+    )]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS 証明書の秘密鍵の PEM ファイル。`--tls-cert` と一緒に指定する
+    #[arg(
+        long,
+        env = "EDAMAME_TLS_KEY",
+        requires = "tls_cert",
+        conflicts_with = "acme"
+    )]
+    pub tls_key: Option<PathBuf>,
+
+    /// ACME で証明書を取得して TLS 配信する
+    #[arg(long, env = "EDAMAME_ACME", conflicts_with_all = ["tls_cert", "tls_key"])]
+    pub acme: bool,
+
+    /// ACME ディレクトリの URL。省略時は Let's Encrypt の本番環境
+    #[arg(long, env = "EDAMAME_ACME_DIRECTORY", requires = "acme")]
+    pub acme_directory: Option<String>,
+
+    /// ACME のアカウント鍵と証明書の保存先。`--acme` と一緒に必須
+    #[arg(long, env = "EDAMAME_ACME_CACHE_DIR", requires = "acme")]
+    pub acme_cache_dir: Option<PathBuf>,
+
+    /// ACME の連絡先メール。省略すると起動時に警告を出す
+    #[arg(long, env = "EDAMAME_ACME_CONTACT", requires = "acme")]
+    pub acme_contact: Option<String>,
+
     /// 外部配信へ流す最低の割合（%）
     #[arg(long, env = "EDAMAME_EXTERNAL_MIN_PERCENT", default_value_t = 1)]
     pub external_min_percent: u8,
@@ -122,7 +159,21 @@ impl ControllerConfig {
         for seed in &self.seed {
             normalize_public_url(seed)?;
         }
+        self.tls_mode()?;
         Ok(())
+    }
+
+    /// TLS の設定を解決する
+    pub fn tls_mode(&self) -> Result<TlsMode, EdamameError> {
+        edamame_tls::resolve_tls_mode(
+            &self.public_url,
+            self.tls_cert.as_deref(),
+            self.tls_key.as_deref(),
+            self.acme,
+            self.acme_directory.as_deref(),
+            self.acme_cache_dir.as_deref(),
+            self.acme_contact.as_deref(),
+        )
     }
 
     /// 正規化した URL で重複と自分自身を除き、最初の接触先を返す。
@@ -172,12 +223,50 @@ mod tests {
             public_url: "http://127.0.0.1:9000".to_owned(),
             metric: 100,
             seed: Vec::new(),
+            tls_cert: None,
+            tls_key: None,
+            acme: false,
+            acme_directory: None,
+            acme_cache_dir: None,
+            acme_contact: None,
         }
     }
 
     #[test]
     fn accepts_valid_values() {
         config().validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_static_tls_with_https_public_url() {
+        let mut config = config();
+        config.public_url = "https://controller.test".to_owned();
+        config.tls_cert = Some(PathBuf::from("/certs/fullchain.pem"));
+        config.tls_key = Some(PathBuf::from("/certs/privkey.pem"));
+        assert_eq!(
+            config.tls_mode().unwrap(),
+            TlsMode::Static {
+                cert: PathBuf::from("/certs/fullchain.pem"),
+                key: PathBuf::from("/certs/privkey.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn uses_public_url_host_for_acme() {
+        let mut config = config();
+        config.public_url = "https://controller.test/base".to_owned();
+        config.acme = true;
+        config.acme_cache_dir = Some(PathBuf::from("/acme"));
+        assert_eq!(
+            config.tls_mode().unwrap(),
+            TlsMode::Acme {
+                domain: "controller.test".to_owned(),
+                directory: "https://acme-v02.api.letsencrypt.org/directory".to_owned(),
+                cache_dir: PathBuf::from("/acme"),
+                contact: None,
+            }
+        );
     }
 
     #[test]
@@ -405,7 +494,7 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 18);
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
         assert_eq!(names["metric"], "EDAMAME_METRIC");
         assert_eq!(names["seed"], "EDAMAME_SEED");
@@ -417,6 +506,12 @@ mod tests {
         assert_eq!(names["publish_wait_ms"], "EDAMAME_PUBLISH_WAIT_MS");
         assert_eq!(names["auth_token"], "EDAMAME_AUTH_TOKEN");
         assert_eq!(names["cors_origin"], "EDAMAME_CORS_ORIGIN");
+        assert_eq!(names["tls_cert"], "EDAMAME_TLS_CERT");
+        assert_eq!(names["tls_key"], "EDAMAME_TLS_KEY");
+        assert_eq!(names["acme"], "EDAMAME_ACME");
+        assert_eq!(names["acme_directory"], "EDAMAME_ACME_DIRECTORY");
+        assert_eq!(names["acme_cache_dir"], "EDAMAME_ACME_CACHE_DIR");
+        assert_eq!(names["acme_contact"], "EDAMAME_ACME_CONTACT");
         assert_eq!(
             names["external_min_percent"],
             "EDAMAME_EXTERNAL_MIN_PERCENT"

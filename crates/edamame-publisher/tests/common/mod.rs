@@ -85,6 +85,12 @@ fn serve(state: Arc<ControllerState>, auth_token: &str) -> String {
                 metric: 100,
                 auth_token,
                 seed: vec![],
+                tls_cert: None,
+                tls_key: None,
+                acme: false,
+                acme_directory: None,
+                acme_cache_dir: None,
+                acme_contact: None,
             };
             let cluster = ClusterState::new(&config, state.clone()).expect("cluster を作れません");
             tokio::spawn(cluster.clone().run());

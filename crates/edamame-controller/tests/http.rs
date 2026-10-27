@@ -3287,6 +3287,12 @@ async fn serves_playlist_without_connect_info() {
         metric: 100,
         auth_token: support::AUTH_TOKEN.to_owned(),
         seed: vec![],
+        tls_cert: None,
+        tls_key: None,
+        acme: false,
+        acme_directory: None,
+        acme_cache_dir: None,
+        acme_contact: None,
     };
     let cluster = edamame_controller::cluster::ClusterState::new(&config, state.clone()).unwrap();
     tokio::spawn(cluster.clone().run());

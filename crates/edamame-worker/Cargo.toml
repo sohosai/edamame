@@ -5,28 +5,23 @@ edition.workspace = true
 
 [dependencies]
 axum.workspace = true
-axum-server.workspace = true
 bytes.workspace = true
 clap.workspace = true
 edamame-domain = { path = "../edamame-domain" }
 edamame-telemetry = { path = "../edamame-telemetry" }
+edamame-tls = { path = "../edamame-tls" }
 opentelemetry.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }
-rustls.workspace = true
-rustls-acme.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# listen backlog を OS の既定 (128) より広げるために使う
-socket2 = { version = "0.6", features = ["all"] }
 tokio = { workspace = true, features = ["signal"] }
-tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tower-http.workspace = true
-url.workspace = true
-webpki-roots.workspace = true
 
 [dev-dependencies]
 # TLS のテストで自己署名証明書を作り、HTTPS で取得するために使う
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls.workspace = true
 # 設定のテストで実バイナリを起動して出力を読むために使う
 tokio = { workspace = true, features = ["io-util", "process", "test-util"] }
+tokio-rustls.workspace = true

@@ -67,7 +67,9 @@ def build_parser():
         description="mp4 をセグメントに分割して controller へ継続的に PUT するテスト用 publisher",
     )
     parser.add_argument("--source", required=True, type=Path, help="入力 mp4 のパス")
-    parser.add_argument("--controller-url", required=True, help="controller の絶対 http URL")
+    parser.add_argument(
+        "--controller-url", required=True, help="controller の絶対 http または https URL"
+    )
     parser.add_argument("--channel-id", required=True, help="channel の識別子")
     parser.add_argument("--quality", required=True, help="quality の識別子")
     parser.add_argument(
@@ -115,8 +117,8 @@ def validate_args(args, parser):
         urllib.request.Request(args.controller_url)
     except ValueError:
         parser.error("controller-url is not a valid URL")
-    if parsed_url.scheme != "http" or parsed_url.hostname is None:
-        parser.error("controller-url must be an absolute http URL")
+    if parsed_url.scheme not in ("http", "https") or parsed_url.hostname is None:
+        parser.error("controller-url must be an absolute http or https URL")
     # 空の query と fragment も、後続の URL 組み立てを壊すため拒否する
     if "?" in args.controller_url or "#" in args.controller_url:
         parser.error("controller-url must not contain a query or fragment")

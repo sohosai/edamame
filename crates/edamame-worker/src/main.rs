@@ -1,7 +1,7 @@
 //! `edamame-worker` の起動処理
 
 use clap::Parser;
-use edamame_domain::{normalize_http_url, normalize_public_url, now_ms};
+use edamame_domain::{normalize_public_url, now_ms};
 use edamame_worker::cache::Cache;
 use edamame_worker::config::{TlsMode, WorkerConfig};
 use edamame_worker::http::{WorkerState, router};
@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // client へは TLS 終端の reverse proxy 越しに配信することがあるため、https も許可する
     let public_url = normalize_public_url(&config.public_url)?;
-    // worker は TLS を使わないため、controller へは http で接続する
-    let controller_url = normalize_http_url(&config.controller_url)?;
+    // controller も TLS を終端できるため、https を許可する
+    let controller_url = normalize_public_url(&config.controller_url)?;
     let cache = Cache::new(config.cache_limit)?;
     let state = WorkerState::new(
         config.worker_id.clone(),
@@ -64,11 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             TlsMode::Static { cert, key } => {
                 // 証明書を読み込んでから controller に登録する
-                let config = edamame_worker::tls::static_config(cert, key).await?;
-                let listener = bind_std_listener(bind)?;
+                let config = edamame_tls::static_config(cert, key).await?;
+                let listener = edamame_tls::bind_listener(bind)?;
                 run_sync(state.clone());
-                edamame_worker::tls::serve_static_until(listener, app, config, shutdown_signal())
-                    .await?;
+                edamame_tls::serve_static_until(listener, app, config, shutdown_signal()).await?;
             }
             TlsMode::Acme {
                 domain,
@@ -76,10 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cache_dir,
                 contact,
             } => {
-                let listener = bind_std_listener(bind)?;
+                let listener = edamame_tls::bind_listener(bind)?;
                 let (valid_sender, mut valid_receiver) = tokio::sync::watch::channel(false);
                 let server = tokio::spawn(async move {
-                    edamame_worker::tls::serve_acme_until(
+                    edamame_tls::serve_acme_until(
                         listener,
                         app,
                         &domain,
@@ -133,23 +132,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     telemetry.shutdown();
     result
-}
-
-/// 待ち受けを先に確保し、失敗を早く返す
-fn bind_std_listener(bind: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
-    // std の TcpListener::bind は backlog を 128 で固定する。接続が集中する時間帯に
-    // accept 待ちの接続が溢れないよう、backlog を広げる
-    let listener = socket2::Socket::new(
-        socket2::Domain::for_address(bind),
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
-    listener.set_reuse_address(true)?;
-    listener.bind(&bind.into())?;
-    listener.listen(4096)?;
-    let listener: std::net::TcpListener = listener.into();
-    listener.set_nonblocking(true)?;
-    Ok(listener)
 }
 
 async fn shutdown_signal() {
