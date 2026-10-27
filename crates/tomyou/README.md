@@ -69,8 +69,9 @@ Unix では設定ファイルを所有者だけが読める 0600 で保存する
 編集後は「再読込」を押す。
 
 fallback 登録を有効にする場合は、`[stream_credentials]` に live2025-server の `base_url` と `ingest_token` を指定する。
-鍵 URI は `<base_url>/key/<channel_id>?metric=100` を自動で使う。
-ImageFlux は metric 100 とし、Edamame の controller (0, 1, ...) より後ろの fallback として登録する。
+`metric` は省略時 100000 で、小さいほど優先される。0 以上 i32::MAX 以下で指定する。
+鍵 URI は `<base_url>/key/<channel_id>?metric=<metric>` を自動で使う。
+ImageFlux は既定で metric 100000 とし、Edamame の controller (0, 1, ...) より後ろの fallback として登録する。
 旧来の `?fallback=1` も server 側の互換エイリアスとして受け付ける。
 この版の tomyou は `metric` に対応した live2025-server を前提にする。
 未対応の server では `metric` が無視され、通常用の鍵を返すため、server を先に更新する。
@@ -87,7 +88,7 @@ Windows では `C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.ex
 1. `base_url` と `channel_id` から鍵 URI を作り、ImageFlux のチャンネル作成に渡す。
 2. `ListPlaylistURLs` で HLS プレイリスト URL を取得する。
 3. プレイリストの `#EXT-X-KEY` から `kid` を取り出し、`ImageFlux_20200707.GetEncryptKey` で 16 バイトの鍵を取得する。
-4. `POST <base_url>/internal/stream-credentials?metric=100` に、`channel_id`、ImageFlux のプレイリスト URL、鍵を登録する。
+4. `POST <base_url>/internal/stream-credentials?metric=100000` に、`channel_id`、ImageFlux のプレイリスト URL、鍵を登録する。
 
 登録に成功すると、GUI に「fallback 登録: 登録済み」と表示する。
 `kid` の取得や登録に失敗しても、Edamame と ImageFlux の送信は継続する。

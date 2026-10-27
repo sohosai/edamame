@@ -76,7 +76,7 @@ impl PublisherConfig {
 }
 
 /// ImageFlux を fallback 配信として登録する live2025-server の設定
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamCredentialsConfig {
     /// live2025-server のベース URL
     #[serde(default)]
@@ -84,6 +84,23 @@ pub struct StreamCredentialsConfig {
     /// live2025-server の STREAM_INGEST_TOKEN
     #[serde(default)]
     pub ingest_token: String,
+    /// ImageFlux を登録するときの metric。小さいほど優先される
+    #[serde(default = "default_imageflux_metric")]
+    pub metric: u32,
+}
+
+fn default_imageflux_metric() -> u32 {
+    100_000
+}
+
+impl Default for StreamCredentialsConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            ingest_token: String::new(),
+            metric: default_imageflux_metric(),
+        }
+    }
 }
 
 impl StreamCredentialsConfig {
@@ -114,6 +131,9 @@ impl StreamCredentialsConfig {
 
     /// 設定の矛盾を確認する
     fn validate(&self) -> Result<()> {
+        if self.metric > i32::MAX as u32 {
+            bail!("stream_credentials.metric は 32bit 符号付き整数に収めてください");
+        }
         let base_url = self.base_url.trim();
         let ingest_token = self.ingest_token.trim();
         if base_url.is_empty() && ingest_token.is_empty() {
@@ -140,7 +160,10 @@ impl StreamCredentialsConfig {
             bail!("channel_id は uni、1A、kaikan のいずれかです");
         }
         let base_url = self.normalized_base_url()?;
-        Ok(format!("{base_url}/key/{channel_id}?metric=100"))
+        Ok(format!(
+            "{base_url}/key/{channel_id}?metric={}",
+            self.metric
+        ))
     }
 }
 
@@ -447,6 +470,7 @@ mod tests {
             stream_credentials: StreamCredentialsConfig {
                 base_url: "https://live.example.test".to_owned(),
                 ingest_token: "ingest-token".to_owned(),
+                ..StreamCredentialsConfig::default()
             },
             imageflux: ImageFluxConfig {
                 token: "imageflux-secret".to_owned(),
@@ -515,7 +539,7 @@ mod tests {
         let config = fallback_config();
         assert_eq!(
             config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
-            "https://live.example.test/key/1A?metric=100"
+            "https://live.example.test/key/1A?metric=100000"
         );
     }
 
@@ -525,7 +549,7 @@ mod tests {
         config.stream_credentials.base_url = "https://live.example.test/".to_owned();
         assert_eq!(
             config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
-            "https://live.example.test/key/1A?metric=100"
+            "https://live.example.test/key/1A?metric=100000"
         );
     }
 
@@ -597,6 +621,7 @@ mod tests {
             stream_credentials: StreamCredentialsConfig {
                 base_url: "https://live.example.test".to_owned(),
                 ingest_token: "ingest-secret".to_owned(),
+                ..StreamCredentialsConfig::default()
             },
             imageflux: ImageFluxConfig {
                 token: "imageflux-secret".to_owned(),

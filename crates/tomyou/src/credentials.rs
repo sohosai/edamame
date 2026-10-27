@@ -22,9 +22,9 @@ pub fn client() -> Result<Client> {
 }
 
 /// 登録先の URL を組み立てる
-pub fn endpoint(base_url: &str) -> String {
+pub fn endpoint(base_url: &str, metric: u32) -> String {
     format!(
-        "{}/internal/stream-credentials?metric=100",
+        "{}/internal/stream-credentials?metric={metric}",
         base_url.trim().trim_end_matches('/')
     )
 }
@@ -123,12 +123,12 @@ mod tests {
     #[test]
     fn builds_fallback_endpoint() {
         assert_eq!(
-            endpoint("https://live.example.test"),
-            "https://live.example.test/internal/stream-credentials?metric=100"
+            endpoint("https://live.example.test", 100_000),
+            "https://live.example.test/internal/stream-credentials?metric=100000"
         );
         assert_eq!(
-            endpoint("https://live.example.test/"),
-            "https://live.example.test/internal/stream-credentials?metric=100"
+            endpoint("https://live.example.test/", 100_000),
+            "https://live.example.test/internal/stream-credentials?metric=100000"
         );
     }
 

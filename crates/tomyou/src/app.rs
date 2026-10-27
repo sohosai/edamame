@@ -837,6 +837,12 @@ impl TomyouApp {
                             .password(true),
                         );
                         ui.end_row();
+                        ui.label("metric");
+                        ui.add(
+                            egui::DragValue::new(&mut self.config.stream_credentials.metric)
+                                .range(0..=i32::MAX as u32),
+                        );
+                        ui.end_row();
                     });
                 ui.label(
                     "空欄なら登録しません。鍵 URI はベース URL とチャンネル名から自動で決まります。",
