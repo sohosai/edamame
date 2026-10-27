@@ -111,6 +111,7 @@ video_bitrate = 3000000
 ### TOML
 
 設定ファイルの 1 本の `[[input]]` が 1 つの channel に対応し、その中の `[[input.rendition]]` が quality を表す。
+`[[controller]]` は送信先の controller を表し、`url` と `metric` を持つ。複数台を指定でき、`metric` が小さい順に使う。
 
 | 項目 | 必須条件と説明 |
 | --- | --- |
@@ -118,9 +119,11 @@ video_bitrate = 3000000
 | `backlog_limit` | 必須。正の整数。未送信セットを保持する期限は `segment_duration_ms × backlog_limit` ミリ秒 |
 | `encoder.codec` | 必須。ffmpeg の映像エンコーダ。`h264_nvenc`、`h264_qsv`、`libx264` など |
 | `encoder.preset` | 必須。エンコーダに対応するプリセット。NVEnc は `p1` から `p7`、QSV は `veryfast` から `veryslow` など |
+| `controller.url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可。設定内で重複不可 |
+| `controller.metric` | 必須。0 以上の優先度。小さいほど先に使う。設定内で重複不可 |
 | `input.channel_id` | 必須。`[A-Za-z0-9_-]` の 1 から 64 文字。同じ設定内で重複不可 |
 | `input.input_url` | 必須。`srt://` または `rtmp://`。SRT は URL の `mode` で接続方式を指定し、RTMP は publisher が待ち受ける。RTMP の app と stream は送信側とそろえる |
-| `input.live_url` | 任意。公開マスタープレイリストの HTTPS URL。`--stream-credentials-url` を使う場合は全 input で必須 |
+| `input.live_url` | 任意。先頭 controller の公開マスタープレイリスト URL の上書き。未指定なら `{controller.url}/channels/{channel_id}/master.m3u8` を導出する。先頭以外の controller は常に導出する |
 | `input.key_uri` | 任意。鍵を取得する HTTP または HTTPS の絶対 URL。通常の HLS プレイヤーで再生する場合は必要 |
 | `input.rendition.quality` | 必須。quality の識別子。同じ channel 内で重複不可。`master` は使用不可 |
 | `input.rendition.mode` | 任意。省略時は `encode`。`copy` は映像を再エンコードしない。音声はどちらもコピーする |
@@ -135,22 +138,26 @@ video_bitrate = 3000000
 ### CLI
 
 CLI オプションを `EDAMAME_` 系の環境変数へ自動変換する機能は publisher にはない。
-接続先や認証情報は CLI で指定する。
+controller は TOML の `[[controller]]` または 1 台だけの `--controller-url`、認証情報は CLI で指定する。
 
 | option | 必須条件と説明 |
 | --- | --- |
 | `--config` | 必須。TOML 設定ファイルのパス |
-| `--controller-url` | 必須。HTTP または HTTPS の絶対 URL。query と fragment は不可 |
+| `--controller-url` | 任意。1 台だけ指定する後方互換。HTTP または HTTPS の絶対 URL。query と fragment は不可。`[[controller]]` とは同時指定できない |
 | `--auth-token` | CLI では任意だが、controller の PUT 認証に必要。同じ token を設定し、省略時は 401 になる |
 | `--work-dir` | 任意。作業ディレクトリを作る親ディレクトリ。配下に `edamame-publisher-<pid>` を作る。省略時は一時ディレクトリを使う |
 | `--key-file` | 任意。16 バイトの生データの鍵ファイル。存在すれば読み、なければ権限 0600 で生成する。省略時は実行ごとに鍵を生成する |
-| `--stream-credentials-url` | 任意。連携する `live2025-server` のベース URL。暗号鍵と `live_url` を登録する |
+| `--stream-credentials-url` | 任意。連携する `live2025-server` のベース URL。暗号鍵と全 controller の `live_url` を登録する |
 | `--stream-ingest-token` | `--stream-credentials-url` と組で指定する。外部サービスの `STREAM_INGEST_TOKEN` と同じ Bearer token |
 
 ### 外部サービスへの登録
 
-`--stream-credentials-url` を指定すると、channel ごとに `POST /internal/stream-credentials` へ `channel_id`、`live_url`、hex 形式の `encryption_key` を送る。
-全 input の `live_url` と、`--stream-ingest-token` が必要になる。
+`--stream-credentials-url` を指定すると、channel ごとに `POST /internal/stream-credentials` へ `candidates` の配列を 1 回で送る。
+各要素は `metric`、`live_url`、hex 形式の `encryption_key` で、`metric` は controller の優先度で小さいほど優先され、`live_url` は先頭 controller の上書きまたは `{controller.url}/channels/{channel_id}/master.m3u8` から導出した URL である。
+`--stream-ingest-token` が必要になる。
+この一括登録は `candidates` に対応した live2025-server が必要になる。
+未対応の server はリクエストを 400 で拒否し、publisher は設定エラーとして登録を打ち切るため、server を先に更新する。
+全 controller を 1 リクエストで登録するため、途中の controller だけが欠けることはない。
 登録の完了を待たずにセグメントの送信を始めるため、PUT の成功だけでは鍵の登録成功を判断しない。
 外部サービスの鍵配信と公開 URL の設定は別途確認する。
 
@@ -205,7 +212,8 @@ host ネットワークを使わない場合は入力用ポートを対応する
 ### 再起動と時刻
 
 ffmpeg は実行ごとに出力の先頭時刻を 0 に寄せるため、publisher は送信済みセット数とセグメント長から `-output_ts_offset` を計算する。
-publisher 自体の起動時は controller のプレイリストから次のセグメント番号を推定し、取得できなければ `0` を使う。
+publisher 自体の起動時は metric の小さい controller から順にプレイリストを取得し、次のセグメント番号を推定する。取得できなければ `0` を使う。
+セグメントの PUT も同じ順に試し、`Retryable` の失敗では次の controller へ進む。全台で失敗した場合は 1 秒待って先頭から再試行する。
 これは出力時刻の初期値であり、controller の採番を指定するものではない。
 外部配信へリダイレクトされる場合や、controller が状態を失った場合は、再起動前後の時刻の連続性を保証しない。
 

@@ -438,7 +438,7 @@ async fn register_fallback(
             return;
         }
     };
-    let endpoint = credentials::endpoint(&settings.base_url);
+    let endpoint = credentials::endpoint(&settings.base_url, settings.metric);
     let body = credentials::body(&channel_id, &playlist_url, &key);
     let ingest_token = settings.ingest_token.trim();
     let log_ui = ui.clone();

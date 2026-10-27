@@ -358,9 +358,10 @@ fn register_stream_credentials(
     ) else {
         return;
     };
-    let Some(live_url) = context.input().live_url.as_deref() else {
+    let candidates = context.settings.candidate_live_urls(context.input());
+    if candidates.is_empty() {
         return;
-    };
+    }
     let client = match credentials::client() {
         Ok(client) => client,
         Err(message) => {
@@ -374,7 +375,7 @@ fn register_stream_credentials(
     };
     let url = credentials::credentials_url(base_url);
     let body =
-        credentials::credentials_body(context.channel_id(), live_url, &hex_encode(&context.key));
+        credentials::credentials_body(context.channel_id(), &hex_encode(&context.key), &candidates);
     match credentials::register_until_success(
         &client,
         &url,
@@ -416,26 +417,27 @@ fn starting_sequence(context: &ChannelContext) -> u64 {
             return 0;
         }
     };
-    match fetch_next_sequence(
-        &client,
-        &context.settings.controller_url,
-        context.channel_id(),
-    ) {
-        Ok(sequence) => {
-            println!(
-                "channel={} starting from sequence {sequence}",
-                context.channel_id()
-            );
-            sequence
-        }
-        Err(message) => {
-            println!(
-                "channel={} failed to read the playlist ({message}); starting from 0",
-                context.channel_id()
-            );
-            0
+    let mut last_error = None;
+    for controller in &context.settings.controllers {
+        match fetch_next_sequence(&client, &controller.url, context.channel_id()) {
+            Ok(sequence) => {
+                println!(
+                    "channel={} starting from sequence {sequence}",
+                    context.channel_id()
+                );
+                return sequence;
+            }
+            Err(message) => {
+                last_error = Some(message);
+            }
         }
     }
+    println!(
+        "channel={} failed to read the playlist ({}); starting from 0",
+        context.channel_id(),
+        last_error.unwrap_or_else(|| "no controller".to_owned())
+    );
+    0
 }
 
 /// channel 全体の次のセグメント番号を返す
@@ -1032,12 +1034,6 @@ fn publish_set(
         };
         let encrypted = encrypt_segment(&context.key, &iv, &plaintext);
         let iv_hex = hex_encode(&iv);
-        let url = segment_url(
-            &context.settings.controller_url,
-            context.channel_id(),
-            &rendition.quality,
-            &set.identifier,
-        );
 
         loop {
             if stop.load(Ordering::Relaxed) || channel_stop.load(Ordering::Relaxed) {
@@ -1046,33 +1042,50 @@ fn publish_set(
             if set.enqueued_at.elapsed() > max_age {
                 return Err(PublishError::Abandoned("expired".to_owned()));
             }
-            match put_segment(client, context, rendition, &url, &iv_hex, encrypted.clone()) {
-                Ok(sequence) => {
-                    println!(
-                        "channel={} published index={} quality={} identifier={} sequence={sequence}",
-                        context.channel_id(),
-                        set.index,
-                        file.quality,
-                        set.identifier
-                    );
-                    break;
-                }
-                Err(PutError::Retryable(message)) => {
-                    println!(
-                        "channel={} retrying index={} quality={}: {message}",
-                        context.channel_id(),
-                        set.index,
-                        file.quality
-                    );
-                    sleep_interruptible(PUT_RETRY_INTERVAL, stop, channel_stop);
-                }
-                Err(PutError::Fatal(message)) => {
-                    return Err(PublishError::Fatal(format!(
-                        "failed to publish index={} quality={}: {message}",
-                        set.index, file.quality
-                    )));
+            let mut retry_message = None;
+            let mut published = false;
+            for controller in &context.settings.controllers {
+                let url = segment_url(
+                    &controller.url,
+                    context.channel_id(),
+                    &rendition.quality,
+                    &set.identifier,
+                );
+                match put_segment(client, context, rendition, &url, &iv_hex, encrypted.clone()) {
+                    Ok(sequence) => {
+                        println!(
+                            "channel={} published index={} quality={} identifier={} sequence={sequence} controller={}",
+                            context.channel_id(),
+                            set.index,
+                            file.quality,
+                            set.identifier,
+                            controller.url
+                        );
+                        published = true;
+                        break;
+                    }
+                    Err(PutError::Retryable(message)) => {
+                        retry_message = Some(message);
+                    }
+                    Err(PutError::Fatal(message)) => {
+                        return Err(PublishError::Fatal(format!(
+                            "failed to publish index={} quality={}: {message}",
+                            set.index, file.quality
+                        )));
+                    }
                 }
             }
+            if published {
+                break;
+            }
+            println!(
+                "channel={} retrying index={} quality={}: {}",
+                context.channel_id(),
+                set.index,
+                file.quality,
+                retry_message.unwrap_or_else(|| "no controller succeeded".to_owned())
+            );
+            sleep_interruptible(PUT_RETRY_INTERVAL, stop, channel_stop);
         }
         let _ = fs::remove_file(&file.path);
     }
@@ -1158,7 +1171,7 @@ fn sleep_interruptible(duration: Duration, stop: &AtomicBool, channel_stop: &Ato
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EncoderSettings, InputSettings, Resolution};
+    use crate::config::{ControllerSettings, EncoderSettings, InputSettings, Resolution};
 
     /// テストで使う rendition
     fn rendition(quality: &str) -> RenditionSettings {
@@ -1183,7 +1196,10 @@ mod tests {
                 codec: "h264_nvenc".to_owned(),
                 preset: "p5".to_owned(),
             },
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controllers: vec![ControllerSettings {
+                url: "http://127.0.0.1:9000".to_owned(),
+                metric: 1,
+            }],
             auth_token: Some("example-token".to_owned()),
             key_file: None,
             stream_credentials_url: None,

@@ -322,7 +322,7 @@ pub fn format_seconds(millis: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EncoderSettings, InputSettings, Resolution};
+    use crate::config::{ControllerSettings, EncoderSettings, InputSettings, Resolution};
 
     /// テストで使う設定
     fn settings() -> PublisherSettings {
@@ -333,7 +333,10 @@ mod tests {
                 codec: "h264_nvenc".to_owned(),
                 preset: "p5".to_owned(),
             },
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controllers: vec![ControllerSettings {
+                url: "http://127.0.0.1:9000".to_owned(),
+                metric: 1,
+            }],
             auth_token: None,
             key_file: None,
             stream_credentials_url: None,

@@ -28,11 +28,16 @@ rtmp_urls = [
 base_url = ""
 # live2025-server の STREAM_INGEST_TOKEN と同じ値
 ingest_token = ""
+# ImageFlux を登録するときの metric。小さいほど優先される。
+# Edamame の controller より後ろに置くため、既定は 100000。
+# 0 以上 i32::MAX 以下で指定する。
+metric = 100000
 
 [imageflux]
 # token もこのファイルへ保存される
 # fallback 登録を有効にすると、鍵 URI は
-# <stream_credentials.base_url>/key/<channel_id>?fallback=1 になる。
+# <stream_credentials.base_url>/key/<channel_id>?metric=100000 になる。
+# ImageFlux は metric 100000 とし、Edamame の controller より後ろの fallback にする。
 event_webhook_url = ""
 
 # whip-script の example.toml と同じ HLS 設定

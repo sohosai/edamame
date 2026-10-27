@@ -1,6 +1,6 @@
 //! publisher の CLI と TOML 設定
 //!
-//! 入力と rendition は TOML に書き、controller の接続先は実行時に CLI で渡す。
+//! 入力と rendition は TOML に書き、controller の接続先は TOML の [[controller]] または CLI で渡す。
 
 use std::collections::HashSet;
 use std::fs;
@@ -17,9 +17,10 @@ pub struct Cli {
     #[arg(long)]
     pub config: PathBuf,
 
-    /// controller の接続先を表す http の絶対 URL
+    /// controller の接続先を表す http の絶対 URL。
+    /// 1 台だけ指定する後方互換用。複数台は TOML の [[controller]] を使う
     #[arg(long)]
-    pub controller_url: String,
+    pub controller_url: Option<String>,
 
     /// PUT の認証に使う Bearer トークン
     #[arg(long)]
@@ -51,7 +52,7 @@ pub struct PublisherSettings {
     pub segment_duration_ms: u64,
     pub backlog_limit: u64,
     pub encoder: EncoderSettings,
-    pub controller_url: String,
+    pub controllers: Vec<ControllerSettings>,
     pub auth_token: Option<String>,
     pub key_file: Option<PathBuf>,
     pub stream_credentials_url: Option<String>,
@@ -66,9 +67,30 @@ struct FileSettings {
     segment_duration_ms: u64,
     backlog_limit: u64,
     encoder: EncoderSettings,
+    // TOML では [[controller]] と書く
+    #[serde(rename = "controller", default)]
+    controllers: Vec<ControllerSettings>,
     // TOML では [[input]] と書く
     #[serde(rename = "input")]
     inputs: Vec<InputSettings>,
+}
+
+/// controller の接続先と優先度
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControllerSettings {
+    /// controller の http(s) の絶対 URL
+    pub url: String,
+    /// 小さいほど優先する。チャンネル内で重複不可
+    pub metric: u32,
+}
+
+impl ControllerSettings {
+    /// この controller が配信するチャンネルのマスタープレイリスト URL
+    #[must_use]
+    pub fn live_url(&self, channel_id: &str) -> String {
+        format!("{}/channels/{channel_id}/master.m3u8", self.url)
+    }
 }
 
 /// エンコーダの指定
@@ -88,7 +110,8 @@ pub struct InputSettings {
     pub channel_id: String,
     /// ffmpeg に渡す入力 URL。srt:// は URL の mode で待ち受け、rtmp:// は publisher が待ち受ける
     pub input_url: String,
-    /// controller の公開マスタープレイリストの URL。鍵と一緒に登録する
+    /// 先頭 controller の公開マスタープレイリスト URL の上書き。
+    /// 未指定なら controller の URL から導出する
     pub live_url: Option<String>,
     /// メディアプレイリストに出力する暗号鍵の URI
     pub key_uri: Option<String>,
@@ -174,14 +197,40 @@ impl PublisherSettings {
             .map_err(|error| format!("failed to read {}: {error}", cli.config.display()))?;
         let file: FileSettings = toml::from_str(&text)
             .map_err(|error| format!("failed to parse {}: {error}", cli.config.display()))?;
-        let controller_url = normalize_controller_url(&cli.controller_url)?;
+        let cli_controller_url = cli
+            .controller_url
+            .as_deref()
+            .map(normalize_controller_url)
+            .transpose()?;
+        if !file.controllers.is_empty() && cli_controller_url.is_some() {
+            return Err("--controller-url and [[controller]] must not be combined".to_owned());
+        }
+        let mut controllers = file.controllers;
+        if controllers.is_empty() {
+            let Some(url) = cli_controller_url else {
+                return Err(
+                    "controller URL is required: pass --controller-url or [[controller]]"
+                        .to_owned(),
+                );
+            };
+            controllers.push(ControllerSettings { url, metric: 0 });
+        } else {
+            for controller in &mut controllers {
+                controller.url = normalize_controller_url(&controller.url)?;
+            }
+        }
+        controllers.sort_by(|left, right| {
+            left.metric
+                .cmp(&right.metric)
+                .then_with(|| left.url.cmp(&right.url))
+        });
         validate_auth_token(cli.auth_token.as_deref())?;
         validate_auth_token(cli.stream_ingest_token.as_deref())?;
         let settings = Self {
             segment_duration_ms: file.segment_duration_ms,
             backlog_limit: file.backlog_limit,
             encoder: file.encoder,
-            controller_url,
+            controllers,
             auth_token: cli.auth_token.clone(),
             key_file: cli.key_file.clone(),
             stream_credentials_url: cli
@@ -212,6 +261,22 @@ impl PublisherSettings {
         }
         if self.inputs.is_empty() {
             return Err("at least one input is required".to_owned());
+        }
+        if self.controllers.is_empty() {
+            return Err("at least one controller is required".to_owned());
+        }
+        let mut controller_metrics = HashSet::new();
+        let mut controller_urls = HashSet::new();
+        for controller in &self.controllers {
+            if controller.metric > i32::MAX as u32 {
+                return Err("controller metric must fit in a signed 32-bit integer".to_owned());
+            }
+            if !controller_metrics.insert(controller.metric) {
+                return Err("controller metric is duplicated".to_owned());
+            }
+            if !controller_urls.insert(controller.url.as_str()) {
+                return Err("controller URL is duplicated".to_owned());
+            }
         }
         if self.stream_credentials_url.is_some() && self.stream_ingest_token.is_none() {
             return Err(
@@ -244,12 +309,6 @@ impl PublisherSettings {
             }
             if let Some(live_url) = &input.live_url {
                 validate_url("live_url", live_url, true)?;
-            }
-            if self.stream_credentials_url.is_some() && input.live_url.is_none() {
-                return Err(format!(
-                    "live_url is required when stream_credentials_url is set: channel {}",
-                    input.channel_id
-                ));
             }
             if let Some(key_uri) = &input.key_uri {
                 validate_url("key_uri", key_uri, false)?;
@@ -297,6 +356,27 @@ impl PublisherSettings {
             }
         }
         Ok(())
+    }
+
+    /// 入力に対する controller ごとの live_url を、優先度の高い順に返す。
+    /// input.live_url は先頭 controller の上書きとしてだけ使う。
+    #[must_use]
+    pub fn candidate_live_urls(&self, input: &InputSettings) -> Vec<(u32, String)> {
+        self.controllers
+            .iter()
+            .enumerate()
+            .map(|(index, controller)| {
+                let live_url = if index == 0 {
+                    input
+                        .live_url
+                        .clone()
+                        .unwrap_or_else(|| controller.live_url(&input.channel_id))
+                } else {
+                    controller.live_url(&input.channel_id)
+                };
+                (controller.metric, live_url)
+            })
+            .collect()
     }
 }
 
@@ -397,7 +477,10 @@ mod tests {
                 codec: "h264_nvenc".to_owned(),
                 preset: "p5".to_owned(),
             },
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controllers: vec![ControllerSettings {
+                url: "http://127.0.0.1:9000".to_owned(),
+                metric: 1,
+            }],
             auth_token: None,
             key_file: None,
             stream_credentials_url: None,
@@ -536,17 +619,78 @@ mod tests {
     }
 
     #[test]
-    fn requires_token_and_live_url_for_registration() {
+    fn requires_token_for_registration() {
         let mut target = settings();
         target.stream_credentials_url = Some("https://live.example.test".to_owned());
         // トークンがない
         assert!(target.validate().is_err());
         target.stream_ingest_token = Some("ingest-token".to_owned());
-        // live_url がない
-        assert!(target.validate().is_err());
-        target.inputs[0].live_url =
-            Some("https://live.example.test/channels/1A/master.m3u8".to_owned());
         target.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_controller_settings() {
+        let controller: ControllerSettings =
+            toml::from_str("url = \"https://controller.example.test\"\nmetric = 100").unwrap();
+        assert_eq!(controller.url, "https://controller.example.test");
+        assert_eq!(controller.metric, 100);
+    }
+
+    #[test]
+    fn derives_candidate_live_urls_in_metric_order() {
+        let mut target = settings();
+        target.controllers = vec![
+            ControllerSettings {
+                url: "https://a.example.test".to_owned(),
+                metric: 0,
+            },
+            ControllerSettings {
+                url: "https://b.example.test".to_owned(),
+                metric: 1,
+            },
+        ];
+        let candidates = target.candidate_live_urls(&target.inputs[0]);
+        assert_eq!(
+            candidates,
+            vec![
+                (
+                    0,
+                    "https://a.example.test/channels/1A/master.m3u8".to_owned()
+                ),
+                (
+                    1,
+                    "https://b.example.test/channels/1A/master.m3u8".to_owned()
+                ),
+            ]
+        );
+
+        target.inputs[0].live_url = Some("https://override.example.test/master.m3u8".to_owned());
+        let candidates = target.candidate_live_urls(&target.inputs[0]);
+        assert_eq!(candidates[0].1, "https://override.example.test/master.m3u8");
+        assert_eq!(
+            candidates[1].1,
+            "https://b.example.test/channels/1A/master.m3u8"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicated_controller_metric() {
+        let mut target = settings();
+        target.controllers.push(ControllerSettings {
+            url: "http://127.0.0.1:9001".to_owned(),
+            metric: 1,
+        });
+        assert!(target.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicated_controller_url() {
+        let mut target = settings();
+        target.controllers.push(ControllerSettings {
+            url: "http://127.0.0.1:9000".to_owned(),
+            metric: 2,
+        });
+        assert!(target.validate().is_err());
     }
 
     #[test]
