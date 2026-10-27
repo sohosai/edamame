@@ -479,11 +479,11 @@ mod tests {
 
     #[test]
     fn finds_kid_in_key_uri() {
-        let playlist = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://live.example.test/key/uni?metric=0&kid=abc\"\n";
+        let playlist = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://live.example.test/key/uni?metric=100&kid=abc\"\n";
         let key_uri = find_key_uri(playlist).expect("鍵 URI を取得できる");
         assert_eq!(
             key_uri,
-            "https://live.example.test/key/uni?metric=0&kid=abc"
+            "https://live.example.test/key/uni?metric=100&kid=abc"
         );
         assert_eq!(kid_from_key_uri(&key_uri).unwrap(), "abc");
     }

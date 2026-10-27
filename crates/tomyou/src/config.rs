@@ -140,7 +140,7 @@ impl StreamCredentialsConfig {
             bail!("channel_id は uni、1A、kaikan のいずれかです");
         }
         let base_url = self.normalized_base_url()?;
-        Ok(format!("{base_url}/key/{channel_id}?metric=0"))
+        Ok(format!("{base_url}/key/{channel_id}?metric=100"))
     }
 }
 
@@ -515,7 +515,7 @@ mod tests {
         let config = fallback_config();
         assert_eq!(
             config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
-            "https://live.example.test/key/1A?metric=0"
+            "https://live.example.test/key/1A?metric=100"
         );
     }
 
@@ -525,7 +525,7 @@ mod tests {
         config.stream_credentials.base_url = "https://live.example.test/".to_owned();
         assert_eq!(
             config.imageflux_key_uri().expect("鍵 URI を組み立てられる"),
-            "https://live.example.test/key/1A?metric=0"
+            "https://live.example.test/key/1A?metric=100"
         );
     }
 

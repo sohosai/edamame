@@ -32,7 +32,8 @@ ingest_token = ""
 [imageflux]
 # token もこのファイルへ保存される
 # fallback 登録を有効にすると、鍵 URI は
-# <stream_credentials.base_url>/key/<channel_id>?metric=0 になる。
+# <stream_credentials.base_url>/key/<channel_id>?metric=100 になる。
+# ImageFlux は metric 100 とし、Edamame の controller より後ろの fallback にする。
 event_webhook_url = ""
 
 # whip-script の example.toml と同じ HLS 設定
