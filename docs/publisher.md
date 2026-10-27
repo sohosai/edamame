@@ -122,7 +122,7 @@ video_bitrate = 3000000
 | `controller.url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可。設定内で重複不可 |
 | `controller.metric` | 必須。0 以上の優先度。小さいほど先に使う。設定内で重複不可 |
 | `input.channel_id` | 必須。`[A-Za-z0-9_-]` の 1 から 64 文字。同じ設定内で重複不可 |
-| `input.input_url` | 必須。`srt://` または `rtmp://`。SRT は URL の `mode` で接続方式を指定し、RTMP は publisher が待ち受ける。RTMP の app と stream は送信側とそろえる |
+| `input.input_url` | 必須。`srt://` または `rtmp://`。SRT は URL の `mode` で接続方式を指定し、RTMP は publisher が待ち受ける。RTMP は `rtmp://<host>` と書くと、チャンネルごとの既定ポートと `/live/<channel_id>` を補う。app と stream は送信側とそろえる |
 | `input.live_url` | 任意。先頭 controller の公開マスタープレイリスト URL の上書き。未指定なら `{controller.url}/channels/{channel_id}/master.m3u8` を導出する。先頭以外の controller は常に導出する |
 | `input.key_uri` | 任意。鍵を取得する HTTP または HTTPS の絶対 URL。通常の HLS プレイヤーで再生する場合は必要 |
 | `input.rendition.quality` | 必須。quality の識別子。同じ channel 内で重複不可。`master` は使用不可 |
@@ -130,6 +130,21 @@ video_bitrate = 3000000
 | `input.rendition.resolution` | 必須。`WIDTHxHEIGHT`。幅と高さはそれぞれ 2 以上の偶数。encode はこの解像度へ変換し、copy は入力との一致を検証する |
 | `input.rendition.bandwidth` | 必須。正の整数。controller へ宣言する bit/s。音声と多重化を含めて見積もる |
 | `input.rendition.video_bitrate` | encode の場合は正の整数が必須。copy の場合は指定不可 |
+
+RTMP の `input_url` は、ホストだけを書くとチャンネルごとの既定ポートと `/live/<channel_id>` を補う。
+
+```toml
+[[input]]
+channel_id = "1A"
+input_url = "rtmp://0.0.0.0"
+```
+
+この例は `rtmp://0.0.0.0:1936/live/1A` で待ち受ける。
+既定ポートは `uni = 1935`、`1A = 1936`、`kaikan = 1937` である。
+ポートを明示するとその値を使う。
+表にないチャンネルは、ポートを省略すると起動エラーになる。
+`/live/<channel_id>` と異なるパスは起動エラーになる。
+tomyou から接続する場合は、tomyou の `channel_id` と同じ値にし、同じポートを使う。
 
 `copy` では入力映像が H.264 であり、キーフレームの間隔がセグメント長を割り切る必要がある。
 6 秒セグメントなら 1 秒、2 秒、3 秒、6 秒の間隔が使える。
@@ -189,6 +204,7 @@ docker run --rm \
 NVEnc では NVIDIA Container Toolkit を用意して `--gpus all` を追加し、QSV では `--device /dev/dri:/dev/dri` を追加する。
 SRT は UDP、RTMP は TCP を使う。
 host ネットワークを使わない場合は入力用ポートを対応するプロトコルで公開し、controller への到達先もコンテナから接続できる URL に変える。
+RTMP のポートを省略した場合は、チャンネルごとの 1935 / 1936 / 1937 を公開する。
 
 ## 動作と運用上の注意点
 

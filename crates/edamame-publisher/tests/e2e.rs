@@ -741,7 +741,7 @@ preset = "ultrafast"
 
 [[input]]
 channel_id = "1B"
-input_url = "rtmp://127.0.0.1:{rtmp_port}/live/1B"
+input_url = "rtmp://127.0.0.1:{rtmp_port}"
 
 [[input.rendition]]
 quality = "main"
@@ -764,8 +764,11 @@ bandwidth = 12000000
         publisher.log()
     );
     assert!(
-        publisher.wait_for_log("input_url=rtmp://127.0.0.1", Duration::from_secs(10)),
-        "RTMP の入力 URL がログに出ません: {}",
+        publisher.wait_for_log(
+            &format!("input_url=rtmp://127.0.0.1:{rtmp_port}/live/1B"),
+            Duration::from_secs(10)
+        ),
+        "RTMP の入力 URL にチャンネルが補完されません: {}",
         publisher.log()
     );
     let _sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);

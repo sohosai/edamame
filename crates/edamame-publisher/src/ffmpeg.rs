@@ -417,14 +417,14 @@ mod tests {
     fn listens_for_an_rtmp_input() {
         let args = build_command(
             &settings(),
-            "rtmp://0.0.0.0:1935/live/1A",
+            "rtmp://0.0.0.0:1936/live/1A",
             &renditions(),
             Path::new("/tmp/run-1"),
             0,
         );
         assert!(
             args.join(" ")
-                .contains("-listen 1 -i rtmp://0.0.0.0:1935/live/1A")
+                .contains("-listen 1 -i rtmp://0.0.0.0:1936/live/1A")
         );
     }
 
@@ -447,7 +447,7 @@ mod tests {
         target.encoder.preset = "medium".to_owned();
         let args = build_command(
             &target,
-            "rtmp://0.0.0.0:1935/live/1A",
+            "rtmp://0.0.0.0:1936/live/1A",
             &renditions(),
             Path::new("/tmp/run-1"),
             0,
