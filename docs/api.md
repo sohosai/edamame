@@ -406,6 +406,8 @@ GET /channels/{channel_id}/master.m3u8
 
 出力形式の詳細は [HLS の出力](./hls.md) で説明する。
 `200 OK` と `302 Found` のレスポンスには `Cache-Control: no-store` ヘッダが付く。
+`publisher` が新しいセグメントを送らなくなって、最後の `PUT` から `duration_ms × --playlist-segments + --publish-wait-ms` を超えた `quality` は停止中とみなし、マスタープレイリストから除外する。
+`503 Service Unavailable` の応答にも `Cache-Control: no-store` ヘッダが付く。
 
 ステータス：
 
@@ -414,7 +416,7 @@ GET /channels/{channel_id}/master.m3u8
 - `400 Bad Request`：`channel_id` が不正である、または query の `external` に `1` と `0` 以外の値を指定した
 - `404 Not Found`：`channel` が存在しない
 - `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
-- `503 Service Unavailable`：配信できる `quality` がない
+- `503 Service Unavailable`：配信できる `quality` がない（すべての `quality` が停止中の場合を含む）
 
 クエリパラメータに `external=1` を付けると外部配信へ振り分け、`external=0` を付けると自前のマスタープレイリストを返す。
 `external=0` は、外部配信を登録している環境でもリダイレクトさせずに `controller` 自身のプレイリストを取得したい場合（`publisher` が再起動時に現在のセグメント番号を確認する場合や、運用者が直接動作確認する場合）に使う。
@@ -436,7 +438,9 @@ GET /channels/{channel_id}/{quality}.m3u8
 - `400 Bad Request`：`channel_id` または `quality` が不正である
 - `404 Not Found`：`channel` または `quality` が存在しない
 - `422 Unprocessable Entity`：公開範囲のセグメントファイルが欠落している
-- `503 Service Unavailable`：その `quality` の公開範囲または配信先 `worker` がない
+- `503 Service Unavailable`：その `quality` が停止中である、または公開範囲か配信先 `worker` がない
+
+`503 Service Unavailable` の応答には `Cache-Control: no-store` ヘッダが付く。
 
 ## worker の API
 
