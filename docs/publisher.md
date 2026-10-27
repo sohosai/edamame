@@ -111,7 +111,7 @@ video_bitrate = 3000000
 ### TOML
 
 設定ファイルの 1 本の `[[input]]` が 1 つの channel に対応し、その中の `[[input.rendition]]` が quality を表す。
-`[[controller]]` は送信先の controller を表し、`url` と `metric` を持つ。複数台を指定でき、`metric` が大きい順に使う。
+`[[controller]]` は送信先の controller を表し、`url` と `metric` を持つ。複数台を指定でき、`metric` が小さい順に使う。
 
 | 項目 | 必須条件と説明 |
 | --- | --- |
@@ -120,7 +120,7 @@ video_bitrate = 3000000
 | `encoder.codec` | 必須。ffmpeg の映像エンコーダ。`h264_nvenc`、`h264_qsv`、`libx264` など |
 | `encoder.preset` | 必須。エンコーダに対応するプリセット。NVEnc は `p1` から `p7`、QSV は `veryfast` から `veryslow` など |
 | `controller.url` | 必須。controller の HTTP または HTTPS の絶対 URL。query と fragment は不可。設定内で重複不可 |
-| `controller.metric` | 必須。0 以上の優先度。大きいほど先に使う。設定内で重複不可 |
+| `controller.metric` | 必須。0 以上の優先度。小さいほど先に使う。設定内で重複不可 |
 | `input.channel_id` | 必須。`[A-Za-z0-9_-]` の 1 から 64 文字。同じ設定内で重複不可 |
 | `input.input_url` | 必須。`srt://` または `rtmp://`。SRT は URL の `mode` で接続方式を指定し、RTMP は publisher が待ち受ける。RTMP の app と stream は送信側とそろえる |
 | `input.live_url` | 任意。先頭 controller の公開マスタープレイリスト URL の上書き。未指定なら `{controller.url}/channels/{channel_id}/master.m3u8` を導出する。先頭以外の controller は常に導出する |
@@ -153,7 +153,7 @@ controller は TOML の `[[controller]]` または 1 台だけの `--controller-
 ### 外部サービスへの登録
 
 `--stream-credentials-url` を指定すると、channel ごとに `POST /internal/stream-credentials` へ `candidates` の配列を 1 回で送る。
-各要素は `metric`、`live_url`、hex 形式の `encryption_key` で、`metric` は controller の優先度、`live_url` は先頭 controller の上書きまたは `{controller.url}/channels/{channel_id}/master.m3u8` から導出した URL である。
+各要素は `metric`、`live_url`、hex 形式の `encryption_key` で、`metric` は controller の優先度で小さいほど優先され、`live_url` は先頭 controller の上書きまたは `{controller.url}/channels/{channel_id}/master.m3u8` から導出した URL である。
 `--stream-ingest-token` が必要になる。
 この一括登録は `candidates` に対応した live2025-server が必要になる。
 未対応の server はリクエストを 400 で拒否し、publisher は設定エラーとして登録を打ち切るため、server を先に更新する。
@@ -212,7 +212,7 @@ host ネットワークを使わない場合は入力用ポートを対応する
 ### 再起動と時刻
 
 ffmpeg は実行ごとに出力の先頭時刻を 0 に寄せるため、publisher は送信済みセット数とセグメント長から `-output_ts_offset` を計算する。
-publisher 自体の起動時は metric の大きい controller から順にプレイリストを取得し、次のセグメント番号を推定する。取得できなければ `0` を使う。
+publisher 自体の起動時は metric の小さい controller から順にプレイリストを取得し、次のセグメント番号を推定する。取得できなければ `0` を使う。
 セグメントの PUT も同じ順に試し、`Retryable` の失敗では次の controller へ進む。全台で失敗した場合は 1 秒待って先頭から再試行する。
 これは出力時刻の初期値であり、controller の採番を指定するものではない。
 外部配信へリダイレクトされる場合や、controller が状態を失った場合は、再起動前後の時刻の連続性を保証しない。

@@ -95,7 +95,7 @@ cargo run --release -p edamame-publisher -- \
 例の `[[controller]]` の URL は実際の controller に置き換える。
 1 台だけ使う場合は `[[controller]]` を削除し、`--controller-url` を指定する。
 複数の controller へ送る場合は、設定ファイルの `[[controller]]` に `url` と `metric` を書く。
-`metric` が大きい controller を優先し、先頭が落ちたときは次の controller へ送信する。
+`metric` が小さい controller を優先し、先頭が落ちたときは次の controller へ送信する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
 
 ## tomyou

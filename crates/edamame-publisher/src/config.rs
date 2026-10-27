@@ -81,7 +81,7 @@ struct FileSettings {
 pub struct ControllerSettings {
     /// controller の http(s) の絶対 URL
     pub url: String,
-    /// 大きいほど優先する。チャンネル内で重複不可
+    /// 小さいほど優先する。チャンネル内で重複不可
     pub metric: u32,
 }
 
@@ -213,16 +213,15 @@ impl PublisherSettings {
                         .to_owned(),
                 );
             };
-            controllers.push(ControllerSettings { url, metric: 1 });
+            controllers.push(ControllerSettings { url, metric: 0 });
         } else {
             for controller in &mut controllers {
                 controller.url = normalize_controller_url(&controller.url)?;
             }
         }
         controllers.sort_by(|left, right| {
-            right
-                .metric
-                .cmp(&left.metric)
+            left.metric
+                .cmp(&right.metric)
                 .then_with(|| left.url.cmp(&right.url))
         });
         validate_auth_token(cli.auth_token.as_deref())?;
@@ -643,11 +642,11 @@ mod tests {
         target.controllers = vec![
             ControllerSettings {
                 url: "https://a.example.test".to_owned(),
-                metric: 100,
+                metric: 0,
             },
             ControllerSettings {
                 url: "https://b.example.test".to_owned(),
-                metric: 50,
+                metric: 1,
             },
         ];
         let candidates = target.candidate_live_urls(&target.inputs[0]);
@@ -655,11 +654,11 @@ mod tests {
             candidates,
             vec![
                 (
-                    100,
+                    0,
                     "https://a.example.test/channels/1A/master.m3u8".to_owned()
                 ),
                 (
-                    50,
+                    1,
                     "https://b.example.test/channels/1A/master.m3u8".to_owned()
                 ),
             ]

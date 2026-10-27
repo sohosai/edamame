@@ -9,7 +9,7 @@
 #   --stream-ingest-token <STREAM_INGEST_TOKEN>
 #   --key-file /var/lib/edamame-publisher/key.bin
 #
-# controller は metric が大きい順に使う。先頭が落ちたときは次の controller へ
+# controller は metric が小さい順に使う。先頭が落ちたときは次の controller へ
 # 送信し、登録した live_url も fallback 候補として使われる。
 
 # 全 channel で共通のセグメント長。
@@ -29,11 +29,11 @@ preset = "p5"
 
 [[controller]]
 url = "https://edamame-a.example.test"
-metric = 100
+metric = 0
 
 [[controller]]
 url = "https://edamame-b.example.test"
-metric = 50
+metric = 1
 
 [[input]]
 channel_id = "uni"
