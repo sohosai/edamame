@@ -17,13 +17,12 @@ async fn reads_configuration_from_environment() {
         .env("EDAMAME_PUBLISH_WAIT_MS", "2000")
         .env("EDAMAME_AUTH_TOKEN", "example-token")
         .env("EDAMAME_PUBLIC_URL", "https://controller.test/base/")
-        .env("EDAMAME_METRIC", "20")
         .env("EDAMAME_SEED", "http://peer.test,http://peer.test/")
         // 環境変数の値は不正だが、CLI の値が優先される
         .env("EDAMAME_PLAYLIST_SEGMENTS", "5")
         // CORS は未指定にする
         .env_remove("EDAMAME_CORS_ORIGIN")
-        .args(["--playlist-segments", "6", "--metric", "30"])
+        .args(["--playlist-segments", "6"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -59,12 +58,8 @@ async fn reads_configuration_from_environment() {
         "公開 URL が正規化されなかった: {cluster}"
     );
     assert!(
-        cluster.contains("metric=30"),
-        "CLI の metric が優先されなかった: {cluster}"
-    );
-    assert!(
-        cluster.contains("role=Follower"),
-        "起動直後に leader を名乗った: {cluster}"
+        cluster.contains("peers=1"),
+        "起動時の peer 数が想定と違う: {cluster}"
     );
     child.kill().await.unwrap();
 }
@@ -100,9 +95,9 @@ async fn rejects_empty_environment_variable() {
     );
 }
 
-/// seed と metric を省略しても、公開 URL と token があれば 1 台で選出する。
+/// seed を省略しても、公開 URL と token があれば 1 台で起動する。
 #[tokio::test]
-async fn elects_self_without_seeds_and_defaults_metric_to_100() {
+async fn starts_without_seeds() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
@@ -117,7 +112,6 @@ async fn elects_self_without_seeds_and_defaults_metric_to_100() {
         .env("EDAMAME_CORS_ORIGIN", "none")
         .env("EDAMAME_PUBLIC_URL", &base)
         .env("EDAMAME_AUTH_TOKEN", "example-token")
-        .env_remove("EDAMAME_METRIC")
         .env_remove("EDAMAME_SEED")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -131,28 +125,17 @@ async fn elects_self_without_seeds_and_defaults_metric_to_100() {
         .unwrap()
         .unwrap();
     let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let health: serde_json::Value = client
-            .get(format!("{base}/internal/cluster/health"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(health["public_url"], base);
-        assert_eq!(health["metric"], 100);
-        if health["role"] == "leader" {
-            assert_eq!(health["leader_url"], base);
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "1 台構成の選出が完了しなかった"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let health: serde_json::Value = client
+        .get(format!("{base}/internal/cluster/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["public_url"], base);
+    assert!(health.get("role").is_none());
+    assert!(health.get("leader_url").is_none());
     let url = format!("{base}/internal/cluster/heartbeat");
     assert_eq!(
         client
@@ -168,7 +151,7 @@ async fn elects_self_without_seeds_and_defaults_metric_to_100() {
     let response = client
         .post(&url)
         .bearer_auth("example-token")
-        .json(&serde_json::json!({"public_url":base,"metric":100,"members":[]}))
+        .json(&serde_json::json!({"public_url":base,"members":[],"workers":[]}))
         .send()
         .await
         .unwrap();

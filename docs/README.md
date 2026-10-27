@@ -12,7 +12,7 @@ Edamame は、ライブ HLS 配信のセグメントをメモリに保持する�
 | [publisher](./publisher.md) | ライブ入力、エンコード、暗号化、鍵登録、検証用 publisher |
 | [tomyou](./tomyou.md) | OBS の映像を Edamame と ImageFlux へ中継する GUI アプリ。入力チェックと fallback 登録 |
 | [運用](./operations.md) | パラメータの調整、メモリ見積もり、通信の保護、再生確認、障害切り分け |
-| [controller の冗長化](./cluster.md) | 複数台の起動、DNS、leader 選出、転送、交代と通信分断時の制約 |
+| [controller の冗長化](./cluster.md) | 複数台の起動、DNS、worker registry の共有、publisher の fan-out、通信分断時の制約 |
 | [HTTP API](./api.md) | エンドポイント、認証、リクエストとレスポンス、再 PUT、ステータス |
 | [HLS の出力](./hls.md) | 対応形式、プレイリストのタグと出力例、暗号化タグ、再生上の制約 |
 | [可観測性](./observability.md) | 共通のメトリクス仕様、送信設定、ヘルスチェック、ローカルでの確認方法 |
@@ -35,8 +35,9 @@ flowchart LR
     client -->|GET 暗号鍵| keys[外部の鍵配信サーバー]
 ```
 
-controller は台数によらず leader を選び、保存とプレイリスト生成を leader で処理する。
-follower は配信用のリクエストを転送し、セグメントや採番状態は複製しない。
+複数の controller は leader を選ばず、それぞれが自分のメモリで保存とプレイリスト生成を行う。
+publisher は全 controller に同じセグメントを送り、worker の登録とキャッシュ報告は heartbeat で共有する。
+client は 1 台の controller から playlist を取り、segment は worker から取得する。
 worker はキャッシュと配信だけを担当し、プレイリストを生成しない。
 publisher は controller へプレイリストを送信せず、鍵の実体も controller / worker には保存しない。
 
@@ -48,7 +49,7 @@ publisher は controller へプレイリストを送信せず、鍵の実体も 
 | quality | channel 内の画質。`quality` で識別し、ビットレートと任意の解像度を持つ |
 | セグメント識別子 | publisher が付ける `identifier`。同じ時間帯の全 quality で同じ値を使う |
 | セグメント番号 | controller が識別子へ channel ごとに割り当てる `sequence`。`0` から始まる |
-| 原本データ | controller がメモリに保存する元のセグメントと属性。再起動または leader 交代で失われる |
+| 原本データ | controller がメモリに保存する元のセグメントと属性。その controller の再起動で失われる |
 | キャッシュ | worker がメモリに持つセグメント本体。原本が残る間は再取得できる |
 | 暗号化指定 | セグメントごとの `key_uri` と任意の IV。controller がプレイリストへ出力する |
 | 暗号鍵 | publisher または外部サービスが配布し、client が直接取得する |
@@ -70,7 +71,7 @@ controller の保存容量は全セグメント本体の合計バイト数、wor
 - VOD、fMP4、LL-HLS、バイト範囲、複数音声、I フレーム用プレイリスト
 - AES-128-CBC 以外の暗号化と、controller / worker での鍵の保管や配布
 - セグメント、採番状態、worker キャッシュの永続化
-- controller 間の状態複製と、leader 交代をまたぐ PUT の保持
+- controller 間の状態複製、再起動した controller への過去セグメントの backfill、全 controller で共通の採番の保証
 - worker の実負荷に合わせた配置や重みの自動調整
 - 全 quality の公開範囲の一致と、範囲切り替え時の連続再生
 - アプリ自体の Prometheus 用 `/metrics`（OTLP/gRPC で送信する）

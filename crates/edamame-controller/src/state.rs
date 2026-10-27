@@ -10,6 +10,7 @@ use edamame_domain::{
     plan_master_playlist, plan_media_playlist, render_master_playlist, render_media_playlist,
     validate_identifier, validate_quality, validate_resolution,
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::external;
@@ -117,6 +118,16 @@ pub struct WorkerState {
     /// 直前の sync 応答で取得を指示したセグメント
     /// 取得が終わって報告されるまでの間に、同じ番号に保存し直したことを検出するために使う
     pub instructed: BTreeSet<SegmentId>,
+}
+
+/// heartbeat で controller 間を共有する worker の状態
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerSnapshot {
+    pub worker_id: String,
+    pub public_url: String,
+    pub weight: u32,
+    pub cached_segments: Vec<SegmentKey>,
+    pub fetching_segments: Vec<SegmentKey>,
 }
 
 /// セグメント登録の結果
@@ -505,6 +516,92 @@ impl ControllerState {
         // 取得中でまだ報告していないセグメントを、再保存のときに検出できるようにする
         worker.instructed = missing;
         Ok(SyncResponse { fetch_segments })
+    }
+
+    /// 他 controller の heartbeat に含まれる全 worker の状態を返す。
+    pub async fn worker_snapshots(&self) -> Vec<WorkerSnapshot> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .map(|(worker_id, worker)| WorkerSnapshot {
+                worker_id: worker_id.clone(),
+                public_url: worker.public_url.clone(),
+                weight: u32::try_from(worker.weight).unwrap_or(u32::MAX),
+                cached_segments: worker.cached.iter().map(SegmentKey::from).collect(),
+                fetching_segments: worker.fetching.iter().map(SegmentKey::from).collect(),
+            })
+            .collect()
+    }
+
+    /// 他 controller から受け取った worker の状態を反映する。
+    /// worker が sync した controller だけが fetch 指示を返すため、instructed は消す。
+    pub async fn apply_worker_snapshot(
+        &self,
+        snapshot: WorkerSnapshot,
+        now_ms: u64,
+    ) -> Result<(), EdamameError> {
+        validate_identifier("worker_id", &snapshot.worker_id)?;
+        if snapshot.weight == 0 {
+            return Err(EdamameError::BadRequest(
+                "weight must be positive".to_owned(),
+            ));
+        }
+        let public_url = normalize_public_url(&snapshot.public_url)?;
+        let mut cached = BTreeSet::new();
+        for key in snapshot.cached_segments {
+            cached.insert(key.into_id()?);
+        }
+        let mut fetching = BTreeSet::new();
+        for key in snapshot.fetching_segments {
+            fetching.insert(key.into_id()?);
+        }
+
+        let mut inner = self.inner.lock().await;
+        let changed = if let Some(worker) = inner.workers.get_mut(&snapshot.worker_id) {
+            let changed =
+                worker.public_url != public_url || worker.weight != i64::from(snapshot.weight);
+            worker.public_url = public_url;
+            worker.weight = i64::from(snapshot.weight);
+            worker.last_sync_ms = now_ms;
+            worker.cached = cached;
+            worker.fetching = fetching;
+            worker.instructed.clear();
+            changed
+        } else {
+            inner.workers.insert(
+                snapshot.worker_id,
+                WorkerState {
+                    public_url,
+                    weight: i64::from(snapshot.weight),
+                    last_sync_ms: now_ms,
+                    cached,
+                    fetching,
+                    instructed: BTreeSet::new(),
+                },
+            );
+            true
+        };
+        if changed {
+            reset_current_weights(&mut inner.channels);
+        }
+        let advances = {
+            let Inner {
+                channels, workers, ..
+            } = &mut *inner;
+            advance_published(
+                channels,
+                workers,
+                self.playlist_segments,
+                self.sync_timeout_ms,
+                now_ms,
+            )
+        };
+        for advance in advances {
+            self.metrics
+                .record_published(&advance.channel_id, &advance.quality, advance.segments);
+        }
+        Ok(())
     }
 
     pub async fn media_playlist(

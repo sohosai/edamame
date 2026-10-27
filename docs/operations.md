@@ -2,7 +2,7 @@
 
 起動と各オプションは [controller](./controller.md)、[worker](./worker.md)、[publisher](./publisher.md) を参照する。
 この文書には、コンポーネント間の調整、ネットワークの前提、全体の確認、障害の切り分けをまとめる。
-複数 controller の構成と選出規則は [冗長化](./cluster.md)、監視は [可観測性](./observability.md) を参照する。
+複数 controller の構成と worker registry の共有は [冗長化](./cluster.md)、監視は [可観測性](./observability.md) を参照する。
 
 ## パラメータ設計とメモリ見積もり
 
@@ -58,7 +58,7 @@ worker が `--cache-limit 12` で同じ 3 channel を持つと、本体だけで
 | --- | --- |
 | publisher / worker から controller | 同じ Bearer token を設定する。controller が TLS を終端する場合は証明書を検証できること |
 | controller の peer 間 | 固有 URL へ相互に接続でき、全 peer が信頼できること |
-| client から controller | マスターとメディアプレイリストに接続でき、follower の `307` に追従できること |
+| client から controller | マスターとメディアプレイリストに接続でき、live2025-server が選んだ controller を使えること |
 | client から worker | プレイリストに書かれた公開 URL へ接続できること |
 | client から鍵配信元 | 鍵 URI へ接続でき、必要な認証と cookie を送れること |
 
@@ -83,7 +83,7 @@ NAT やプロキシを使う場合は、視聴者単位の割合にならない�
 controller と worker の起動順序は問わないが、確認時は [導入手順](../README.md#最短での起動手順) の順にすると切り分けやすい。
 次の順で確認する。
 
-1. `/health` が応答することと、`/internal/cluster/health` で leader が確定していることを確認する。
+1. `/health` が応答することと、複数台の場合は `/internal/cluster/health` の `members` で peer を発見できていることを確認する。
 2. worker の登録と sync のログを確認する。
 3. セグメントを PUT し、返された `sequence` を確認する。
 4. 公開待ちと取得完了後に master と全 quality のメディアプレイリストを取得する。
@@ -114,11 +114,11 @@ HTTP の成功、ffprobe による解析、手動復号の成功だけで再生�
 | 症状 | 最初に確認すること |
 | --- | --- |
 | プロセスへ接続できない | `--bind`、公開ポート、DNS、TLS、プロキシの転送先。`/health` の応答だけでは配信可能とは判断しない |
-| プレイリストが `404` | channel / quality へ PUT 済みか、再起動または leader 交代で状態が失われていないか |
+| プレイリストが `404` | channel / quality へ PUT 済みか、その controller の再起動で状態が失われていないか |
 | PUT が `401` | publisher / worker / 全 controller の token が一致しているか |
 | PUT が `409` | 同じ識別子のバイト列、duration、bandwidth、resolution の固定条件を破っていないか |
 | PUT が `413` | 1 セグメントが保存容量または 64 MiB の HTTP 上限を超えていないか |
-| プレイリストが `503` | leader、公開待ち、publisher の停止、worker の登録と sync、公開範囲全体のキャッシュ有無。詳細は [controller](./controller.md#公開範囲の決定) |
+| プレイリストが `503` | 公開待ち、publisher の停止、worker の登録と sync、公開範囲全体のキャッシュ有無。詳細は [controller](./controller.md#公開範囲の決定) |
 | プレイリストが `422` | 公開範囲の原本が容量超過で消えていないか。容量と入力の最大サイズを見直す |
 | worker のセグメントが `404` | プレイリストが古くないか、worker の再起動や再登録でキャッシュを捨てていないか。worker はリクエスト時に原本を取得しない |
 | worker が登録されない | token、`--controller-url`、ネットワークの疎通。controller が TLS を終端する場合は証明書を検証できるか。ACME の場合は公開ルート CA で有効な証明書を取得できているか |
@@ -126,7 +126,7 @@ HTTP の成功、ffprobe による解析、手動復号の成功だけで再生�
 | 最後の映像から進まない | publisher の入力と PUT、新規保存からの経過時間を確認する。猶予を超えるとその quality は停止中になり、メディアプレイリストは `503`、マスタープレイリストからは除外される。再開しても停止前のセグメントは公開されない |
 | 解像度や音声が設定と違う入力を送った | publisher の拒否ログを確認し、送信側の設定を直して再接続する。拒否では channel は止まらず、ffmpeg を起動し直して次の入力を待つ |
 | controller を再起動した | 状態と採番は失われる。worker は再登録後にキャッシュを捨て、publisher は新しいセグメントを送る必要がある |
-| leader が交代した | 状態の復元は行わない。外部配信の再登録とプレイヤーの再開が必要な場合がある。[冗長化の制約](./cluster.md#交代時の状態と復旧) を確認する |
+| controller が停止または再起動した | その controller の状態は復元しない。worker は別の controller へ切り替え、client は別の候補へ fallback する。外部配信の再登録とプレイヤーの再開が必要な場合がある。[冗長化の制約](./cluster.md#再起動と失敗時の扱い) を確認する |
 | DNS が停止機体を返す | 停止機体の A レコードを除き、接続失敗を再試行する。短い TTL だけで即時切り替えは保証できない |
 | HTTP は成功するが復号できない | 対象セグメントの鍵、IV、URI、鍵の入れ替え、cookie と CORS を確認する |
 | 外部配信へ転送後に失敗する | controller は外部の状態を監視しない。登録先を確認し、停止するなら外部配信登録を解除する |

@@ -3284,7 +3284,6 @@ async fn serves_playlist_without_connect_info() {
         external_min_percent: 1,
         cors_origin: vec![],
         public_url: "http://127.0.0.1:9000".to_owned(),
-        metric: 100,
         auth_token: support::AUTH_TOKEN.to_owned(),
         seed: vec![],
         tls_cert: None,
@@ -3296,9 +3295,6 @@ async fn serves_playlist_without_connect_info() {
     };
     let cluster = edamame_controller::cluster::ClusterState::new(&config, state.clone()).unwrap();
     tokio::spawn(cluster.clone().run());
-    while cluster.health().await.role != edamame_controller::cluster::Role::Leader {
-        tokio::task::yield_now().await;
-    }
     let app = edamame_controller::router(state, &CorsOrigins::Disabled, cluster);
     let request = axum::http::Request::builder()
         .uri("/channels/live/master.m3u8")

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use edamame_controller::cluster::{ClusterState, Role};
+use edamame_controller::cluster::ClusterState;
 use edamame_controller::storage::CanonicalStore;
 use edamame_controller::{ControllerConfig, ControllerState, router as controller_router};
 use edamame_domain::CorsOrigins;
@@ -239,7 +239,6 @@ async fn spawn_controller_with_options(
         external_min_percent: options.external_min_percent,
         cors_origin: vec![],
         public_url: format!("http://{addr}"),
-        metric: 100,
         auth_token: options.auth_token.to_owned(),
         seed: vec![],
         tls_cert: None,
@@ -251,10 +250,6 @@ async fn spawn_controller_with_options(
     };
     let cluster = ClusterState::new(&config, state.clone()).unwrap();
     let heartbeat_task = tokio::spawn(cluster.clone().run());
-    // 通常の API テストは、初回の選出が終わった状態から始める。
-    while cluster.health().await.role != Role::Leader {
-        tokio::task::yield_now().await;
-    }
     let app = controller_router(state.clone(), &options.cors, cluster);
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     tokio::spawn(async move {
@@ -388,6 +383,45 @@ async fn spawn_worker_with_options(
     start_sync: bool,
     options: WorkerOptions,
 ) -> WorkerHandle {
+    spawn_worker_with_controllers_options(
+        worker_id,
+        vec![controller_url.to_owned()],
+        cache_limit,
+        start_sync,
+        options,
+    )
+    .await
+}
+
+/// 複数の controller を接続先に持つ worker を起動する
+pub async fn spawn_worker_with_auth_and_controllers(
+    worker_id: &str,
+    controller_urls: Vec<String>,
+    cache_limit: u64,
+    start_sync: bool,
+    auth_token: &str,
+) -> WorkerHandle {
+    let options = WorkerOptions {
+        auth_token: Some(auth_token.to_owned()),
+        ..WorkerOptions::default()
+    };
+    spawn_worker_with_controllers_options(
+        worker_id,
+        controller_urls,
+        cache_limit,
+        start_sync,
+        options,
+    )
+    .await
+}
+
+async fn spawn_worker_with_controllers_options(
+    worker_id: &str,
+    controller_urls: Vec<String>,
+    cache_limit: u64,
+    start_sync: bool,
+    options: WorkerOptions,
+) -> WorkerHandle {
     let WorkerOptions {
         cors,
         auth_token,
@@ -399,7 +433,7 @@ async fn spawn_worker_with_options(
     let public_url = format!("http://{addr}");
     let state = WorkerState::new(
         worker_id.to_owned(),
-        controller_url.to_owned(),
+        controller_urls,
         public_url.clone(),
         weight,
         cache,
@@ -494,7 +528,6 @@ pub fn available_addr() -> SocketAddr {
 /// 外部の EDAMAME_ 設定を引き継がず実プロセスを起動し、health の応答まで待つ。
 pub async fn spawn_cluster_process(
     addr: SocketAddr,
-    metric: u32,
     seeds: &[String],
     prefix: &str,
 ) -> ControllerProcess {
@@ -522,8 +555,6 @@ pub async fn spawn_cluster_process(
         "*",
         "--public-url",
         &base_url,
-        "--metric",
-        &metric.to_string(),
     ]);
     if !seeds.is_empty() {
         command.args(["--seed", &seeds.join(",")]);
@@ -558,8 +589,8 @@ pub async fn spawn_cluster_process(
     }
 }
 
-/// 選出の収束を確認するため、役割と leader URL の両方が一致するまで待つ。
-pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str, leader_url: &str) {
+/// peer の発見が終わるまで health の members を待つ。
+pub async fn wait_for_member(client: &reqwest::Client, base_url: &str, member_url: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let health: serde_json::Value = client
@@ -570,12 +601,15 @@ pub async fn wait_for_role(client: &reqwest::Client, base_url: &str, role: &str,
             .json()
             .await
             .unwrap();
-        if health["role"] == role && health["leader_url"] == leader_url {
+        let found = health["members"]
+            .as_array()
+            .is_some_and(|members| members.iter().any(|member| member == member_url));
+        if found {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "役割が切り替わらなかった: {health}"
+            "peer を発見できなかった: {health}"
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }

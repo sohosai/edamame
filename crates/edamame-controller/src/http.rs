@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::cluster::{ClusterState, Heartbeat, Role};
+use crate::cluster::{ClusterState, Heartbeat};
 
 use crate::state::{
     ControllerState, ExternalRouting, IngestOutcome, MasterResponse, SegmentIngest,
@@ -50,10 +50,6 @@ pub fn router(
             get(get_segment),
         )
         .route("/channels/{channel_id}/{file}", get(get_playlist));
-    let read = read.layer(middleware::from_fn_with_state(
-        cluster.clone(),
-        route_cluster,
-    ));
     let read = match cors_layer(cors) {
         Some(layer) => read.layer(layer),
         None => read,
@@ -72,10 +68,6 @@ pub fn router(
             put(put_channel_external).layer(DefaultBodyLimit::max(EXTERNAL_BODY_LIMIT)),
         );
     let write = write.layer(middleware::from_fn_with_state(
-        cluster.clone(),
-        route_cluster,
-    ));
-    let write = write.layer(middleware::from_fn_with_state(
         cluster.auth_token.clone(),
         authorize_bearer,
     ));
@@ -83,10 +75,6 @@ pub fn router(
         "/workers/{worker_id}/sync",
         post(post_sync).layer(DefaultBodyLimit::max(SYNC_BODY_LIMIT)),
     );
-    let sync = sync.layer(middleware::from_fn_with_state(
-        cluster.clone(),
-        route_cluster,
-    ));
     let internal = Router::new()
         .route("/internal/cluster/heartbeat", post(cluster_heartbeat))
         .layer(DefaultBodyLimit::max(REGISTER_BODY_LIMIT));
@@ -121,110 +109,6 @@ async fn cluster_heartbeat(
     ValidatedJson(heartbeat): ValidatedJson<Heartbeat>,
 ) -> Result<Json<Heartbeat>, HttpError> {
     Ok(Json(cluster.receive(heartbeat).await?))
-}
-
-/// leader 未確定や中継失敗の際に、1 秒後の再試行を促す応答。
-fn unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (header::RETRY_AFTER, "1"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        "leader unavailable",
-    )
-        .into_response()
-}
-
-/// 受信側の接頭辞を除いた URI を受け取り、leader の公開 URL に連結する。
-fn leader_location(leader: &str, uri: &axum::http::Uri) -> String {
-    format!(
-        "{leader}{}",
-        uri.path_and_query().map_or("/", |value| value.as_str())
-    )
-}
-
-/// leader は自分で処理し、follower は GET と sync を redirect、PUT を内部中継する。
-async fn route_cluster(
-    State(cluster): State<Arc<ClusterState>>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    let mut inner = cluster.inner.read().await;
-    if inner.role == Role::Leader && matches!(*request.method(), Method::PUT | Method::POST) {
-        // 低速なアップロードで heartbeat を止めないよう、body の受信中は役割を固定しない。
-        drop(inner);
-        let limit = match (request.method(), request.uri().path()) {
-            (&Method::PUT, path) if path.starts_with("/workers/") => REGISTER_BODY_LIMIT,
-            (&Method::PUT, path) if path.starts_with("/channels/") => EXTERNAL_BODY_LIMIT,
-            _ => SEGMENT_BODY_LIMIT,
-        };
-        let (parts, body) = request.into_parts();
-        let body = match axum::body::to_bytes(body, limit).await {
-            Ok(body) => body,
-            Err(_) if parts.method == Method::PUT && parts.uri.path().starts_with("/segments/") => {
-                return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-            }
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "request body is too large or unreadable",
-                )
-                    .into_response();
-            }
-        };
-        request = Request::from_parts(parts, axum::body::Body::from(body));
-        // 受信中に降格していた場合は、新しい役割に従って転送する。
-        inner = cluster.inner.read().await;
-    }
-    if inner.role == Role::Leader {
-        // 降格はこの処理が終わるまで待ち、全消去した状態への書き戻しを防ぐ。
-        let response = next.run(request).await;
-        drop(inner);
-        return response;
-    }
-    let Some(leader) = &inner.leader_url else {
-        return unavailable();
-    };
-    let location = leader_location(leader, request.uri());
-    drop(inner);
-    if request.method() != Method::PUT {
-        return (
-            StatusCode::TEMPORARY_REDIRECT,
-            [
-                (header::LOCATION, location),
-                (header::CACHE_CONTROL, "no-store".to_owned()),
-            ],
-        )
-            .into_response();
-    }
-    let (parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, SEGMENT_BODY_LIMIT).await {
-        Ok(body) => body,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
-    };
-    let mut relay = cluster.client.request(parts.method, location).body(body);
-    for name in [header::AUTHORIZATION, header::CONTENT_TYPE] {
-        if let Some(value) = parts.headers.get(&name) {
-            relay = relay.header(name, value);
-        }
-    }
-    let result = async {
-        let response = relay.send().await?;
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response.bytes().await?;
-        Ok::<_, reqwest::Error>((status, headers, body).into_response())
-    }
-    .await;
-    match result {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("cluster relay failed: {error}");
-            cluster.refresh.notify_one();
-            unavailable()
-        }
-    }
 }
 
 /// PUT と heartbeat を同じ Bearer token で認証する
@@ -567,111 +451,4 @@ async fn post_sync(
         }
     };
     Ok(Json(response))
-}
-
-#[cfg(test)]
-mod cluster_tests {
-    use super::*;
-    use clap::Parser;
-    use tower::ServiceExt;
-
-    #[test]
-    fn keeps_prefix_path_and_query_in_location() {
-        let uri = "/segments/live/720p/0.ts?k=a%2Fb&x=1".parse().unwrap();
-        assert_eq!(
-            leader_location("https://leader.test/base", &uri),
-            "https://leader.test/base/segments/live/720p/0.ts?k=a%2Fb&x=1"
-        );
-        assert_eq!(
-            leader_location("http://leader.test", &"/".parse().unwrap()),
-            "http://leader.test/"
-        );
-    }
-
-    #[tokio::test]
-    async fn returns_retry_after_until_first_heartbeat_round_completes() {
-        let config = crate::ControllerConfig::parse_from([
-            "controller",
-            "--bind",
-            "127.0.0.1:0",
-            "--storage-capacity",
-            "1MiB",
-            "--playlist-segments",
-            "6",
-            "--sync-interval-ms",
-            "100",
-            "--sync-timeout-ms",
-            "1000",
-            "--public-url",
-            "http://a.test",
-            "--metric",
-            "10",
-            "--seed",
-            "http://b.test",
-            "--auth-token",
-            "token",
-        ]);
-        let state = ControllerState::new(crate::CanonicalStore::new(1024), 6, 100, 1000, 0, 1);
-        let cluster = ClusterState::new(&config, state.clone()).unwrap();
-        // 実際の初期状態を使い、heartbeat を開始する前の応答を確認する。
-        let app = router(state.clone(), &CorsOrigins::Any, cluster);
-        for (method, path) in [
-            (Method::GET, "/segments/live/720p/0.ts"),
-            (Method::PUT, "/workers/a"),
-            (Method::POST, "/workers/a/sync"),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .method(method.clone())
-                        .uri(path)
-                        .header(header::AUTHORIZATION, "Bearer token")
-                        .header(header::ORIGIN, "https://player.test")
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
-            if method == Method::GET {
-                assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
-            }
-        }
-        let response = app
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method(Method::PUT)
-                    .uri("/workers/a")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "未確定時も PUT は先に認証する"
-        );
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/internal/cluster/health")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(health["role"], "follower");
-        assert!(health["leader_url"].is_null());
-        assert_eq!(state.store.used_bytes(), 0);
-        assert!(state.inner.lock().await.workers.is_empty());
-    }
 }
