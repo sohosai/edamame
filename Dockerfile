@@ -3,6 +3,7 @@ FROM rust:1.97-slim-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo build --release --locked --bin edamame-controller --bin edamame-worker --bin edamame-publisher
 # distroless には shell が無く RUN でファイルを足せないため、DNS 解決に使う設定をここで作る
 RUN printf 'hosts: files dns\n' > /etc/nsswitch.conf

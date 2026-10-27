@@ -27,6 +27,10 @@ const PUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// ffmpeg を起動し直すときの待ち時間
 const RESTART_MIN: Duration = Duration::from_secs(1);
 const RESTART_MAX: Duration = Duration::from_secs(10);
+/// 不正な入力を拒否したあと、次の入力を待つまでの時間
+const INPUT_RESTART_DELAY: Duration = Duration::from_secs(1);
+/// 拒否時に、送信待ちのセットが処理されるのを待つ上限
+const PENDING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// コピーする rendition のセグメント長を比べるときの許容幅
 const COPY_DURATION_TOLERANCE_MS: u64 = 100;
 /// プレイリスト取得時の制限時間と試行回数
@@ -90,6 +94,14 @@ enum PublishError {
     Fatal(String),
     /// 期限を過ぎたか停止したので、このセットは捨てる
     Abandoned(String),
+}
+
+/// セグメントの収集で起きた問題
+enum SegmentError {
+    /// 入力が設定に合わないので、セットを捨てて入力を待ち直す
+    Rejected(String),
+    /// ローカルの障害なので、channel を起動し直す
+    Fatal(String),
 }
 
 /// 16 byte の乱数から暗号鍵を作る
@@ -220,7 +232,7 @@ pub fn spawn_channel(
             })
         };
 
-        // 入力が設定に合わないなどでチャンネルが止まっても、待ち受けを再開して次の入力を待つ。
+        // PUT の設定誤りなどでチャンネルが止まっても、待ち受けを再開して次の入力を待つ。
         // 止まったままにすると、送信側が設定を直して接続し直しても復帰できない。
         // run の番号は作業ディレクトリに残っている番号の続きから使い、
         // 前の実行が残したセグメントを新しい実行が読み直さないようにする
@@ -230,6 +242,8 @@ pub fn spawn_channel(
             let channel_stop = Arc::new(AtomicBool::new(false));
             let start_sequence = starting_sequence(&context);
             let published = Arc::new(AtomicU64::new(start_sequence));
+            // 拒否時に、送信待ちのセットが処理し終わるまで次の ffmpeg を起動しないために数える
+            let pending = Arc::new(AtomicU64::new(0));
             let (sender, receiver) = mpsc::channel();
 
             let encoder = {
@@ -237,6 +251,7 @@ pub fn spawn_channel(
                 let stop = Arc::clone(&stop);
                 let channel_stop = Arc::clone(&channel_stop);
                 let published = Arc::clone(&published);
+                let pending = Arc::clone(&pending);
                 let run_counter = Arc::clone(&run_counter);
                 thread::spawn(move || {
                     if let Err(message) = run_encoder(
@@ -245,6 +260,7 @@ pub fn spawn_channel(
                         &stop,
                         &channel_stop,
                         &published,
+                        &pending,
                         &run_counter,
                     ) {
                         println!("channel={} stopped: {message}", context.channel_id());
@@ -256,10 +272,16 @@ pub fn spawn_channel(
                 let stop = Arc::clone(&stop);
                 let channel_stop = Arc::clone(&channel_stop);
                 let published = Arc::clone(&published);
+                let pending = Arc::clone(&pending);
                 thread::spawn(move || {
-                    if let Err(message) =
-                        run_publisher(&context, &receiver, &stop, &channel_stop, &published)
-                    {
+                    if let Err(message) = run_publisher(
+                        &context,
+                        &receiver,
+                        &stop,
+                        &channel_stop,
+                        &published,
+                        &pending,
+                    ) {
                         println!("channel={} stopped: {message}", context.channel_id());
                     }
                 })
@@ -517,11 +539,12 @@ fn run_encoder(
     stop: &AtomicBool,
     channel_stop: &AtomicBool,
     published: &AtomicU64,
+    pending: &AtomicU64,
     run_counter: &AtomicU64,
 ) -> Result<(), String> {
     let mut restart_delay = RESTART_MIN;
 
-    while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
+    'restart_input: while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
         let run_number = run_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let run_dir = context.work_dir.join(format!("run-{run_number}"));
         for rendition in context.renditions() {
@@ -557,12 +580,42 @@ fn run_encoder(
                 );
                 break;
             }
-            collect_segments(context, &mut run, sender)?;
+            match collect_segments(context, &mut run, sender, pending) {
+                Ok(()) => {}
+                Err(SegmentError::Rejected(message)) => {
+                    reject_input(
+                        context,
+                        &mut process,
+                        &mut run,
+                        &message,
+                        pending,
+                        stop,
+                        channel_stop,
+                    )?;
+                    continue 'restart_input;
+                }
+                Err(SegmentError::Fatal(message)) => return Err(message),
+            }
             thread::sleep(POLL_INTERVAL);
         }
 
         // 終了間際に完成したセグメントを集め、揃わなかったものは捨てる
-        collect_segments(context, &mut run, sender)?;
+        match collect_segments(context, &mut run, sender, pending) {
+            Ok(()) => {}
+            Err(SegmentError::Rejected(message)) => {
+                reject_input(
+                    context,
+                    &mut process,
+                    &mut run,
+                    &message,
+                    pending,
+                    stop,
+                    channel_stop,
+                )?;
+                continue 'restart_input;
+            }
+            Err(SegmentError::Fatal(message)) => return Err(message),
+        }
         run.discard_incomplete(context)?;
 
         if run.produced == 0 {
@@ -576,6 +629,43 @@ fn run_encoder(
     Ok(())
 }
 
+/// 不正な入力を拒否し、channel を維持したまま ffmpeg を起動し直せる状態にする
+///
+/// channel 全体を止めると、controller のプレイリスト読み直しとバックオフの間、
+/// 送信側が再接続できなくなる。ffmpeg だけを止め、送信待ちのセットが
+/// 処理し終わるのを待ってから次の入力を待つ。
+fn reject_input(
+    context: &ChannelContext,
+    process: &mut Ffmpeg,
+    run: &mut RunState,
+    message: &str,
+    pending: &AtomicU64,
+    stop: &AtomicBool,
+    channel_stop: &AtomicBool,
+) -> Result<(), String> {
+    println!(
+        "channel={} rejected the input: {message}; restarting the input",
+        context.channel_id()
+    );
+    process.stop();
+    run.discard_incomplete(context)?;
+    wait_for_pending_sets(pending, stop, channel_stop);
+    sleep_interruptible(INPUT_RESTART_DELAY, stop, channel_stop);
+    Ok(())
+}
+
+/// 送信側が送信待ちのセットを処理し終えるのを、上限付きで待つ
+fn wait_for_pending_sets(pending: &AtomicU64, stop: &AtomicBool, channel_stop: &AtomicBool) {
+    let deadline = Instant::now() + PENDING_DRAIN_TIMEOUT;
+    while pending.load(Ordering::Relaxed) > 0
+        && Instant::now() < deadline
+        && !stop.load(Ordering::Relaxed)
+        && !channel_stop.load(Ordering::Relaxed)
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// ffmpeg を 1 回起動して作られたセグメントの状態
 struct RunState {
     run_dir: PathBuf,
@@ -585,8 +675,6 @@ struct RunState {
     sent: BTreeSet<u64>,
     /// 長さを確かめたセグメント番号
     checked: BTreeSet<u64>,
-    /// 今回の ffmpeg 起動後、最初のセットの検査が済んだか
-    validated: bool,
     /// 今回の ffmpeg 起動後に送信側へ渡したセット数
     produced: u64,
 }
@@ -598,7 +686,6 @@ impl RunState {
             files: BTreeMap::new(),
             sent: BTreeSet::new(),
             checked: BTreeSet::new(),
-            validated: false,
             produced: 0,
         }
     }
@@ -609,30 +696,40 @@ fn collect_segments(
     context: &ChannelContext,
     run: &mut RunState,
     sender: &Sender<PendingSet>,
-) -> Result<(), String> {
-    check_copy_segment_durations(context, run)?;
-    read_files(context, run)?;
+    pending: &AtomicU64,
+) -> Result<(), SegmentError> {
+    check_copy_segment_durations(context, run).map_err(SegmentError::Fatal)?;
+    read_files(context, run).map_err(SegmentError::Fatal)?;
 
     while let Some(index) = next_complete_index(context, run) {
-        let qualities = run.files.remove(&index).unwrap_or_default();
         let files = context
             .renditions()
             .iter()
             .filter_map(|rendition| {
-                qualities.get(&rendition.quality).map(|path| SegmentFile {
-                    quality: rendition.quality.clone(),
-                    path: path.clone(),
-                })
+                run.files
+                    .get(&index)?
+                    .get(&rendition.quality)
+                    .map(|path| SegmentFile {
+                        quality: rendition.quality.clone(),
+                        path: path.clone(),
+                    })
             })
             .collect::<Vec<_>>();
 
-        if !run.validated {
-            validate_first_set(context, &files)?;
-            run.validated = true;
+        // 拒否したセットは送らずに削除し、残りの未完成セットは呼び出し側で捨てる
+        if let Err(message) = validate_set(context, &files, run.produced == 0) {
+            let _ = run.files.remove(&index);
+            for file in &files {
+                let _ = fs::remove_file(&file.path);
+            }
+            return Err(SegmentError::Rejected(message));
         }
+
+        let identifier = new_identifier().map_err(SegmentError::Fatal)?;
+        let _ = run.files.remove(&index);
         let set = PendingSet {
             index,
-            identifier: new_identifier()?,
+            identifier,
             files,
             enqueued_at: Instant::now(),
         };
@@ -641,8 +738,13 @@ fn collect_segments(
                 .metrics
                 .record_encoded(context.channel_id(), &file.quality);
         }
+        // 送信側が処理し終えたことを数えられるよう、送る前に増やす
+        pending.fetch_add(1, Ordering::Relaxed);
         if sender.send(set).is_err() {
-            return Err("the publisher thread has stopped".to_owned());
+            pending.fetch_sub(1, Ordering::Relaxed);
+            return Err(SegmentError::Fatal(
+                "the publisher thread has stopped".to_owned(),
+            ));
         }
         run.sent.insert(index);
         run.produced += 1;
@@ -743,8 +845,15 @@ fn parse_segment_index(name: &str) -> Option<u64> {
     name.strip_suffix(".ts")?.parse::<u64>().ok()
 }
 
-/// ffmpeg 起動後の最初のセットだけ、入力の形式を確かめる
-fn validate_first_set(context: &ChannelContext, files: &[SegmentFile]) -> Result<(), String> {
+/// 完成したセットが入力の前提を満たすか確かめる
+///
+/// 音声はそのままコピーするため AAC に限る。copy の映像は H.264 で、
+/// 設定した解像度と一致しなければならない。
+fn validate_set(
+    context: &ChannelContext,
+    files: &[SegmentFile],
+    first_set: bool,
+) -> Result<(), String> {
     for file in files {
         let rendition = context
             .renditions()
@@ -784,7 +893,8 @@ fn validate_first_set(context: &ChannelContext, files: &[SegmentFile]) -> Result
                     file.quality
                 ));
             }
-            if let Some(field_order) = &video.field_order
+            if first_set
+                && let Some(field_order) = &video.field_order
                 && field_order != "progressive"
                 && field_order != "unknown"
             {
@@ -826,6 +936,7 @@ fn run_publisher(
     stop: &AtomicBool,
     channel_stop: &AtomicBool,
     published: &AtomicU64,
+    pending: &AtomicU64,
 ) -> Result<(), String> {
     let client = Client::builder()
         .timeout(PUT_TIMEOUT)
@@ -860,6 +971,7 @@ fn run_publisher(
                 dropped.index
             );
             delete_files(&dropped);
+            pending.fetch_sub(1, Ordering::Relaxed);
         }
 
         context
@@ -871,6 +983,7 @@ fn run_publisher(
         match publish_set(&client, context, &set, stop, channel_stop, max_age) {
             Ok(()) => {
                 published.fetch_add(1, Ordering::Relaxed);
+                pending.fetch_sub(1, Ordering::Relaxed);
             }
             Err(PublishError::Abandoned(reason)) => {
                 println!(
@@ -879,9 +992,11 @@ fn run_publisher(
                     set.index
                 );
                 delete_files(&set);
+                pending.fetch_sub(1, Ordering::Relaxed);
             }
             Err(PublishError::Fatal(message)) => {
                 delete_files(&set);
+                pending.fetch_sub(1, Ordering::Relaxed);
                 // 送信側を止め、エンコード側も終わらせる
                 channel_stop.store(true, Ordering::Relaxed);
                 return Err(message);
@@ -891,6 +1006,7 @@ fn run_publisher(
 
     for set in queue {
         delete_files(&set);
+        pending.fetch_sub(1, Ordering::Relaxed);
     }
     Ok(())
 }

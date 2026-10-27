@@ -321,6 +321,20 @@ impl IntoResponse for HttpError {
     }
 }
 
+/// プレイリストの利用不能応答を、共有キャッシュに残さない形で返す
+fn playlist_error(error: EdamameError) -> Response {
+    let status =
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let message = error.message().to_owned();
+    let mut response = (status, message).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
 /// プロセスが HTTP を受け付けられることを示す死活監視用の応答
 async fn health() -> (StatusCode, &'static str) {
     (StatusCode::OK, "ok")
@@ -430,9 +444,9 @@ async fn get_master_playlist(
             None => ExternalRouting::LocalOnly,
         },
     };
-    let body = match state.master_playlist(channel_id, now_ms(), routing).await? {
-        MasterResponse::Local(body) => body,
-        MasterResponse::External(url) => {
+    let body = match state.master_playlist(channel_id, now_ms(), routing).await {
+        Ok(MasterResponse::Local(body)) => body,
+        Ok(MasterResponse::External(url)) => {
             let location = HeaderValue::from_str(&url).map_err(|_| {
                 EdamameError::Internal("external m3u8 is not a valid header value".to_owned())
             })?;
@@ -446,6 +460,7 @@ async fn get_master_playlist(
             )
                 .into_response());
         }
+        Err(error) => return Ok(playlist_error(error)),
     };
     // 応答は接続元ごとに変わるため、共有キャッシュが使い回さないようにする
     Ok((
@@ -467,7 +482,10 @@ async fn get_media_playlist(
     channel_id: &str,
     quality: &str,
 ) -> Result<Response, HttpError> {
-    let body = state.media_playlist(channel_id, quality, now_ms()).await?;
+    let body = match state.media_playlist(channel_id, quality, now_ms()).await {
+        Ok(body) => body,
+        Err(error) => return Ok(playlist_error(error)),
+    };
     Ok((
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
         body,

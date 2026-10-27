@@ -1,0 +1,92 @@
+# tomyou の設定例
+# OBS のパスワード、ImageFlux の API トークン、STREAM_INGEST_TOKEN もこのファイルへ保存される。
+# 秘密情報を含むため、ファイルの権限と配布先に注意する。
+# 初回は GUI の「設定」から入力し、「保存」を押す。
+
+# live2025-server が認識する固定のチャンネル名
+channel_id = "uni"
+
+[obs]
+host = "127.0.0.1"
+port = 4455
+# password もこのファイルへ保存される
+
+[publisher]
+# edamame-publisher が待ち受ける RTMP URL。
+# 2 つ以上書くと、上から順に使い、送信が終わったら次の URL へ切り替える。
+# 1 つだけなら rtmp_url = "rtmp://..." でもよい。
+rtmp_urls = [
+  "rtmp://publisher.example.test:1935/live/uni",
+  "rtmp://publisher2.example.test:1935/live/uni",
+]
+
+[stream_credentials]
+# ImageFlux を fallback として登録する live2025-server のベース URL。
+# 視聴者と tomyou の双方から到達できる HTTPS のオリジン。
+# 空欄の場合は登録しない。ingest_token と両方指定する。
+# 例: https://live.example.test
+base_url = ""
+# live2025-server の STREAM_INGEST_TOKEN と同じ値
+ingest_token = ""
+
+[imageflux]
+# token もこのファイルへ保存される
+# fallback 登録を有効にすると、鍵 URI は
+# <stream_credentials.base_url>/key/<channel_id>?fallback=1 になる。
+event_webhook_url = ""
+
+# whip-script の example.toml と同じ HLS 設定
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 1920
+height = 1080
+fps = 60
+bps = 15000000
+
+[imageflux.hls.audio]
+bps = 320000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 1280
+height = 720
+fps = 60
+bps = 2500000
+
+[imageflux.hls.audio]
+bps = 128000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[[imageflux.hls]]
+duration-seconds = 1
+start-time-offset = -2
+
+[imageflux.hls.video]
+width = 854
+height = 480
+fps = 24
+bps = 950000
+
+[imageflux.hls.audio]
+bps = 96000
+
+[imageflux.hls.archive]
+archive_destination_id = ""
+
+[relay]
+bind = "127.0.0.1:1935"
+
+[gstreamer]
+# 空欄なら PATH、TOMYOU_GST_LAUNCH、標準的なインストール先から探す。
+# path = "/opt/homebrew/bin/gst-launch-1.0"
