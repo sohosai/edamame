@@ -80,10 +80,6 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL", value_parser = normalize_public_url)]
     pub public_url: String,
 
-    /// leader の優先度。大きい値を優先する
-    #[arg(long, env = "EDAMAME_METRIC", default_value_t = 100)]
-    pub metric: u32,
-
     /// 最初に接触する controller の URL。カンマ区切りと繰り返しを許可する
     #[arg(long, env = "EDAMAME_SEED", value_delimiter = ',', value_parser = normalize_public_url)]
     pub seed: Vec<String>,
@@ -221,7 +217,6 @@ mod tests {
             cors_origin: Vec::new(),
             external_min_percent: 1,
             public_url: "http://127.0.0.1:9000".to_owned(),
-            metric: 100,
             seed: Vec::new(),
             tls_cert: None,
             tls_key: None,
@@ -409,19 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn defaults_metric_to_100_and_accepts_explicit_boundaries() {
+    fn starts_without_seeds() {
         let config = ControllerConfig::try_parse_from(CLI_ARGS).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.metric, 100);
         assert!(config.seed.is_empty());
-        for metric in ["0", "4294967295"] {
-            let config = ControllerConfig::try_parse_from(
-                CLI_ARGS.iter().copied().chain(["--metric", metric]),
-            )
-            .unwrap();
-            config.validate().unwrap();
-            assert_eq!(config.metric, metric.parse::<u32>().unwrap());
-        }
     }
 
     #[test]
@@ -441,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_cluster_urls_and_metric() {
+    fn rejects_invalid_cluster_urls() {
         for option in ["--public-url", "--seed"] {
             for url in [
                 "/relative",
@@ -460,12 +446,6 @@ mod tests {
                 assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
             }
         }
-        assert!(
-            ControllerConfig::try_parse_from(
-                CLI_ARGS.iter().copied().chain(["--metric", "4294967296"])
-            )
-            .is_err()
-        );
         let mut args = CLI_ARGS.to_vec();
         let index = args.iter().position(|arg| *arg == "--public-url").unwrap();
         args[index + 1] = "https://A.test/base/";
@@ -494,9 +474,8 @@ mod tests {
                 ))
             })
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 17);
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
-        assert_eq!(names["metric"], "EDAMAME_METRIC");
         assert_eq!(names["seed"], "EDAMAME_SEED");
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["storage_capacity"], "EDAMAME_STORAGE_CAPACITY");

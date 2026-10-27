@@ -111,10 +111,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else if let Some(task) = cluster_task.take() {
                         task.abort();
                         let _ = task.await;
-                        // 到達できない leader を残さないよう、役割と状態を捨てる
-                        cluster.leave_cluster().await;
                         eprintln!(
-                            "controller left the cluster because the acme certificate is not valid"
+                            "controller stopped the cluster heartbeat because the acme certificate is not valid"
                         );
                     }
                     if valid_receiver.changed().await.is_err() {
@@ -143,12 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// 起動時の役割と公開 URL を出力する
+/// 起動時の公開 URL と既知の peer を出力する
 async fn log_startup(cluster: &ClusterState) {
     let health = cluster.health().await;
     println!(
-        "controller public_url={} metric={} role={:?}",
-        health.public_url, health.metric, health.role
+        "controller public_url={} peers={}",
+        health.public_url,
+        health.members.len()
     );
 }
 

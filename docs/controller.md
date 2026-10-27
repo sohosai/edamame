@@ -44,8 +44,8 @@ curl --fail --show-error http://127.0.0.1:9000/internal/cluster/health
 ```
 
 `/health` はステータス `200` と本文 `ok` を返す。
-役割の確認には `/internal/cluster/health` の `role` と `leader_url` を使う。
-起動直後は leader が未確定で、配信用の API が一時的に `503` を返すことがある。
+`/internal/cluster/health` は `public_url` と既知の member を返す。
+leader は存在しないため、役割や leader URL は返さない。
 worker と publisher を起動するまでは、応答できても映像を配信できる状態ではない。
 
 ## 設定
@@ -65,7 +65,6 @@ CLI と環境変数の両方に指定した場合は CLI を優先する。
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 必須 | PUT と heartbeat に使う共通 Bearer token。空白と制御文字を除く表示可能 ASCII。全 peer、worker、publisher に同じ値を指定する |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | GET の読み取りを許可する origin。`*`、`none`、またはカンマ区切りの一覧。`*` と `none` は他の値と混在不可。省略時はヘッダーを付けず警告を出す |
 | `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 登録された外部配信へ流す最低割合。0 以上 100 以下の整数、既定値 `1` |
-| `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下、既定値 `100`。大きい値を優先する |
 | `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の HTTP / HTTPS URL。カンマ区切りと繰り返しを許可し、重複と自分の URL は除く。省略時は自分 1 台で始める |
 | `--tls-cert` | `EDAMAME_TLS_CERT` | `--tls-key` 使用時は必須 | 証明書チェーンの PEM ファイル。`--acme` と排他 |
 | `--tls-key` | `EDAMAME_TLS_KEY` | `--tls-cert` 使用時は必須 | 秘密鍵の PEM ファイル。`--acme` と排他 |
@@ -86,7 +85,7 @@ controller 自身で終端する場合は、静的 PEM または ACME のどち�
 
 ### 静的 PEM
 
-証明書と対応する秘密鍵を読み込み、待ち受けに成功すると cluster へ参加する。
+証明書と対応する秘密鍵を読み込み、待ち受けに成功すると heartbeat を開始する。
 公開ルート CA での信頼性、公開 URL とのホスト名の一致、有効期限を参加条件として検査するわけではない。
 これらは peer、worker、client が接続できるように運用者が確認する。
 
@@ -139,14 +138,13 @@ cargo run --locked -p edamame-controller -- \
 
 ACME での動作と制約は次のとおりである。
 
-- 配信中の証明書をホスト名と公開ルート CA で検証できる間だけ cluster に参加する。
-  検証できない間は heartbeat を送らず、peer は最終成功から 3 秒以上経過するとこの機体を停止扱いにする。
-  離脱時に leader だった場合は、保持していたセグメントと採番を破棄する。
-  有効な証明書に戻ると再参加する
+- 配信中の証明書をホスト名と公開ルート CA で検証できる間だけ heartbeat を送る。
+  検証できない間は heartbeat を止め、peer は最終成功から 3 秒以上経過するとこの機体を停止扱いにする。
+  メモリ上のセグメントと採番は破棄しない。有効な証明書に戻ると heartbeat を再開する
 - 証明書取得に失敗しても再試行し、取得済みの証明書が有効なら使い続ける
 - EAB が必要な ACME サービスには対応していない
 - キャッシュには秘密鍵が含まれるためアクセスを制限し、Unix ではディレクトリの権限を `0700` に設定する
-- staging の証明書は公開ルート CA の検証を通らないため cluster に参加しない。
+- staging の証明書は公開ルート CA の検証を通らないため heartbeat を送らない。
   本番の証明書で動作を確認する
 
 ## 保存と採番
@@ -251,10 +249,10 @@ channel に外部のマスタープレイリスト URL を 1 つ登録すると�
 ## 再起動と失敗時の扱い
 
 セグメント、採番、channel / quality の属性、暗号化指定、worker の登録、外部配信の登録はメモリにだけ保持する。
-再起動または leader 交代が起きたときのそれぞれの動作は次のとおりである。
+controller の再起動や停止が起きたときのそれぞれの動作は次のとおりである。
 
 - controller：保持していた状態をすべて失い、採番も `0` から始まる
-- worker：sync の `404` で再登録して手元のキャッシュを捨て、新しいセグメントを取り直す
+- worker：接続先の controller を切り替える。sync の `404` では再登録してキャッシュを捨て、新しいセグメントを取り直す
 - publisher：外部配信を登録していた場合は、利用者が再登録する必要がある
 - client：番号のリセットに追従できないプレイヤーは、再生を開始し直す
 
@@ -263,6 +261,6 @@ publisher が止まると、猶予を過ぎた quality は停止中として `50
 停止中も保存済みのセグメントと worker のキャッシュは残るが、再開後に公開されるのは再開後の新しいセグメントだけであり、停止前のセグメントはプレイリストへ戻らない。
 新規映像の到着は [メトリクス](./observability.md) で監視する。
 
-controller は 1 台でも leader 選出を行い、seed を省略しても後から peer が参加できる。
+controller は leader を選ばず、seed を省略しても後から peer が参加できる。
 複数台での起動、DNS、交代時の状態消失、通信分断時の制約は [controller の冗長化](./cluster.md) を参照する。
 症状からの切り分けは [運用](./operations.md#障害を切り分ける) を参照する。

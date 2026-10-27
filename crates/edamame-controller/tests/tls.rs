@@ -50,7 +50,6 @@ async fn serves_health_over_static_tls() {
         auth_token: "example-token".to_owned(),
         cors_origin: vec![],
         public_url: "https://localhost".to_owned(),
-        metric: 100,
         seed: vec![],
         tls_cert: None,
         tls_key: None,

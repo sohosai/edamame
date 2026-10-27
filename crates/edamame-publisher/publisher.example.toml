@@ -9,7 +9,7 @@
 #   --stream-ingest-token <STREAM_INGEST_TOKEN>
 #   --key-file /var/lib/edamame-publisher/key.bin
 #
-# controller は metric が小さい順に使う。先頭が落ちたときは次の controller へ
+# publisher は全 controller に同じセグメントを並列に送る。metric は live2025-server の候補順に使う
 # 送信し、登録した live_url も fallback 候補として使われる。
 
 # 全 channel で共通のセグメント長。

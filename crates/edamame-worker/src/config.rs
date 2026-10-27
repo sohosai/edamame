@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token, validate_identifier};
+use edamame_domain::{
+    CorsOrigins, EdamameError, normalize_public_url, validate_auth_token, validate_identifier,
+};
 
 pub use edamame_tls::TlsMode;
 
@@ -24,9 +26,16 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL")]
     pub public_url: String,
 
-    /// controller の接続先。http または https の絶対 URL を指定する
-    #[arg(long, env = "EDAMAME_CONTROLLER_URL")]
-    pub controller_url: String,
+    /// controller の接続先。http または https の絶対 URL を指定する。
+    /// カンマ区切りと繰り返しを許可し、先頭から順に失敗時の切り替え先にする
+    #[arg(
+        long = "controller-url",
+        env = "EDAMAME_CONTROLLER_URL",
+        value_delimiter = ',',
+        required = true,
+        num_args = 1..
+    )]
+    pub controller_urls: Vec<String>,
 
     /// (channel_id, quality) ごとのキャッシュ上限
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
@@ -97,6 +106,14 @@ impl WorkerConfig {
                 "weight must be positive".to_owned(),
             ));
         }
+        if self.controller_urls.is_empty() {
+            return Err(EdamameError::BadRequest(
+                "at least one controller URL is required".to_owned(),
+            ));
+        }
+        for url in &self.controller_urls {
+            normalize_public_url(url)?;
+        }
         self.tls_mode()?;
         Ok(())
     }
@@ -133,7 +150,7 @@ mod tests {
             worker_id: "worker-a".to_owned(),
             bind: "127.0.0.1:9001".parse().unwrap(),
             public_url: "http://127.0.0.1:9001".to_owned(),
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controller_urls: vec!["http://127.0.0.1:9000".to_owned()],
             cache_limit: 12,
             tls_cert: None,
             tls_key: None,
@@ -232,7 +249,7 @@ mod tests {
         assert_eq!(names["worker_id"], "EDAMAME_WORKER_ID");
         assert_eq!(names["bind"], "EDAMAME_BIND");
         assert_eq!(names["public_url"], "EDAMAME_PUBLIC_URL");
-        assert_eq!(names["controller_url"], "EDAMAME_CONTROLLER_URL");
+        assert_eq!(names["controller_urls"], "EDAMAME_CONTROLLER_URL");
         assert_eq!(names["cache_limit"], "EDAMAME_CACHE_LIMIT");
         assert_eq!(names["tls_cert"], "EDAMAME_TLS_CERT");
         assert_eq!(names["tls_key"], "EDAMAME_TLS_KEY");

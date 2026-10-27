@@ -75,8 +75,9 @@ curl --fail --show-error http://127.0.0.1:9001/health
 cluster の処理は常に有効であり、seed を省略した場合は自分 1 台で始まる。
 
 複数台に増やすときは、参加する機体の `--seed` に起動済みの controller の URL を指定する。
-leader の優先度を変える場合は `--metric` を指定する。
-DNS の共有名から各機へ到達させる起動例は [controller の冗長化](./docs/cluster.md#起動と-dns-の設定)、交代による状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
+publisher は `[[controller]]` に全 controller を指定し、全台へ同じセグメントを送る。
+worker は `--controller-url` に接続先を優先順に複数指定できる。
+DNS の共有名から各機へ到達させる起動例は [controller の冗長化](./docs/cluster.md#起動と-dns-の設定)、状態消失と通信分断時の制約は [controller の冗長化](./docs/cluster.md) を参照する。
 
 ## publisher
 
@@ -181,7 +182,7 @@ cargo test --workspace
 
 ## 運用上の注意点と制約
 
-- **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。プロセスの再起動や leader の交代で、これらのデータは失われる。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
+- **インメモリ保持と再起動時の挙動** ：`controller` のセグメントファイル、メタデータ、採番状態と、`worker` のキャッシュは、すべてメモリ上にだけ保持される。controller の再起動で、その controller のデータは失われる。publisher は全 controller に同じセグメントを送るが、過去分の backfill はしない。`controller` を再起動するとセグメント番号は `0` から振り直され、`worker` は再登録した時点で手元のキャッシュを捨てて取り直す。
 - **容量上限と自動削除** ：`controller` は、メモリ上のセグメントの合計サイズが `--storage-capacity` を超えると、書き込んだ順に古いセグメントから削除する。プレイリストの公開範囲にあるセグメントまで削除されると、プレイリストの取得には `422 Unprocessable Entity` が返る。必要なメモリ容量は [運用](./docs/operations.md) の計算式で見積もり、余裕を持たせて設定する。
 - **画質間のセグメント識別子** ：複数の画質（`quality`）を配信する場合、同じ時間帯のセグメントには同じセグメント識別子（`identifier`）を付けて `PUT` する。`controller` は同じ識別子に対して同じセグメント番号（`sequence`）を割り当てる。
 - **publisher 停止時の公開停止** ：`publisher` が新しいセグメントを送らなくなって、最後の `PUT` から `duration_ms × --playlist-segments + --publish-wait-ms` を超えると、その `quality` のメディアプレイリストは `503 Service Unavailable` になり、マスタープレイリストから除外される。再開後は停止前のセグメントを公開せず、新しいセグメントだけを公開する。

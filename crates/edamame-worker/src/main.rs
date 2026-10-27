@@ -33,11 +33,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // client へは TLS 終端の reverse proxy 越しに配信することがあるため、https も許可する
     let public_url = normalize_public_url(&config.public_url)?;
     // controller も TLS を終端できるため、https を許可する
-    let controller_url = normalize_public_url(&config.controller_url)?;
+    let mut controller_urls = Vec::new();
+    for url in &config.controller_urls {
+        let url = normalize_public_url(url)?;
+        if !controller_urls.contains(&url) {
+            controller_urls.push(url);
+        }
+    }
     let cache = Cache::new(config.cache_limit)?;
     let state = WorkerState::new(
         config.worker_id.clone(),
-        controller_url,
+        controller_urls,
         public_url,
         config.weight,
         cache,

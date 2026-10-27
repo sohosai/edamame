@@ -7,7 +7,7 @@
 
 | 提供元 | メソッドとパス | 呼び出し元 | 認証 | 用途 |
 | --- | --- | --- | --- | --- |
-| controller | `GET /internal/cluster/health` | peer / 運用者 | なし | インスタンス自身の役割、metric、leader URL の取得 |
+| controller | `GET /internal/cluster/health` | peer / 運用者 | なし | インスタンス自身の公開 URL と既知の peer の取得 |
 | controller | `POST /internal/cluster/heartbeat` | peer | Bearer（必須） | 生存確認と既知 member の交換 |
 | controller | `PUT /segments/{channel_id}/{quality}/{identifier}` | publisher | Bearer（必須） | セグメント原本の登録と連番（`sequence`）の採番 |
 | controller | `PUT /channels/{channel_id}/external` | publisher | Bearer（必須） | 外部配信のマスタープレイリスト URL の登録と解除 |
@@ -45,7 +45,7 @@
 
 ### ステータスコードの判定順
 
-- leader での基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
+- controller での基本的な判定順は、認証チェック（`401`）、入力検証（`400`）、対象の存在確認（`404`）、および各エンドポイント固有の状態や容量の判定（`302`、`409`、`413`、`422`、`503`）とする
 - 予期しない内部エラーは `500 Internal Server Error` を返す
 
 ## ヘルスチェック
@@ -62,31 +62,30 @@ controller と worker は、ヘルスチェック用の `GET /health` を提供�
 
 ## controller の API
 
-### インスタンスの役割を取得する
+### インスタンスの peer を取得する
 
 ```http
 GET /internal/cluster/health
 ```
 
 認証なしで常に 200 と、そのインスタンス自身の状態を返す。
-leader に転送しない。
+ほかの controller へ転送しない。
 
 ```json
 {
-  "role": "follower",
   "public_url": "http://controller-b.test:9000",
-  "metric": 10,
-  "leader_url": "http://controller-a.test:9000"
+  "members": [
+    "http://controller-a.test:9000"
+  ]
 }
 ```
 
-`role` は `leader` または `follower` とする。
-cluster の起動直後は `follower` と `leader_url: null` を返す。
 `public_url` は必ず自分自身の公開 URL を文字列で返す。
-metric を省略した場合は `100` になる。
-200 はインスタンス自身が応答できることを示し、leader の確定や配信可能なプレイリストの存在を保証しない。
+`members` は heartbeat で知っている peer の公開 URL を返し、自分自身は含めない。
+leader、metric、役割は返さない。
+200 はインスタンス自身が応答できることを示し、ほかの controller の状態や配信可能なプレイリストの存在を保証しない。
 
-### peer と heartbeat を交換する
+### peer と worker registry を交換する
 
 ```http
 POST /internal/cluster/heartbeat
@@ -95,32 +94,43 @@ Content-Type: application/json
 ```
 
 全 peer に共通の `--auth-token` が必須になる。
-自分の public URL、metric、既知の member 一覧を送る。
-リクエストの `role` と `leader_url` は省略でき、省略した role は `follower` として扱う。
+自分の public URL、既知の member 一覧、保持している worker の状態を送る。
 送信例を示す。
 
 ```json
 {
   "public_url": "http://controller-b.test:9000",
-  "metric": 10,
-  "role": "follower",
-  "leader_url": "http://controller-a.test:9000",
   "members": [
     {
-      "public_url": "http://controller-a.test:9000",
-      "metric": 20,
-      "role": "leader"
+      "public_url": "http://controller-a.test:9000"
+    }
+  ],
+  "workers": [
+    {
+      "worker_id": "worker-a",
+      "public_url": "http://worker-a.test:9001",
+      "weight": 1,
+      "cached_segments": [
+        {
+          "channel_id": "live",
+          "quality": "720p",
+          "sequence": 10
+        }
+      ],
+      "fetching_segments": []
     }
   ]
 }
 ```
 
-受信側は 200 と自分の `public_url`、`metric`、`role`、`leader_url`、`members` を同じ形式で返す。
-member の role を省略した場合も `follower` として扱う。
+受信側は 200 と、自分の `public_url`、`members`、`workers` を同じ形式で返す。
 member 一覧には受信側が既知の peer を返し、自分自身は一覧に含めない。
 URL は HTTP または HTTPS の絶対 URL とし、query と fragment は許可しない。
+worker の `cached_segments` と `fetching_segments` は `(channel_id, quality, sequence)` の配列である。
 JSON body の上限は 4 MiB とする。
-生存確認と leader 判定の規則は [controller の冗長化](./cluster.md) に従う。
+
+受信側は worker registry を取り込み、最終同期時刻を heartbeat の受信時刻として記録する。
+worker が sync した controller だけが `fetch_segments` を返し、ほかの controller は cache 報告だけを使う。
 
 | status | 条件 |
 | --- | --- |
@@ -128,39 +138,21 @@ JSON body の上限は 4 MiB とする。
 | 401 | Authorization がない、または token が一致しない |
 | 400 | JSON または URL が不正、または body が上限を超えている |
 
-### follower の転送と leader 未確定時の応答
+member の発見と worker registry の共有の規則は [controller の冗長化](./cluster.md) に従う。
 
-`/health`、`/internal/cluster/health`、heartbeat を除き、follower の GET と sync の POST は `307 Temporary Redirect` を返す。
-Location は leader の public URL に元の API の path と query を連結する。
-HTTP と HTTPS の両方を許可する。
-public URL に接頭辞がある場合、API はその下に公開され、転送では leader の接頭辞に置き換わる。
+### すべての API を各 controller が処理する
 
-```http
-HTTP/1.1 307 Temporary Redirect
-Location: https://controller-a.test/base/segments/live/720p/0.ts?x=1
-Cache-Control: no-store
-```
+leader 選出と follower への転送は行わない。
+`/health`、`/internal/cluster/health`、heartbeat を除くすべての API は、リクエストを受け取った controller がローカルで処理する。
 
-GET の応答には `--cors-origin` の設定に応じた読み取り用 CORS ヘッダーを付ける。
-sync の redirect に CORS ヘッダーは付けない。
-client は 307 に追従し、sync では POST と JSON body を保持する。
+- PUT、worker の登録、外部配信の登録は、受け取った controller のメモリに保存する
+- GET と sync は、受け取った controller の状態を使う
+- worker の登録と cache 報告は、heartbeat でほかの controller に共有される
+- 307、leader 未確定の 503、PUT の中継は行わない
 
-認証付き PUT は follower 自身で認証した後、leader へ内部中継する。
-Authorization、Content-Type、body を保持し、leader の status、応答ヘッダー、body を返す。
-入力の検証と採番は leader が行い、follower は保存しない。
-
-leader URL が未確定の間は、各配信用 API に次の応答を返す。
-PUT の認証はこの判定より先に行う。
-PUT の中継失敗でも同じ 503 を返し、heartbeat の再確認を要求する。
-
-```http
-HTTP/1.1 503 Service Unavailable
-Retry-After: 1
-Cache-Control: no-store
-```
-
-leader の交代で状態は失われる。
-worker は sync の 404 で再登録し、client はプレイリストの 404 または 503 の後に取り直す。
+publisher は全 controller へ同じセグメントを送る。
+client は live2025-server が選んだ 1 台の controller を使い、失敗時だけ `candidate_live_urls` の次の候補へ fallback する。
+controller 間の client 負荷分散は行わない。
 
 ### セグメントファイルを登録する（publisher 用）
 

@@ -577,7 +577,8 @@ preset = "ultrafast"
     );
     let _sender = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
 
-    let dropped = publisher.wait_for_log("dropping expired segment", Duration::from_secs(30));
+    // fan-out の timeout で送信できなかったセグメントも、期限切れとして捨てる
+    let dropped = publisher.wait_for_log("abandoning segment", Duration::from_secs(30));
     assert!(
         dropped,
         "controller に届かないときに古いセグメントを捨てません: {}",
@@ -796,4 +797,64 @@ bandwidth = 12000000
 
     let status = publisher.stop();
     assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+/// 複数 controller を指定したとき、同じセグメントが全 controller に保存される
+#[test]
+fn fans_out_segments_to_all_controllers() {
+    let dir = TestDir::new("fanout");
+    let srt_port = free_port();
+    let first = Controller::start("test-token");
+    let second = Controller::start("test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+{}
+[[controller]]
+url = "{}"
+metric = 0
+
+[[controller]]
+url = "{}"
+metric = 1
+"#,
+            input_config("1A", srt_port, true),
+            first.base_url,
+            second.base_url
+        ),
+    );
+
+    let publisher = Publisher::start_with_config(&config, Some("test-token"), dir.path());
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let _sender = Sender::start(srt_port, "640x360", 30, 30, "aac", 60);
+
+    let stored = wait_for(
+        || first.sequences("1A", "main").len() >= 2 && second.sequences("1A", "main").len() >= 2,
+        Duration::from_secs(30),
+    );
+    assert!(
+        stored,
+        "両方の controller にセグメントが保存されません: {}",
+        publisher.log()
+    );
+    let log = publisher.log();
+    assert!(
+        log.contains(&format!("controller={}", first.base_url)),
+        "1 台目の controller への保存ログがありません: {log}"
+    );
+    assert!(
+        log.contains(&format!("controller={}", second.base_url)),
+        "2 台目の controller への保存ログがありません: {log}"
+    );
 }

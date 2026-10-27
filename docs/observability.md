@@ -66,7 +66,7 @@ Gauge は現在の状態、Counter はプロセス内の累計を表し、再起
 | `edamame.controller.errors` | Counter | なし | `operation` | `ingest` / `register` / `sync` / `external` の処理エラー数 |
 
 worker と channel の Gauge は、controller が現在保持する登録情報と配信情報について記録する。
-follower は配信用のリクエストを転送するため、leader と同じ worker / channel の Gauge があるとは限らない。
+各 controller は独立して状態を持つため、worker / channel の Gauge は controller ごとに異なる場合がある。
 公開遅延は実際の映像の撮影時刻やプレイヤーの再生位置を測った値ではない。
 まだ何も公開していない quality では、保持している先頭番号の 1 つ前を公開末尾として扱うが、番号が `0` の場合は `0` とする。
 
@@ -106,7 +106,7 @@ controller と worker は、HTTP リクエストを受け付けられる場合�
 `path_prefix` は `--public-url` のパスから決まり、待ち受けアドレスは `--bind` で指定する。
 controller または worker が TLS を終端する構成では、同じ TLS の待ち受けで取得する。
 `/health` は controller への登録、同期、証明書の信頼性、セグメントの配信可否を保証する readiness ではない。
-controller の役割と leader の確認には、別の `GET /internal/cluster/health` を使う（[HTTP API](./api.md)）。
+controller の peer と worker registry の確認には、別の `GET /internal/cluster/health` を使う（[HTTP API](./api.md)）。
 
 ## ローカルでメトリクスを確認する
 
