@@ -142,11 +142,14 @@ HLS 設定は `whip-script` の設定を取り込み、解像度、FPS、ビッ�
 30 秒以内に生成されない場合は「生成待ち」として表示する。
 停止時はチャンネル削除を試み、失敗した場合は次回起動時に残存チャンネルとして確認できるようにする。
 
-fallback 登録を有効にすると、ImageFlux の鍵 URI は `<stream_credentials.base_url>/key/<channel_id>?fallback=1` になる。
+fallback 登録を有効にすると、ImageFlux の鍵 URI は `<stream_credentials.base_url>/key/<channel_id>?metric=0` になる。
+旧来の `?fallback=1` も server 側の互換エイリアスとして受け付ける。
+この版の tomyou は `metric` に対応した live2025-server を前提にする。
+未対応の server では `metric` が無視され、通常用の鍵を返すため、server を先に更新する。
 ImageFlux はこの URI に `&kid=...` を追加してプレイリストへ出力する。
 `tomyou` はプレイリストの `#EXT-X-KEY` から `kid` を取り出し、`ImageFlux_20200707.GetEncryptKey` で 16 バイトの鍵を取得する。
 
-取得した鍵とプレイリスト URL は、`POST <stream_credentials.base_url>/internal/stream-credentials?fallback=1` に登録する。
+取得した鍵とプレイリスト URL は、`POST <stream_credentials.base_url>/internal/stream-credentials?metric=0` に登録する。
 `channel_id` は ImageFlux のチャンネル ID ではなく、`uni`、`1A`、`kaikan` のいずれかである。
 登録は配信開始後、プレイリストが生成されてから行う。
 鍵はメモリ上だけで扱い、設定ファイルやログには保存しない。
@@ -269,9 +272,9 @@ GStreamer は外部ランタイムとし、アプリには同梱しない。
 fallback 登録を使う場合は、上記に加えて次を確認する。
 
 1. GUI の fallback 登録が「登録済み」になる。
-2. ImageFlux のプレイリストの `#EXT-X-KEY` URI に `fallback=1` と `kid` が含まれる。
+2. ImageFlux のプレイリストの `#EXT-X-KEY` URI に `metric=0` と `kid` が含まれる。
 3. 通常用のプレイリストを取得できない状態で、`GET /channel/<channel>` の `live_url` が ImageFlux の URL になる。
-4. セッション Cookie 付きの `GET /key/<channel>?fallback=1` が、登録した鍵を返す。
+4. セッション Cookie 付きの `GET /key/<channel>?metric=0` が、登録した鍵を返す。
 
 入力チェックは、1920x1080/AAC のストリームで GUI が「OK」になり、解像度や音声形式が違う場合に赤くなることを確認する。
 `cargo test -p tomyou` では、ffmpeg が使える環境で 1920x1080/AAC の結合テストも実行する。
