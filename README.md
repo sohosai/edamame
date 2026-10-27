@@ -88,11 +88,14 @@ GPU と入力の設定が必要なため、既定の `compose.yaml` には含め
 ```bash
 cargo run --release -p edamame-publisher -- \
   --config crates/edamame-publisher/publisher.example.toml \
-  --controller-url http://127.0.0.1:9000 \
   --auth-token example-token
 ```
 
 設定ファイルの書き方、暗号化と鍵登録の仕組み、失敗時の扱いは [publisher](./docs/publisher.md) で説明する。
+例の `[[controller]]` の URL は実際の controller に置き換える。
+1 台だけ使う場合は `[[controller]]` を削除し、`--controller-url` を指定する。
+複数の controller へ送る場合は、設定ファイルの `[[controller]]` に `url` と `metric` を書く。
+`metric` が大きい controller を優先し、先頭が落ちたときは次の controller へ送信する。
 ローカルの MP4 ファイルを無限ループさせてテスト配信を行うスクリプトは [scripts/README.md](./scripts/README.md) で説明する。
 
 ## tomyou

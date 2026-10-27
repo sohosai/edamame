@@ -28,14 +28,27 @@ pub fn credentials_url(base_url: &str) -> String {
     format!("{base_url}/internal/stream-credentials")
 }
 
-/// 登録する JSON を組み立てる
+/// 登録する JSON を組み立てる。候補は 1 リクエストでまとめて送る。
 #[must_use]
-pub fn credentials_body(channel_id: &str, live_url: &str, encryption_key_hex: &str) -> String {
+pub fn credentials_body(
+    channel_id: &str,
+    encryption_key_hex: &str,
+    candidates: &[(u32, String)],
+) -> String {
+    let candidates: Vec<_> = candidates
+        .iter()
+        .map(|(metric, live_url)| {
+            json!({
+                "metric": metric,
+                "live_url": live_url,
+                "encryption_key": encryption_key_hex,
+            })
+        })
+        .collect();
     // 値のエスケープは serde_json に任せる
     json!({
         "channel_id": channel_id,
-        "live_url": live_url,
-        "encryption_key": encryption_key_hex,
+        "candidates": candidates,
     })
     .to_string()
 }
@@ -132,15 +145,33 @@ mod tests {
     fn builds_credentials_body() {
         let body = credentials_body(
             "uni",
-            "https://live.example.test/channels/uni/master.m3u8",
             "0123456789abcdef0123456789abcdef",
+            &[
+                (
+                    100,
+                    "https://live.example.test/channels/uni/master.m3u8".to_owned(),
+                ),
+                (
+                    50,
+                    "https://fallback.example.test/channels/uni/master.m3u8".to_owned(),
+                ),
+            ],
         );
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["channel_id"], "uni");
+        assert_eq!(parsed["candidates"][0]["metric"], 100);
         assert_eq!(
-            parsed["live_url"],
+            parsed["candidates"][0]["live_url"],
             "https://live.example.test/channels/uni/master.m3u8"
         );
-        assert_eq!(parsed["encryption_key"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(parsed["candidates"][1]["metric"], 50);
+        assert_eq!(
+            parsed["candidates"][1]["live_url"],
+            "https://fallback.example.test/channels/uni/master.m3u8"
+        );
+        assert_eq!(
+            parsed["candidates"][0]["encryption_key"],
+            "0123456789abcdef0123456789abcdef"
+        );
     }
 }

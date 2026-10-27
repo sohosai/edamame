@@ -8,6 +8,9 @@
 #   --stream-credentials-url https://live.example.test
 #   --stream-ingest-token <STREAM_INGEST_TOKEN>
 #   --key-file /var/lib/edamame-publisher/key.bin
+#
+# controller は metric が大きい順に使う。先頭が落ちたときは次の controller へ
+# 送信し、登録した live_url も fallback 候補として使われる。
 
 # 全 channel で共通のセグメント長。
 # PUT の duration_ms にもこの値を使う
@@ -24,12 +27,20 @@ backlog_limit = 6
 codec = "h264_nvenc"
 preset = "p5"
 
+[[controller]]
+url = "https://edamame-a.example.test"
+metric = 100
+
+[[controller]]
+url = "https://edamame-b.example.test"
+metric = 50
+
 [[input]]
 channel_id = "uni"
 input_url = "srt://0.0.0.0:9101?mode=listener&latency=200000"
-# controller の公開マスタープレイリストの URL。
-# 鍵と一緒に live2025-server へ登録する
-live_url = "https://live.example.test/channels/uni/master.m3u8"
+# 先頭 controller の公開マスタープレイリスト URL の上書き。
+# 未指定なら controller の URL から /channels/<channel>/master.m3u8 を導出する
+# live_url = "https://live.example.test/channels/uni/master.m3u8"
 # メディアプレイリストに出力する暗号鍵の URI。
 # client はこの URI から鍵を取得する
 key_uri = "https://live.example.test/key/uni"
@@ -56,7 +67,6 @@ video_bitrate = 1200000
 [[input]]
 channel_id = "1A"
 input_url = "rtmp://0.0.0.0:1935/live/1A"
-live_url = "https://live.example.test/channels/1A/master.m3u8"
 key_uri = "https://live.example.test/key/1A"
 
 [[input.rendition]]
@@ -80,7 +90,6 @@ video_bitrate = 1200000
 [[input]]
 channel_id = "kaikan"
 input_url = "rtmp://0.0.0.0:1936/live/kaikan"
-live_url = "https://live.example.test/channels/kaikan/master.m3u8"
 key_uri = "https://live.example.test/key/kaikan"
 
 [[input.rendition]]
