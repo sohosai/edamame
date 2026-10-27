@@ -27,7 +27,7 @@ flowchart LR
 
 - Rust 1.99.1（edition 2024）でビルドを確認済み。`tomyou` は Rust 1.93 以降を要求する
 - ネットワークの接続条件：
-  - `publisher` と `worker` から、`controller` の HTTP アドレスへ接続できること
+  - `publisher` と `worker` から、`controller` の HTTP または HTTPS アドレスへ接続できること
   - `client` から、`controller` のアドレス（プレイリスト取得用）へ接続できること
   - `client` から、`worker` の公開 URL（`--public-url`、セグメント取得用）へ接続できること
 - `edamame-publisher` を動かす場合は、SRT と RTMP に対応した `ffmpeg` と `ffprobe`、およびエンコーダに応じた GPU 環境：
@@ -184,5 +184,5 @@ cargo test --workspace
 - **publisher 停止時の公開停止** ：`publisher` が新しいセグメントを送らなくなって、最後の `PUT` から `duration_ms × --playlist-segments + --publish-wait-ms` を超えると、その `quality` のメディアプレイリストは `503 Service Unavailable` になり、マスタープレイリストから除外される。再開後は停止前のセグメントを公開せず、新しいセグメントだけを公開する。
 - **プレイリスト反映の遅延と独立性** ：セグメントを `PUT` してからプレイリストに反映されるまでには、`--publish-wait-ms` の待ち時間と、`worker` が `sync` でセグメントを取得する時間がかかる。公開範囲は `quality` ごとに独立して決まるため、`worker` の停止やセグメントの欠落が起きると、メディアプレイリストのセグメント番号（`#EXT-X-MEDIA-SEQUENCE`）は前に進むだけでなく、戻ったり飛んだりすることがある。
 - **キャッシュ上限の推奨値** ：`worker` の `--cache-limit` は、`controller` の `--playlist-segments` より 1 以上大きく設定することを推奨する。公開待ちの間も、直前の公開範囲と新しいセグメントの両方を同時にキャッシュへ残せるようにするためである。
-- **認証と通信保護** ：`--auth-token` による Bearer 認証は、セグメントの `PUT`、`worker` の登録、外部配信の登録と heartbeat に適用される。`GET` と `POST /workers/{worker_id}/sync` には認証がない。`controller` は HTTP のみで待ち受けるため、内部通信はプライベートネットワーク内にとどめ、外部へ公開する場合はリバースプロキシなどで TLS を終端する。なお、`worker` は単体での TLS 終端と ACME による証明書取得にも対応している。
+- **認証と通信保護** ：`--auth-token` による Bearer 認証は、セグメントの `PUT`、`worker` の登録、外部配信の登録と heartbeat に適用される。`GET` と `POST /workers/{worker_id}/sync` には認証がない。`controller` と `worker` は単体での TLS 終端と ACME による証明書取得に対応している。TLS を使わない場合は、内部通信をプライベートネットワーク内にとどめ、外部へ公開する場合はリバースプロキシなどで TLS を終端する。
 - **障害時の扱いと関連仕様** ：各コンポーネントが停止したときの動作は [運用](./docs/operations.md)、HTTP ステータスコードの詳細は [HTTP API](./docs/api.md)、プレイリストの出力形式は [HLS の出力](./docs/hls.md) で説明する。

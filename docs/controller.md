@@ -11,8 +11,9 @@ client が取得するセグメントの URL には worker の公開 URL を使�
 - `--public-url` が各 peer、worker、client から接続でき、このインスタンス固有の URL であること
 - セグメントの保持に必要なメモリを確保すること（[容量の見積もり](./operations.md#パラメータ設計とメモリ見積もり)）
 
-controller は HTTP で待ち受ける。
-`--public-url` を HTTPS にしても TLS は有効にならないため、HTTPS で公開する場合は TLS 終端を別途用意する。
+controller は HTTP または TLS で待ち受ける。
+TLS を使わない場合は、`--public-url` を HTTPS にしても TLS は有効にならないため、HTTPS で公開する場合は TLS 終端を別途用意する。
+controller 自身で終端する場合は、静的 PEM または ACME のどちらかを使う（[TLS 配信](#tls-配信)）。
 認証のない GET と sync もあるため、公開する範囲を決めてから起動する（[通信の保護](./operations.md#通信の保護と公開範囲)）。
 
 ## 最小起動
@@ -54,8 +55,8 @@ CLI と環境変数の両方に指定した場合は CLI を優先する。
 
 | オプション | 環境変数 | 必須条件 | 説明 |
 | --- | --- | --- | --- |
-| `--bind` | `EDAMAME_BIND` | 必須 | HTTP の待ち受けアドレス。接続先として公開する URL とは別に指定する |
-| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | インスタンス固有の HTTP / HTTPS 絶対 URL。query と fragment は不可。パス接頭辞は使える |
+| `--bind` | `EDAMAME_BIND` | 必須 | HTTP または TLS の待ち受けアドレス。接続先として公開する URL とは別に指定する |
+| `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | インスタンス固有の HTTP / HTTPS 絶対 URL。query と fragment は不可。パス接頭辞は使える。TLS / ACME 指定時は `https` が必須 |
 | `--storage-capacity` | `EDAMAME_STORAGE_CAPACITY` | 必須 | セグメント本体の合計容量。バイト数または `KiB` / `MiB` / `GiB` / `TiB` 付きで指定し、1 以上とする |
 | `--playlist-segments` | `EDAMAME_PLAYLIST_SEGMENTS` | 必須 | 全 channel 共通の公開セグメント数の上限。6 以上の整数 |
 | `--sync-interval-ms` | `EDAMAME_SYNC_INTERVAL_MS` | 必須 | worker に伝える同期間隔。ミリ秒、1 以上 |
@@ -66,10 +67,87 @@ CLI と環境変数の両方に指定した場合は CLI を優先する。
 | `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 登録された外部配信へ流す最低割合。0 以上 100 以下の整数、既定値 `1` |
 | `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下、既定値 `100`。大きい値を優先する |
 | `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の HTTP / HTTPS URL。カンマ区切りと繰り返しを許可し、重複と自分の URL は除く。省略時は自分 1 台で始める |
+| `--tls-cert` | `EDAMAME_TLS_CERT` | `--tls-key` 使用時は必須 | 証明書チェーンの PEM ファイル。`--acme` と排他 |
+| `--tls-key` | `EDAMAME_TLS_KEY` | `--tls-cert` 使用時は必須 | 秘密鍵の PEM ファイル。`--acme` と排他 |
+| `--acme` | `EDAMAME_ACME` | 任意 | ACME で証明書を取得する。環境変数は `true` / `false`。静的 PEM の指定と排他 |
+| `--acme-directory` | `EDAMAME_ACME_DIRECTORY` | 任意、指定時は `--acme` が必須 | ACME ディレクトリの HTTPS URL。fragment は不可。省略時は Let's Encrypt の本番環境 |
+| `--acme-cache-dir` | `EDAMAME_ACME_CACHE_DIR` | `--acme` 使用時は必須。指定時も `--acme` が必須 | アカウント鍵と証明書の保存先。書き込み可能な永続ディレクトリを指定する |
+| `--acme-contact` | `EDAMAME_ACME_CONTACT` | 任意、指定時は `--acme` が必須 | 連絡先メールアドレス。省略時は警告を出す |
 
 `--public-url` にパスを含めた場合は、health を含む API をその接頭辞の下で公開する。
 URL は `--bind` から自動生成しない。
 メトリクスの送信設定は [可観測性](./observability.md) を参照する。
+
+## TLS 配信
+
+TLS を前段のプロキシで終端する場合は controller を HTTP で動かし、`--public-url` に client 向けの HTTPS URL を指定する。
+controller 自身で終端する場合は、静的 PEM または ACME のどちらかを使う。
+両方式は同時に指定できず、公開 URL は HTTPS が必須になる。
+
+### 静的 PEM
+
+証明書と対応する秘密鍵を読み込み、待ち受けに成功すると cluster へ参加する。
+公開ルート CA での信頼性、公開 URL とのホスト名の一致、有効期限を参加条件として検査するわけではない。
+これらは peer、worker、client が接続できるように運用者が確認する。
+
+次の例では `controller.example.test` を実際の公開ホスト名に置き換え、そのホスト名を含む証明書チェーンと秘密鍵を指定のパスに用意する。
+実行ユーザーが PEM を読めること、peer、worker、client が対象ホストの TCP `9443` 番へ到達できることを前提とする。
+
+```bash
+cargo run --locked -p edamame-controller -- \
+  --bind 0.0.0.0:9443 \
+  --public-url https://controller.example.test:9443 \
+  --storage-capacity 512MiB \
+  --playlist-segments 6 \
+  --sync-interval-ms 1000 \
+  --sync-timeout-ms 10000 \
+  --publish-wait-ms 2000 \
+  --auth-token example-token \
+  --cors-origin none \
+  --tls-cert /etc/edamame/fullchain.pem \
+  --tls-key /etc/edamame/privkey.pem
+```
+
+証明書と鍵の更新時刻を 60 秒ごとに確認し、変更時に再起動なしで読み直す。
+読み直しに失敗した場合は古い設定を維持してログを出し、次の確認で再試行する。
+
+### ACME
+
+ACME は TLS-ALPN-01 で公開 URL のホスト名に対する証明書を取得し、更新する。
+公開 DNS に対象ホストを登録し、インターネットからの TCP `443` 番が controller の TLS 待ち受けへ届く必要がある。
+前段で TLS を終端するとチャレンジを受け取れないため、ポート転送では TLS と ALPN をそのまま通す。
+HTTP `80` 番は使わず、IP アドレスを証明書の対象には指定できない。
+
+次の例では、実際に管理する公開ホスト名と連絡先に置き換え、TCP `443` 番を controller の待ち受けへ転送する。
+実行ユーザーが書き込める `./acme-cache` を、再起動やコンテナ再作成で失わない場所に置く。
+
+```bash
+cargo run --locked -p edamame-controller -- \
+  --bind 0.0.0.0:443 \
+  --public-url https://controller.example.test \
+  --storage-capacity 512MiB \
+  --playlist-segments 6 \
+  --sync-interval-ms 1000 \
+  --sync-timeout-ms 10000 \
+  --publish-wait-ms 2000 \
+  --auth-token example-token \
+  --cors-origin none \
+  --acme \
+  --acme-cache-dir ./acme-cache \
+  --acme-contact operator@example.test
+```
+
+ACME での動作と制約は次のとおりである。
+
+- 配信中の証明書をホスト名と公開ルート CA で検証できる間だけ cluster に参加する。
+  検証できない間は heartbeat を送らず、peer は最終成功から 3 秒以上経過するとこの機体を停止扱いにする。
+  離脱時に leader だった場合は、保持していたセグメントと採番を破棄する。
+  有効な証明書に戻ると再参加する
+- 証明書取得に失敗しても再試行し、取得済みの証明書が有効なら使い続ける
+- EAB が必要な ACME サービスには対応していない
+- キャッシュには秘密鍵が含まれるためアクセスを制限し、Unix ではディレクトリの権限を `0700` に設定する
+- staging の証明書は公開ルート CA の検証を通らないため cluster に参加しない。
+  本番の証明書で動作を確認する
 
 ## 保存と採番
 

@@ -7,7 +7,7 @@ Edamame は、ライブ HLS 配信のセグメントをメモリに保持する�
 
 | 文書 | 内容 |
 | --- | --- |
-| [controller](./controller.md) | 起動と設定、保存と採番、公開範囲、worker 選択、外部配信 |
+| [controller](./controller.md) | 起動と設定、保存と採番、公開範囲、worker 選択、外部配信、TLS / ACME |
 | [worker](./worker.md) | 起動と設定、登録と同期、キャッシュ、再取得、TLS / ACME |
 | [publisher](./publisher.md) | ライブ入力、エンコード、暗号化、鍵登録、検証用 publisher |
 | [tomyou](./tomyou.md) | OBS の映像を Edamame と ImageFlux へ中継する GUI アプリ。入力チェックと fallback 登録 |
@@ -73,7 +73,6 @@ controller の保存容量は全セグメント本体の合計バイト数、wor
 - controller 間の状態複製と、leader 交代をまたぐ PUT の保持
 - worker の実負荷に合わせた配置や重みの自動調整
 - 全 quality の公開範囲の一致と、範囲切り替え時の連続再生
-- controller 自体の TLS 終端
 - アプリ自体の Prometheus 用 `/metrics`（OTLP/gRPC で送信する）
 
 再起動や交代で番号がリセットされ、worker の停止によって公開範囲が戻ったり飛んだりする場合がある。

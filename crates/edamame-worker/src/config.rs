@@ -6,24 +6,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token, validate_identifier};
 
-/// ACME ディレクトリの既定値（Let's Encrypt の本番環境）
-const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
-
-/// client への配信で使う TLS の設定
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TlsMode {
-    /// TLS を使わない
-    Plain,
-    /// PEM ファイルの証明書で TLS 配信する
-    Static { cert: PathBuf, key: PathBuf },
-    /// ACME で証明書を取得して TLS 配信する
-    Acme {
-        domain: String,
-        directory: String,
-        cache_dir: PathBuf,
-        contact: Option<String>,
-    },
-}
+pub use edamame_tls::TlsMode;
 
 /// `edamame-worker` の設定
 #[derive(Debug, Clone, Parser)]
@@ -33,7 +16,7 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_WORKER_ID")]
     pub worker_id: String,
 
-    /// HTTP server の待ち受けアドレス
+    /// HTTP または TLS サーバーの待ち受けアドレス
     #[arg(long, env = "EDAMAME_BIND")]
     pub bind: SocketAddr,
 
@@ -41,7 +24,7 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL")]
     pub public_url: String,
 
-    /// controller の接続先。http の絶対 URL のみ許可する
+    /// controller の接続先。http または https の絶対 URL を指定する
     #[arg(long, env = "EDAMAME_CONTROLLER_URL")]
     pub controller_url: String,
 
@@ -120,141 +103,21 @@ impl WorkerConfig {
 
     /// TLS の設定を解決する
     pub fn tls_mode(&self) -> Result<TlsMode, EdamameError> {
-        match (&self.tls_cert, &self.tls_key) {
-            (Some(cert), Some(key)) => {
-                if self.acme {
-                    return Err(EdamameError::BadRequest(
-                        "--acme cannot be combined with --tls-cert".to_owned(),
-                    ));
-                }
-                require_https_public_url(&self.public_url, "TLS")?;
-                Ok(TlsMode::Static {
-                    cert: cert.clone(),
-                    key: key.clone(),
-                })
-            }
-            (None, None) if self.acme => {
-                let cache_dir = self.acme_cache_dir.clone().ok_or_else(|| {
-                    EdamameError::BadRequest("--acme-cache-dir is required with --acme".to_owned())
-                })?;
-                let url = require_https_public_url(&self.public_url, "ACME")?;
-                let domain = validate_acme_domain(url.host_str().ok_or_else(|| {
-                    EdamameError::BadRequest("--public-url has no host".to_owned())
-                })?)?;
-                let directory = match &self.acme_directory {
-                    Some(directory) => validate_acme_directory(directory)?,
-                    None => DEFAULT_ACME_DIRECTORY.to_owned(),
-                };
-                let contact = self
-                    .acme_contact
-                    .as_deref()
-                    .map(validate_acme_contact)
-                    .transpose()?;
-                Ok(TlsMode::Acme {
-                    domain,
-                    directory,
-                    cache_dir,
-                    contact,
-                })
-            }
-            (None, None) => Ok(TlsMode::Plain),
-            _ => Err(EdamameError::BadRequest(
-                "--tls-cert and --tls-key must be specified together".to_owned(),
-            )),
-        }
+        edamame_tls::resolve_tls_mode(
+            &self.public_url,
+            self.tls_cert.as_deref(),
+            self.tls_key.as_deref(),
+            self.acme,
+            self.acme_directory.as_deref(),
+            self.acme_cache_dir.as_deref(),
+            self.acme_contact.as_deref(),
+        )
     }
 
     /// CORS の設定を検証して返す
     pub fn cors_origins(&self) -> Result<CorsOrigins, EdamameError> {
         CorsOrigins::parse(&self.cors_origin)
     }
-}
-
-/// TLS 配信で使うため、`--public-url` が https のときだけ URL を返す
-fn require_https_public_url(value: &str, purpose: &str) -> Result<url::Url, EdamameError> {
-    let url = url::Url::parse(value.trim())
-        .map_err(|error| EdamameError::BadRequest(format!("public_url is invalid: {error}")))?;
-    if url.scheme() != "https" {
-        return Err(EdamameError::BadRequest(format!(
-            "public_url must be https for {purpose}"
-        )));
-    }
-    Ok(url)
-}
-
-/// ACME で証明書を取得する DNS 名を検証する
-fn validate_acme_domain(value: &str) -> Result<String, EdamameError> {
-    let domain = value.trim();
-    if domain.is_empty() || domain.len() > 253 {
-        return Err(EdamameError::BadRequest(
-            "acme domain is invalid".to_owned(),
-        ));
-    }
-    if domain.parse::<std::net::IpAddr>().is_ok() {
-        return Err(EdamameError::BadRequest(
-            "acme domain must be a DNS name, not an IP address".to_owned(),
-        ));
-    }
-    if !domain.contains('.') {
-        return Err(EdamameError::BadRequest(
-            "acme domain must contain a dot".to_owned(),
-        ));
-    }
-    for label in domain.split('.') {
-        if label.is_empty() || label.len() > 63 {
-            return Err(EdamameError::BadRequest(
-                "acme domain is invalid".to_owned(),
-            ));
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(EdamameError::BadRequest(
-                "acme domain is invalid".to_owned(),
-            ));
-        }
-        if !label
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-        {
-            return Err(EdamameError::BadRequest(
-                "acme domain is invalid".to_owned(),
-            ));
-        }
-    }
-    Ok(domain.to_ascii_lowercase())
-}
-
-/// ACME ディレクトリが https の絶対 URL であることを検証する
-fn validate_acme_directory(value: &str) -> Result<String, EdamameError> {
-    let url = url::Url::parse(value.trim())
-        .map_err(|error| EdamameError::BadRequest(format!("acme directory is invalid: {error}")))?;
-    if url.scheme() != "https" || url.host_str().is_none() || url.fragment().is_some() {
-        return Err(EdamameError::BadRequest(
-            "acme directory must be an https URL without a fragment".to_owned(),
-        ));
-    }
-    Ok(url.to_string())
-}
-
-/// ACME の連絡先メールを検証する
-fn validate_acme_contact(value: &str) -> Result<String, EdamameError> {
-    let contact = value.trim();
-    let Some((local, domain)) = contact.split_once('@') else {
-        return Err(EdamameError::BadRequest(
-            "acme contact must be an email address".to_owned(),
-        ));
-    };
-    if local.is_empty()
-        || domain.is_empty()
-        || domain.contains('@')
-        || contact
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-    {
-        return Err(EdamameError::BadRequest(
-            "acme contact must be an email address".to_owned(),
-        ));
-    }
-    Ok(contact.to_owned())
 }
 
 #[cfg(test)]
@@ -301,118 +164,6 @@ mod tests {
         let mut config = config();
         config.weight = 0;
         assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn uses_plain_tls_by_default() {
-        assert_eq!(config().tls_mode().unwrap(), TlsMode::Plain);
-    }
-
-    #[test]
-    fn accepts_static_tls_with_https_public_url() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.tls_cert = Some(PathBuf::from("/certs/fullchain.pem"));
-        config.tls_key = Some(PathBuf::from("/certs/privkey.pem"));
-        assert_eq!(
-            config.tls_mode().unwrap(),
-            TlsMode::Static {
-                cert: PathBuf::from("/certs/fullchain.pem"),
-                key: PathBuf::from("/certs/privkey.pem"),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_static_tls_with_http_public_url() {
-        let mut config = config();
-        config.tls_cert = Some(PathBuf::from("/certs/fullchain.pem"));
-        config.tls_key = Some(PathBuf::from("/certs/privkey.pem"));
-        assert!(config.tls_mode().is_err());
-    }
-
-    #[test]
-    fn rejects_tls_cert_without_key() {
-        let mut config = config();
-        config.tls_cert = Some(PathBuf::from("/certs/fullchain.pem"));
-        assert!(config.tls_mode().is_err());
-    }
-
-    #[test]
-    fn rejects_acme_with_static_cert() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.tls_cert = Some(PathBuf::from("/certs/fullchain.pem"));
-        config.tls_key = Some(PathBuf::from("/certs/privkey.pem"));
-        config.acme = true;
-        assert!(config.tls_mode().is_err());
-    }
-
-    #[test]
-    fn uses_public_url_host_and_lets_encrypt_by_default() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.acme = true;
-        config.acme_cache_dir = Some(PathBuf::from("/acme"));
-        assert_eq!(
-            config.tls_mode().unwrap(),
-            TlsMode::Acme {
-                domain: "worker.test".to_owned(),
-                directory: "https://acme-v02.api.letsencrypt.org/directory".to_owned(),
-                cache_dir: PathBuf::from("/acme"),
-                contact: None,
-            }
-        );
-    }
-
-    #[test]
-    fn accepts_explicit_acme_directory() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.acme = true;
-        config.acme_cache_dir = Some(PathBuf::from("/acme"));
-        config.acme_directory =
-            Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_owned());
-        config.acme_contact = Some("ops@example.test".to_owned());
-        assert_eq!(
-            config.tls_mode().unwrap(),
-            TlsMode::Acme {
-                domain: "worker.test".to_owned(),
-                directory: "https://acme-staging-v02.api.letsencrypt.org/directory".to_owned(),
-                cache_dir: PathBuf::from("/acme"),
-                contact: Some("ops@example.test".to_owned()),
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_acme_without_cache_dir() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.acme = true;
-        assert!(config.tls_mode().is_err());
-    }
-
-    #[test]
-    fn rejects_acme_with_ip_domain() {
-        let mut config = config();
-        config.public_url = "https://127.0.0.1:9001".to_owned();
-        config.acme = true;
-        config.acme_cache_dir = Some(PathBuf::from("/acme"));
-        assert!(config.tls_mode().is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_acme_directory_and_contact() {
-        let mut config = config();
-        config.public_url = "https://worker.test".to_owned();
-        config.acme = true;
-        config.acme_cache_dir = Some(PathBuf::from("/acme"));
-        config.acme_directory = Some("ftp://worker.test/directory".to_owned());
-        assert!(config.tls_mode().is_err());
-        config.acme_directory = None;
-        config.acme_contact = Some("not-an-email".to_owned());
-        assert!(config.tls_mode().is_err());
     }
 
     #[test]

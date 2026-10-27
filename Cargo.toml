@@ -2,6 +2,7 @@
 members = [
   "crates/edamame-domain",
   "crates/edamame-telemetry",
+  "crates/edamame-tls",
   "crates/edamame-controller",
   "crates/edamame-worker",
   "crates/edamame-publisher",

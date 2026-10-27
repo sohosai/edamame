@@ -11,9 +11,10 @@ worker は controller からセグメントファイルを取得し、メモリ�
   `--bind` は待ち受けアドレスであり、公開 URL ではない
 - controller と同じ認証トークンを用意し、worker ごとに異なる `--worker-id` を指定すること
 
-初期接続先の `--controller-url` は `http` の絶対 URL に限る。
-一方、leader へのリダイレクトでは `https` にも追従できる。
-worker 自身の TLS 設定は client 向けの通信に適用され、controller への初期接続を HTTPS にするものではない。
+`--controller-url` には `http` または `https` の絶対 URL を指定できる。
+controller が TLS を終端する場合は `https` を使い、worker がその証明書を検証できる root CA を用意する。
+leader へのリダイレクトでも `https` に追従できる。
+worker 自身の TLS 設定は client 向けの通信に適用され、controller への接続には影響しない。
 controller との内部通信は信頼できるネットワーク内に置く。
 
 ## 最小の起動
@@ -49,7 +50,7 @@ controller より先に起動しても、登録に成功するまで再試行す
 | `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | なし | 登録する識別子。`[A-Za-z0-9_-]` の 1〜64 文字 |
 | `--bind` | `EDAMAME_BIND` | 必須 | なし | HTTP または TLS の待ち受け IP アドレスとポート |
 | `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | なし | client 向けの `http` / `https` 絶対 URL。TLS / ACME 指定時は `https` が必須 |
-| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | なし | worker から接続する `http` の絶対 URL |
+| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | なし | worker から接続する `http` / `https` の絶対 URL |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | なし | `(channel_id, quality)` ごとの保持件数。1 以上の整数で、実行環境の `usize` に収まる値 |
 | `--weight` | `EDAMAME_WEIGHT` | 任意 | `1` | 配信先に選ぶ回数の相対的な重み。1〜4294967295 の整数 |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | CLI では任意、controller への登録には必須 | なし | controller と同じ Bearer トークン。空白と制御文字を除く表示可能 ASCII。登録の PUT にだけ付ける |

@@ -242,6 +242,12 @@ async fn spawn_controller_with_options(
         metric: 100,
         auth_token: options.auth_token.to_owned(),
         seed: vec![],
+        tls_cert: None,
+        tls_key: None,
+        acme: false,
+        acme_directory: None,
+        acme_cache_dir: None,
+        acme_contact: None,
     };
     let cluster = ClusterState::new(&config, state.clone()).unwrap();
     let heartbeat_task = tokio::spawn(cluster.clone().run());

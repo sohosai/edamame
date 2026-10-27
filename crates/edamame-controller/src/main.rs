@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use edamame_controller::cluster::ClusterState;
-use edamame_controller::config::{ControllerConfig, DEFAULT_PUBLISH_WAIT_MS};
+use edamame_controller::config::{ControllerConfig, DEFAULT_PUBLISH_WAIT_MS, TlsMode};
 use edamame_controller::http::router;
 use edamame_controller::state::ControllerState;
 use edamame_controller::storage::CanonicalStore;
@@ -14,12 +14,18 @@ use edamame_domain::now_ms;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ControllerConfig::parse();
     config.validate()?;
+    let tls = config.tls_mode()?;
     if config.sync_timeout_ms < config.sync_interval_ms.saturating_mul(3) {
         eprintln!("warning: sync timeout is less than 3 times the sync interval");
     }
     if config.publish_wait_ms.is_none() {
         eprintln!(
             "warning: --publish-wait-ms is not specified; using {DEFAULT_PUBLISH_WAIT_MS} ms"
+        );
+    }
+    if let TlsMode::Acme { contact: None, .. } = &tls {
+        eprintln!(
+            "warning: --acme-contact is not specified; certificate problem notices cannot be sent"
         );
     }
     let cors = config.cors_origins()?;
@@ -45,21 +51,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = ClusterState::new(&config, state.clone())?;
     let app = router(Arc::clone(&state), &cors, cluster.clone());
     let metrics_task = telemetry.is_enabled().then(|| state.spawn_metrics_loop());
-    let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    println!("edamame-controller listening on {}", config.bind);
-    let health = cluster.health().await;
-    println!(
-        "controller public_url={} metric={} role={:?}",
-        health.public_url, health.metric, health.role
-    );
-    tokio::spawn(cluster.run());
-    // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
+    let bind = config.bind;
+
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        match tls {
+            TlsMode::Plain => {
+                let listener = tokio::net::TcpListener::bind(bind).await?;
+                println!("edamame-controller listening on {bind}");
+                log_startup(&cluster).await;
+                tokio::spawn(cluster.run());
+                // 外部配信への振り分けで接続元を使うため、接続情報を付けて配信する
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+            }
+            TlsMode::Static { cert, key } => {
+                let tls_config = edamame_tls::static_config(cert, key).await?;
+                let listener = edamame_tls::bind_listener(bind)?;
+                println!("edamame-controller listening on {bind}");
+                log_startup(&cluster).await;
+                tokio::spawn(cluster.run());
+                edamame_tls::serve_static_until(listener, app, tls_config, shutdown_signal())
+                    .await?;
+            }
+            TlsMode::Acme {
+                domain,
+                directory,
+                cache_dir,
+                contact,
+            } => {
+                let listener = edamame_tls::bind_listener(bind)?;
+                println!("edamame-controller listening on {bind}");
+                println!("waiting for acme certificate for {domain}");
+                let (valid_sender, mut valid_receiver) = tokio::sync::watch::channel(false);
+                let server = tokio::spawn(async move {
+                    edamame_tls::serve_acme_until(
+                        listener,
+                        app,
+                        &domain,
+                        &directory,
+                        cache_dir,
+                        contact.as_deref(),
+                        valid_sender,
+                        shutdown_signal(),
+                    )
+                    .await
+                });
+                // 証明書が無効な間は heartbeat を止め、peer に生存と誤認させない
+                let mut cluster_task: Option<tokio::task::JoinHandle<()>> = None;
+                loop {
+                    if *valid_receiver.borrow_and_update() {
+                        if cluster_task.is_none() {
+                            log_startup(&cluster).await;
+                            cluster_task = Some(tokio::spawn(cluster.clone().run()));
+                        }
+                    } else if let Some(task) = cluster_task.take() {
+                        task.abort();
+                        let _ = task.await;
+                        // 到達できない leader を残さないよう、役割と状態を捨てる
+                        cluster.leave_cluster().await;
+                        eprintln!(
+                            "controller left the cluster because the acme certificate is not valid"
+                        );
+                    }
+                    if valid_receiver.changed().await.is_err() {
+                        break;
+                    }
+                }
+                if let Some(task) = cluster_task {
+                    task.abort();
+                    let _ = task.await;
+                }
+                server.await??;
+            }
+        }
+        Ok(())
+    }
     .await;
+
     if let Some(task) = metrics_task {
         task.abort();
         let _ = task.await;
@@ -68,8 +140,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.record_metrics(now_ms()).await;
     }
     telemetry.shutdown();
-    serve_result?;
-    Ok(())
+    result
+}
+
+/// 起動時の役割と公開 URL を出力する
+async fn log_startup(cluster: &ClusterState) {
+    let health = cluster.health().await;
+    println!(
+        "controller public_url={} metric={} role={:?}",
+        health.public_url, health.metric, health.role
+    );
 }
 
 fn instance_id() -> String {

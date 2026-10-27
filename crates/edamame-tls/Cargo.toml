@@ -1,0 +1,25 @@
+[package]
+name = "edamame-tls"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+edamame-domain = { path = "../edamame-domain" }
+rustls.workspace = true
+rustls-acme.workspace = true
+# listen backlog を OS の既定 (128) より広げるために使う
+socket2 = { version = "0.6", features = ["all"] }
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+# 自己署名証明書を作り、HTTPS で取得するために使う
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+# ハンドシェイクのタイムアウトを時間を進めて確認するために使う
+tokio = { workspace = true, features = ["io-util", "test-util"] }

@@ -1,4 +1,4 @@
-//! worker の TLS 配信
+//! controller と worker の TLS 配信
 
 use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
@@ -12,15 +12,194 @@ use rustls::pki_types::pem::PemObject;
 use rustls_acme::AcmeConfig;
 use rustls_acme::caches::DirCache;
 use tokio_stream::StreamExt;
+use url::Url;
+
+/// ACME ディレクトリの既定値（Let's Encrypt の本番環境）
+pub const DEFAULT_ACME_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// 再開用に保持するセッションの数
 ///
-/// 視聴者ごとに接続が作られるため、既定の 256 では同時接続数を下回る。保持できなかった
+/// client ごとに接続が作られるため、既定の 256 では同時接続数を下回る。保持できなかった
 /// 接続は毎回ハンドシェイクの署名と鍵交換を行うことになる
 const SESSION_CACHE_SIZE: usize = 16384;
 
 /// 終了時に既存の接続を待つ時間
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// TLS の使い方
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsMode {
+    /// TLS を使わない
+    Plain,
+    /// PEM ファイルの証明書で TLS 配信する
+    Static { cert: PathBuf, key: PathBuf },
+    /// ACME で証明書を取得して TLS 配信する
+    Acme {
+        domain: String,
+        directory: String,
+        cache_dir: PathBuf,
+        contact: Option<String>,
+    },
+}
+
+/// 設定値から TLS の使い方を決める
+///
+/// 静的 PEM と ACME は同時に指定できない。どちらも `public_url` を https にする。
+pub fn resolve_tls_mode(
+    public_url: &str,
+    tls_cert: Option<&Path>,
+    tls_key: Option<&Path>,
+    acme: bool,
+    acme_directory: Option<&str>,
+    acme_cache_dir: Option<&Path>,
+    acme_contact: Option<&str>,
+) -> Result<TlsMode, EdamameError> {
+    match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            if acme {
+                return Err(EdamameError::BadRequest(
+                    "--acme cannot be combined with --tls-cert".to_owned(),
+                ));
+            }
+            require_https_public_url(public_url, "TLS")?;
+            Ok(TlsMode::Static {
+                cert: cert.to_path_buf(),
+                key: key.to_path_buf(),
+            })
+        }
+        (None, None) if acme => {
+            let cache_dir = acme_cache_dir
+                .ok_or_else(|| {
+                    EdamameError::BadRequest("--acme-cache-dir is required with --acme".to_owned())
+                })?
+                .to_path_buf();
+            let url = require_https_public_url(public_url, "ACME")?;
+            let domain =
+                validate_acme_domain(url.host_str().ok_or_else(|| {
+                    EdamameError::BadRequest("--public-url has no host".to_owned())
+                })?)?;
+            let directory = match acme_directory {
+                Some(directory) => validate_acme_directory(directory)?,
+                None => DEFAULT_ACME_DIRECTORY.to_owned(),
+            };
+            let contact = acme_contact.map(validate_acme_contact).transpose()?;
+            Ok(TlsMode::Acme {
+                domain,
+                directory,
+                cache_dir,
+                contact,
+            })
+        }
+        (None, None) => Ok(TlsMode::Plain),
+        _ => Err(EdamameError::BadRequest(
+            "--tls-cert and --tls-key must be specified together".to_owned(),
+        )),
+    }
+}
+
+/// TLS 配信で使うため、`public_url` が https のときだけ URL を返す
+fn require_https_public_url(value: &str, purpose: &str) -> Result<Url, EdamameError> {
+    let url = Url::parse(value.trim())
+        .map_err(|error| EdamameError::BadRequest(format!("public_url is invalid: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(EdamameError::BadRequest(format!(
+            "public_url must be https for {purpose}"
+        )));
+    }
+    Ok(url)
+}
+
+/// ACME で証明書を取得する DNS 名を検証する
+fn validate_acme_domain(value: &str) -> Result<String, EdamameError> {
+    let domain = value.trim();
+    if domain.is_empty() || domain.len() > 253 {
+        return Err(EdamameError::BadRequest(
+            "acme domain is invalid".to_owned(),
+        ));
+    }
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return Err(EdamameError::BadRequest(
+            "acme domain must be a DNS name, not an IP address".to_owned(),
+        ));
+    }
+    if !domain.contains('.') {
+        return Err(EdamameError::BadRequest(
+            "acme domain must contain a dot".to_owned(),
+        ));
+    }
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(EdamameError::BadRequest(
+                "acme domain is invalid".to_owned(),
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(EdamameError::BadRequest(
+                "acme domain is invalid".to_owned(),
+            ));
+        }
+        if !label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(EdamameError::BadRequest(
+                "acme domain is invalid".to_owned(),
+            ));
+        }
+    }
+    Ok(domain.to_ascii_lowercase())
+}
+
+/// ACME ディレクトリが https の絶対 URL であることを検証する
+fn validate_acme_directory(value: &str) -> Result<String, EdamameError> {
+    let url = Url::parse(value.trim())
+        .map_err(|error| EdamameError::BadRequest(format!("acme directory is invalid: {error}")))?;
+    if url.scheme() != "https" || url.host_str().is_none() || url.fragment().is_some() {
+        return Err(EdamameError::BadRequest(
+            "acme directory must be an https URL without a fragment".to_owned(),
+        ));
+    }
+    Ok(url.to_string())
+}
+
+/// ACME の連絡先メールを検証する
+fn validate_acme_contact(value: &str) -> Result<String, EdamameError> {
+    let contact = value.trim();
+    let Some((local, domain)) = contact.split_once('@') else {
+        return Err(EdamameError::BadRequest(
+            "acme contact must be an email address".to_owned(),
+        ));
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || domain.contains('@')
+        || contact
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(EdamameError::BadRequest(
+            "acme contact must be an email address".to_owned(),
+        ));
+    }
+    Ok(contact.to_owned())
+}
+
+/// 待ち受けを先に確保し、失敗を早く返す
+pub fn bind_listener(bind: SocketAddr) -> std::io::Result<TcpListener> {
+    // std の TcpListener::bind は backlog を 128 で固定する。接続が集中する時間帯に
+    // accept 待ちの接続が溢れないよう、backlog を広げる
+    let listener = socket2::Socket::new(
+        socket2::Domain::for_address(bind),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    listener.set_reuse_address(true)?;
+    listener.bind(&bind.into())?;
+    listener.listen(4096)?;
+    let listener: TcpListener = listener.into();
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
 
 /// TLS の暗号実装をプロセスに 1 度だけ登録する
 fn install_crypto_provider() {
@@ -125,7 +304,7 @@ where
     let server = axum_server::from_tcp_rustls(listener, config)
         .map_err(|error| EdamameError::Internal(format!("tls listener failed: {error}")))?
         .handle(handle.clone())
-        .serve(app.into_make_service());
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     tokio::pin!(server);
     let result = tokio::select! {
         result = &mut server => result,
@@ -203,7 +382,7 @@ where
         timeout: Duration::from_secs(10),
     };
     let probe_config = probe_client_config();
-    {
+    let event_task = {
         // 証明書が入れ替わったら、すぐに有効性を確かめて通知する
         let valid = valid.clone();
         let domain = domain.to_owned();
@@ -228,9 +407,9 @@ where
                 }
             }
             eprintln!("acme certificate management stopped");
-        });
-    }
-    {
+        })
+    };
+    let probe_task = {
         // 更新に失敗して期限切れになったら、配信先から外れるよう通知を続ける
         let domain = domain.to_owned();
         tokio::spawn(async move {
@@ -241,14 +420,14 @@ where
                 let valid_now = probe_certificate(&domain, addr, &probe_config).await;
                 let _ = valid.send(valid_now);
             }
-        });
-    }
+        })
+    };
     let handle = axum_server::Handle::new();
     let server = axum_server::from_tcp(listener)
         .map_err(|error| EdamameError::Internal(format!("tls listener failed: {error}")))?
         .handle(handle.clone())
         .acceptor(acceptor)
-        .serve(app.into_make_service());
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     tokio::pin!(server);
     let result = tokio::select! {
         result = &mut server => result,
@@ -257,6 +436,11 @@ where
             (&mut server).await
         }
     };
+    // 証明書の監視を止め、watch の送信側を確実に閉じる
+    event_task.abort();
+    probe_task.abort();
+    let _ = event_task.await;
+    let _ = probe_task.await;
     result.map_err(|error| EdamameError::Internal(format!("tls server failed: {error}")))
 }
 
@@ -401,15 +585,195 @@ async fn certificate_modified(cert: &Path, key: &Path) -> Option<(SystemTime, Sy
 mod tests {
     use super::*;
 
+    /// 値の検証と解決を確認する
+    fn plain() -> TlsMode {
+        resolve_tls_mode("http://127.0.0.1:9000", None, None, false, None, None, None).unwrap()
+    }
+
+    #[test]
+    fn uses_plain_tls_by_default() {
+        assert_eq!(plain(), TlsMode::Plain);
+    }
+
+    #[test]
+    fn accepts_static_tls_with_https_public_url() {
+        assert_eq!(
+            resolve_tls_mode(
+                "https://controller.test",
+                Some(Path::new("/certs/fullchain.pem")),
+                Some(Path::new("/certs/privkey.pem")),
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            TlsMode::Static {
+                cert: PathBuf::from("/certs/fullchain.pem"),
+                key: PathBuf::from("/certs/privkey.pem"),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_static_tls_with_http_public_url() {
+        assert!(
+            resolve_tls_mode(
+                "http://controller.test",
+                Some(Path::new("/certs/fullchain.pem")),
+                Some(Path::new("/certs/privkey.pem")),
+                false,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_tls_cert_without_key() {
+        assert!(
+            resolve_tls_mode(
+                "https://controller.test",
+                Some(Path::new("/certs/fullchain.pem")),
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_acme_with_static_cert() {
+        assert!(
+            resolve_tls_mode(
+                "https://controller.test",
+                Some(Path::new("/certs/fullchain.pem")),
+                Some(Path::new("/certs/privkey.pem")),
+                true,
+                None,
+                Some(Path::new("/acme")),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn uses_public_url_host_and_lets_encrypt_by_default() {
+        assert_eq!(
+            resolve_tls_mode(
+                "https://controller.test/base",
+                None,
+                None,
+                true,
+                None,
+                Some(Path::new("/acme")),
+                None,
+            )
+            .unwrap(),
+            TlsMode::Acme {
+                domain: "controller.test".to_owned(),
+                directory: DEFAULT_ACME_DIRECTORY.to_owned(),
+                cache_dir: PathBuf::from("/acme"),
+                contact: None,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_explicit_acme_directory_and_contact() {
+        assert_eq!(
+            resolve_tls_mode(
+                "https://controller.test",
+                None,
+                None,
+                true,
+                Some("https://acme-staging-v02.api.letsencrypt.org/directory"),
+                Some(Path::new("/acme")),
+                Some("ops@example.test"),
+            )
+            .unwrap(),
+            TlsMode::Acme {
+                domain: "controller.test".to_owned(),
+                directory: "https://acme-staging-v02.api.letsencrypt.org/directory".to_owned(),
+                cache_dir: PathBuf::from("/acme"),
+                contact: Some("ops@example.test".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_acme_without_cache_dir() {
+        assert!(
+            resolve_tls_mode(
+                "https://controller.test",
+                None,
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_acme_with_ip_domain() {
+        assert!(
+            resolve_tls_mode(
+                "https://127.0.0.1:9000",
+                None,
+                None,
+                true,
+                None,
+                Some(Path::new("/acme")),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_acme_directory_and_contact() {
+        assert!(
+            resolve_tls_mode(
+                "https://controller.test",
+                None,
+                None,
+                true,
+                Some("ftp://controller.test/directory"),
+                Some(Path::new("/acme")),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_tls_mode(
+                "https://controller.test",
+                None,
+                None,
+                true,
+                None,
+                Some(Path::new("/acme")),
+                Some("not-an-email"),
+            )
+            .is_err()
+        );
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "edamame-worker-tls-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("edamame-tls-{tag}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }

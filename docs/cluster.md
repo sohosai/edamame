@@ -120,8 +120,9 @@ leader で保存できた後に応答だけが失われた場合も、同じ識�
 
 worker と publisher は既定の redirect 追従を使う。
 worker は自身の配信に TLS を使わない場合でも、HTTPS への redirect を追従できる。
-controller の待ち受け自体は HTTP のままであり、`--public-url` を HTTPS にしても TLS 配信は有効にならない。
-HTTPS の URL を指定する場合は、その URL で TLS 接続を受け付けられる環境を用意する。
+controller も TLS を終端できる。`--tls-cert` / `--tls-key` か `--acme` を指定した場合、`--public-url` は HTTPS にする（[TLS 配信](./controller.md#tls-配信)）。
+TLS を使わない場合は、HTTPS の URL を指定しても TLS 接続は受け付けられないため、前段で終端する。
+TLS を使う場合、peer は `--public-url` へ HTTPS で heartbeat を送るため、各機が証明書を検証できる必要がある。
 
 ## 交代時の状態と復旧
 

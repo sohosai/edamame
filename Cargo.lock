@@ -1110,8 +1110,10 @@ dependencies = [
  "clap",
  "edamame-domain",
  "edamame-telemetry",
+ "edamame-tls",
  "edamame-worker",
  "opentelemetry",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
@@ -1160,29 +1162,44 @@ dependencies = [
 ]
 
 [[package]]
-name = "edamame-worker"
+name = "edamame-tls"
 version = "0.1.1"
 dependencies = [
  "axum",
  "axum-server",
- "bytes",
- "clap",
  "edamame-domain",
- "edamame-telemetry",
- "opentelemetry",
  "rcgen",
  "reqwest",
  "rustls",
  "rustls-acme",
- "serde",
- "serde_json",
  "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
- "tower-http",
  "url",
  "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "edamame-worker"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "edamame-domain",
+ "edamame-telemetry",
+ "edamame-tls",
+ "opentelemetry",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tower-http",
 ]
 
 [[package]]

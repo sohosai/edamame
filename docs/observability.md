@@ -104,7 +104,7 @@ controller と worker は、HTTP リクエストを受け付けられる場合�
 | worker（パス接頭辞あり） | `GET {path_prefix}/health` でも取得できる |
 
 `path_prefix` は `--public-url` のパスから決まり、待ち受けアドレスは `--bind` で指定する。
-worker が TLS を終端する構成では、同じ TLS の待ち受けで取得する。
+controller または worker が TLS を終端する構成では、同じ TLS の待ち受けで取得する。
 `/health` は controller への登録、同期、証明書の信頼性、セグメントの配信可否を保証する readiness ではない。
 controller の役割と leader の確認には、別の `GET /internal/cluster/health` を使う（[HTTP API](./api.md)）。
 
