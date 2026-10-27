@@ -16,6 +16,7 @@ use reqwest::blocking::Client;
 use crate::config::{PublisherSettings, RenditionMode, RenditionSettings};
 use crate::credentials;
 use crate::ffmpeg::{self, Ffmpeg, PLAYLIST_NAME};
+use crate::metrics::PublisherMetrics;
 
 /// 作業ディレクトリを走査する間隔
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -44,6 +45,7 @@ pub struct ChannelContext {
     pub input_index: usize,
     pub key: [u8; 16],
     pub work_dir: PathBuf,
+    pub(crate) metrics: Arc<PublisherMetrics>,
 }
 
 impl ChannelContext {
@@ -731,6 +733,11 @@ fn collect_segments(
             files,
             enqueued_at: Instant::now(),
         };
+        for file in &set.files {
+            context
+                .metrics
+                .record_encoded(context.channel_id(), &file.quality);
+        }
         // 送信側が処理し終えたことを数えられるよう、送る前に増やす
         pending.fetch_add(1, Ordering::Relaxed);
         if sender.send(set).is_err() {
@@ -967,6 +974,9 @@ fn run_publisher(
             pending.fetch_sub(1, Ordering::Relaxed);
         }
 
+        context
+            .metrics
+            .record_queue_depth(context.channel_id(), queue.len());
         let Some(set) = queue.pop_front() else {
             continue;
         };
@@ -1048,6 +1058,9 @@ fn publish_set(
             }
             match put_segment(client, context, rendition, &url, &iv_hex, encrypted.clone()) {
                 Ok(sequence) => {
+                    context
+                        .metrics
+                        .record_published(context.channel_id(), &file.quality);
                     println!(
                         "channel={} published index={} quality={} identifier={} sequence={sequence}",
                         context.channel_id(),
@@ -1058,6 +1071,11 @@ fn publish_set(
                     break;
                 }
                 Err(PutError::Retryable(message)) => {
+                    context.metrics.record_upload_error(
+                        context.channel_id(),
+                        &file.quality,
+                        "retryable",
+                    );
                     println!(
                         "channel={} retrying index={} quality={}: {message}",
                         context.channel_id(),
@@ -1067,6 +1085,11 @@ fn publish_set(
                     sleep_interruptible(PUT_RETRY_INTERVAL, stop, channel_stop);
                 }
                 Err(PutError::Fatal(message)) => {
+                    context.metrics.record_upload_error(
+                        context.channel_id(),
+                        &file.quality,
+                        "fatal",
+                    );
                     return Err(PublishError::Fatal(format!(
                         "failed to publish index={} quality={}: {message}",
                         set.index, file.quality
@@ -1255,6 +1278,7 @@ mod tests {
             settings: Arc::new(settings),
             key: [0u8; 16],
             work_dir: PathBuf::from("/tmp"),
+            metrics: Arc::new(PublisherMetrics::new()),
         };
         let iv = "0000000000000000000000000000000a";
         let query = segment_query(&context, &rendition("1080p"), iv);
@@ -1272,6 +1296,7 @@ mod tests {
             settings: Arc::new(settings()),
             key: [0u8; 16],
             work_dir: PathBuf::from("/tmp"),
+            metrics: Arc::new(PublisherMetrics::new()),
         };
         let query = segment_query(
             &context,
@@ -1332,6 +1357,7 @@ mod tests {
             }),
             key: [0u8; 16],
             work_dir: PathBuf::from("/tmp"),
+            metrics: Arc::new(PublisherMetrics::new()),
         };
         let mut run = RunState::new(PathBuf::from("/tmp/run-1"));
         run.files

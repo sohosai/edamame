@@ -1,7 +1,8 @@
 # 可観測性
 
-controller と worker は、OpenTelemetry のメトリクスを OTLP/gRPC で送信し、HTTP の `/health` でヘルスチェックに応答する。
-publisher のメトリクス送信とトレースの出力には対応していない。
+controller / worker / publisher は、OpenTelemetry のメトリクスを OTLP/gRPC で送信する。
+controller と worker は、HTTP の `/health` でヘルスチェックに応答する。
+publisher のトレース出力には対応していない。
 ダッシュボード、アラートの閾値、通知先は利用する監視基盤で設定する。
 
 ## メトリクスの送信
@@ -12,7 +13,7 @@ publisher のメトリクス送信とトレースの出力には対応してい�
 - 送信方式は OTLP/gRPC とし、OTLP/HTTP には切り替わらない
 - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` を優先し、未設定の場合だけ `OTEL_EXPORTER_OTLP_ENDPOINT` を使う
 - 選ばれた送信先が空の場合、または `OTEL_SDK_DISABLED=true` の場合は送信しない
-- 初期化に失敗しても controller と worker の動作は継続し、標準エラーへ警告を出す
+- 初期化に失敗しても controller / worker / publisher の動作は継続し、標準エラーへ警告を出す
 - アプリ終了時は未送信のメトリクスの送信を試みてから終了する
 
 ### 環境変数
@@ -23,8 +24,8 @@ publisher のメトリクス送信とトレースの出力には対応してい�
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics 専用の送信先。空文字を指定すると、共通の送信先が設定されていても送信しない |
 | `OTEL_SDK_DISABLED` | 前後の空白を除き、大文字小文字を区別せず `true` の場合に送信を無効にする |
 | `OTEL_METRIC_EXPORT_INTERVAL` | 送信間隔をミリ秒で指定する。既定は `10000`。未設定、整数でない値、`100` 未満の値は既定値を使う |
-| `OTEL_SERVICE_NAME` | `service.name` を上書きする。未設定または空の場合は `edamame-controller` / `edamame-worker` を使う |
-| `EDAMAME_INSTANCE_ID` | controller の `service.instance.id` を指定する。worker では使わない |
+| `OTEL_SERVICE_NAME` | `service.name` を上書きする。未設定または空の場合は `edamame-controller` / `edamame-worker` / `edamame-publisher` を使う |
+| `EDAMAME_INSTANCE_ID` | controller と publisher の `service.instance.id` を指定する。worker では使わない |
 | `OTEL_EXPORTER_OTLP_HEADERS` | 送信時のヘッダーを `key=value` のカンマ区切りで指定する |
 | `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | metrics 専用のヘッダー。指定時は `OTEL_EXPORTER_OTLP_HEADERS` より優先される |
 
@@ -36,12 +37,13 @@ scheme がない場合は `http://` を補う。
 
 | 属性 | 値 |
 | --- | --- |
-| `service.name` | `edamame-controller` または `edamame-worker`。`OTEL_SERVICE_NAME` で上書きできる |
-| `service.instance.id` | controller は下記の環境変数、worker は `--worker-id` の値 |
+| `service.name` | `edamame-controller`、`edamame-worker`、`edamame-publisher` のいずれか。`OTEL_SERVICE_NAME` で上書きできる |
+| `service.instance.id` | controller と publisher は下記の環境変数、worker は `--worker-id` の値 |
 | `service.version` | アプリのパッケージバージョン |
 
 controller の instance ID は、最初に設定されている `EDAMAME_INSTANCE_ID`、`HOSTNAME`、`COMPUTERNAME` の値から決める。
 選ばれた値が空白だけの場合や、すべて未設定の場合は `controller` を使う。
+publisher も同じ環境変数を使い、値がない場合は `publisher-<pid>` を使う。
 複数の controller を監視する場合は、各機で異なる `EDAMAME_INSTANCE_ID` を指定する。
 `env` などの環境識別用ラベルはアプリから送らない。
 
@@ -49,7 +51,8 @@ controller の instance ID は、最初に設定されている `EDAMAME_INSTANC
 
 表の名前は OpenTelemetry で送信する名前である。
 Gauge は現在の状態、Counter はプロセス内の累計を表し、再起動するとリセットされる。
-状態を表す Gauge は 5 秒ごとに記録し、送信は `OTEL_METRIC_EXPORT_INTERVAL` の間隔で行う。
+controller と worker の状態を表す Gauge は 5 秒ごとに記録し、送信は `OTEL_METRIC_EXPORT_INTERVAL` の間隔で行う。
+publisher の `up` は起動時と終了時に、`queue.depth` は publisher のループごとに記録する。
 
 ### controller
 
@@ -85,10 +88,25 @@ follower は配信用のリクエストを転送するため、leader と同じ 
 cache の Gauge は、キャッシュ内にセグメントがある channel / quality について記録する。
 まだ処理が発生していない Counter や、対象が存在しない Gauge は、値が `0` の系列として取得できるとは限らない。
 
+### publisher
+
+| メトリクス | 種類 | 単位 | ラベル | 説明 |
+| --- | --- | --- | --- | --- |
+| `edamame.publisher.up` | Gauge | なし | なし | 起動時に `1`、正常終了時に `0` を記録する |
+| `edamame.publisher.segments.encoded` | Counter | なし | `channel_id`, `quality` | encoder が publisher 側へ渡したセグメント数 |
+| `edamame.publisher.segments.published` | Counter | なし | `channel_id`, `quality` | controller への upload に成功したセグメント数 |
+| `edamame.publisher.upload.errors` | Counter | なし | `channel_id`, `quality`, `kind` | upload のエラー数。`kind` は `retryable` / `fatal` |
+| `edamame.publisher.queue.depth` | Gauge | なし | `channel_id` | publish 待ち queue に残っているセグメントセット数 |
+
+publisher の Counter は、セグメントの生成や upload が発生するまで系列が出ない場合がある。
+`queue.depth` は publisher のループが動いている間だけ記録する。
+encoder が起動直後に停止した場合など、queue の計測まで到達しないことがある。
+
 ### 監視するときの制約
 
-`up` は稼働中に `1` を記録するが、停止時に `0` を送るものではない。
-Collector や監視基盤に最後の値が残ることがあるため、直近のサンプル時刻や `/health` へ接続できるかも確認する。
+controller と worker の `up` は稼働中に `1` を記録するが、停止時に `0` を送るものではない。
+publisher の `up` は正常終了時に `0` を記録するが、強制終了などでは最後の値が残る。
+Collector や監視基盤に最後の値が残ることがあるため、直近のサンプル時刻やプロセスの状態も確認する。
 同期遅延と配信停止は、`last_sync_age`、`last_success_age`、`last_ingest_age`、`published_lag` を使って判断する。
 
 ## ヘルスチェック用の HTTP API
