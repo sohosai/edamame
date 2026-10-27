@@ -38,7 +38,7 @@ async fn serves_segments_over_static_tls() {
         .unwrap();
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         "https://localhost".to_owned(),
         1,
         cache,
@@ -91,7 +91,7 @@ async fn static_server_stops_when_shutdown_fires() {
 
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         "https://localhost".to_owned(),
         1,
         Cache::new(12).unwrap(),
@@ -137,7 +137,7 @@ async fn resumes_previous_session() {
         .unwrap();
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         "https://localhost".to_owned(),
         1,
         cache,
