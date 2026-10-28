@@ -2,7 +2,9 @@
 # 3 系統の入力それぞれについて、1080p はそのままコピーし、720p と 480p はエンコーダで作り直す。
 #
 # 入力は SRT と RTMP のどちらも使える。SRT は URL の mode で待ち受け、RTMP は publisher が待ち受ける。
-# RTMP では URL の app と stream が送信側と一致していなければ接続できない。
+# RTMP で input_url を rtmp://<host> だけにすると、チャンネルごとの既定ポートと
+# /live/<channel_id> を補う。既定ポート: uni = 1935、1A = 1936、kaikan = 1937。
+# ポートを明示した場合はその値を使う。
 #
 # 鍵と配信 URL の登録先、登録用トークン、鍵の保存先は CLI で指定する。
 #   --stream-credentials-url https://live.example.test
@@ -66,7 +68,7 @@ video_bitrate = 1200000
 
 [[input]]
 channel_id = "1A"
-input_url = "rtmp://0.0.0.0:1935/live/1A"
+input_url = "rtmp://0.0.0.0"
 key_uri = "https://live.example.test/key/1A"
 
 [[input.rendition]]
@@ -89,7 +91,7 @@ video_bitrate = 1200000
 
 [[input]]
 channel_id = "kaikan"
-input_url = "rtmp://0.0.0.0:1936/live/kaikan"
+input_url = "rtmp://0.0.0.0"
 key_uri = "https://live.example.test/key/kaikan"
 
 [[input.rendition]]

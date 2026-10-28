@@ -354,11 +354,6 @@ pub fn imageflux_spec(input: &str, endpoint: &str, decoder: AudioDecoder) -> Out
     )
 }
 
-/// RTMP 入力 URL を作る
-pub fn rtmp_input(bind: &str, channel_id: &str) -> String {
-    format!("rtmp://{bind}/live/{channel_id}")
-}
-
 fn choose_audio_decoder(has_avdec: bool, has_faad: bool) -> Option<AudioDecoder> {
     if has_avdec {
         Some(AudioDecoder::AvdecAac)

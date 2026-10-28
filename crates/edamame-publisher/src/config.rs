@@ -120,6 +120,75 @@ pub struct InputSettings {
     pub renditions: Vec<RenditionSettings>,
 }
 
+impl InputSettings {
+    /// RTMP の入力 URL にチャンネル別のポートと /live/<channel_id> を補う
+    fn normalize_input_url(&mut self) -> Result<(), String> {
+        let text = self.input_url.trim();
+        if !text.starts_with("rtmp://") {
+            // SRT は URL に待ち受け方法が含まれるため、そのまま使う
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(text).map_err(|error| {
+            format!("invalid input_url for channel {}: {error}", self.channel_id)
+        })?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "input_url must not contain credentials: channel {}",
+                self.channel_id
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "input_url must not contain a query or fragment: channel {}",
+                self.channel_id
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| format!("input_url must contain a host: channel {}", self.channel_id))?;
+        let port = match url.port() {
+            Some(0) => {
+                return Err(format!(
+                    "input_url port must be 1 or greater: channel {}",
+                    self.channel_id
+                ));
+            }
+            Some(port) => port,
+            None => channel_port(&self.channel_id).ok_or_else(|| {
+                format!(
+                    "channel {} has no default RTMP port; specify host:port in input_url",
+                    self.channel_id
+                )
+            })?,
+        };
+        let expected_path = format!("/live/{}", self.channel_id);
+        let path = match url.path() {
+            "" | "/" => expected_path,
+            path if path == expected_path || path == format!("{expected_path}/") => expected_path,
+            _ => {
+                return Err(format!(
+                    "input_url path must be {expected_path} or omitted: channel {}",
+                    self.channel_id
+                ));
+            }
+        };
+        self.input_url = format!("rtmp://{host}:{port}{path}");
+        Ok(())
+    }
+}
+
+/// チャンネルごとの publisher 側 RTMP ポート
+///
+/// docs/tomyou.md の表と一致させる。
+fn channel_port(channel_id: &str) -> Option<u16> {
+    match channel_id {
+        "uni" => Some(1935),
+        "1A" => Some(1936),
+        "kaikan" => Some(1937),
+        _ => None,
+    }
+}
+
 /// 1 つの quality の作り方
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -226,6 +295,10 @@ impl PublisherSettings {
         });
         validate_auth_token(cli.auth_token.as_deref())?;
         validate_auth_token(cli.stream_ingest_token.as_deref())?;
+        let mut inputs = file.inputs;
+        for input in &mut inputs {
+            input.normalize_input_url()?;
+        }
         let settings = Self {
             segment_duration_ms: file.segment_duration_ms,
             backlog_limit: file.backlog_limit,
@@ -239,7 +312,7 @@ impl PublisherSettings {
                 .map(|url| normalize_base_url("stream_credentials_url", url))
                 .transpose()?,
             stream_ingest_token: cli.stream_ingest_token.clone(),
-            inputs: file.inputs,
+            inputs,
         };
         settings.validate()?;
         Ok(settings)
@@ -559,8 +632,158 @@ mod tests {
     #[test]
     fn accepts_rtmp_input_url() {
         let mut target = settings();
-        target.inputs[0].input_url = "rtmp://0.0.0.0:1935/live/1A".to_owned();
+        target.inputs[0].input_url = "rtmp://0.0.0.0:1936/live/1A".to_owned();
         target.validate().unwrap();
+    }
+
+    /// 入力 URL を正規化した結果を返す
+    fn normalized_input(channel_id: &str, input_url: &str) -> Result<String, String> {
+        let mut input = settings().inputs[0].clone();
+        input.channel_id = channel_id.to_owned();
+        input.input_url = input_url.to_owned();
+        input.normalize_input_url()?;
+        Ok(input.input_url)
+    }
+
+    #[test]
+    fn channel_ports_follow_the_deployment_table() {
+        assert_eq!(channel_port("uni"), Some(1935));
+        assert_eq!(channel_port("1A"), Some(1936));
+        assert_eq!(channel_port("kaikan"), Some(1937));
+        assert_eq!(channel_port("1B"), None);
+    }
+
+    #[test]
+    fn parses_and_normalizes_the_example_config() {
+        let file: FileSettings =
+            toml::from_str(include_str!("../publisher.example.toml")).expect("設定例を読める");
+        let mut inputs = file.inputs;
+        for input in &mut inputs {
+            input
+                .normalize_input_url()
+                .expect("設定例の入力 URL を補完できる");
+        }
+        let input_1a = inputs
+            .iter()
+            .find(|input| input.channel_id == "1A")
+            .expect("1A の設定がある");
+        assert_eq!(input_1a.input_url, "rtmp://0.0.0.0:1936/live/1A");
+    }
+
+    #[test]
+    fn fills_rtmp_port_and_path_for_a_known_channel() {
+        assert_eq!(
+            normalized_input("1A", "rtmp://0.0.0.0").expect("ポートを補完できる"),
+            "rtmp://0.0.0.0:1936/live/1A"
+        );
+        assert_eq!(
+            normalized_input("uni", "rtmp://0.0.0.0/").expect("ポートを補完できる"),
+            "rtmp://0.0.0.0:1935/live/uni"
+        );
+    }
+
+    #[test]
+    fn fills_rtmp_port_for_an_ipv6_host() {
+        assert_eq!(
+            normalized_input("1A", "rtmp://[::1]").expect("IPv6 のホストを使える"),
+            "rtmp://[::1]:1936/live/1A"
+        );
+    }
+
+    #[test]
+    fn load_fills_the_default_rtmp_port() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("現在時刻を取得できる")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "edamame-publisher-{}-{suffix}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+segment_duration_ms = 6000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1A"
+input_url = "rtmp://127.0.0.1"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 1000000
+"#,
+        )
+        .expect("設定を書ける");
+        let cli = Cli {
+            config: path.clone(),
+            controller_url: "http://127.0.0.1:9000".to_owned(),
+            auth_token: None,
+            work_dir: None,
+            key_file: None,
+            stream_credentials_url: None,
+            stream_ingest_token: None,
+        };
+        let settings = PublisherSettings::load(&cli).expect("設定を読み込める");
+        assert_eq!(
+            settings.inputs[0].input_url,
+            "rtmp://127.0.0.1:1936/live/1A"
+        );
+        fs::remove_file(&path).expect("設定を消せる");
+    }
+
+    #[test]
+    fn explicit_rtmp_port_overrides_the_channel_port() {
+        assert_eq!(
+            normalized_input("1A", "rtmp://0.0.0.0:4001").expect("明示ポートを使える"),
+            "rtmp://0.0.0.0:4001/live/1A"
+        );
+    }
+
+    #[test]
+    fn keeps_a_matching_rtmp_path() {
+        assert_eq!(
+            normalized_input("1B", "rtmp://0.0.0.0:4001/live/1B").expect("一致するパスを使える"),
+            "rtmp://0.0.0.0:4001/live/1B"
+        );
+        assert_eq!(
+            normalized_input("1B", "rtmp://0.0.0.0:4001/live/1B/").expect("末尾スラッシュを使える"),
+            "rtmp://0.0.0.0:4001/live/1B"
+        );
+    }
+
+    #[test]
+    fn rejects_rtmp_path_for_another_channel() {
+        assert!(normalized_input("1A", "rtmp://0.0.0.0:4001/live/1B").is_err());
+    }
+
+    #[test]
+    fn rejects_rtmp_without_a_port_for_an_unknown_channel() {
+        assert!(normalized_input("1B", "rtmp://0.0.0.0").is_err());
+    }
+
+    #[test]
+    fn rejects_rtmp_with_invalid_port_or_credentials() {
+        assert!(normalized_input("1A", "rtmp://0.0.0.0:0").is_err());
+        assert!(normalized_input("1A", "rtmp://user:pass@0.0.0.0:4001").is_err());
+        assert!(normalized_input("1A", "rtmp://0.0.0.0:4001?x=1").is_err());
+        assert!(normalized_input("1A", "rtmp://0.0.0.0:4001#fragment").is_err());
+    }
+
+    #[test]
+    fn leaves_srt_input_url_unchanged() {
+        assert_eq!(
+            normalized_input("1A", "srt://0.0.0.0:9101?mode=listener")
+                .expect("SRT はそのまま使える"),
+            "srt://0.0.0.0:9101?mode=listener"
+        );
     }
 
     #[test]

@@ -78,6 +78,8 @@ ImageFlux は既定で metric 100000 とし、Edamame の controller (0, 1, ...)
 `[stream_credentials]` が空の場合は登録せず、ImageFlux の HLS は暗号化しない。
 
 設定例は [`config.example.toml`](./config.example.toml) を参照する。
+`[publisher]` の `hosts` には publisher のホストを書く。
+ポートを省略すると、チャンネルごとの既定値（`uni` 1935、`1A` 1936、`kaikan` 1937）を使う。
 `gstreamer.path` を空欄にすると、PATH、`TOMYOU_GST_LAUNCH`、標準的なインストール先の順に探す。
 Windows では `C:\Program Files\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe` も探す。
 
@@ -153,9 +155,10 @@ GStreamer のインストールをアプリが自動実行することはない�
 1. OBS を起動し、OBS WebSocket を有効にする。
 2. `tomyou` の設定を入力して保存する。
 3. 「配信を開始」を押す。
-4. OBS の配信先が `rtmp://127.0.0.1:1935/live/<channel>` に設定され、OBS の配信が始まる。
+4. OBS の配信先が `rtmp://<relay.bind>/live/<channel>` に設定され、OBS の配信が始まる。
 5. Edamame と ImageFlux の送信状態、ImageFlux の HLS URL、fallback 登録の状態、入力ストリームの映像・音声情報を表示する。
-6. 終了時は「配信を停止」を押す。OBS の配信先は、変更していなければ元へ戻る。
+6. 画面の「RTMP URL」で、`tomyou` が待ち受ける URL を確認できる。パスワードはない。
+7. 終了時は「配信を停止」を押す。OBS の配信先は、変更していなければ元へ戻る。
 
 OBS が既に配信中の場合は開始しない。
 OBS WebSocket だけが切れても、RTMP 入力が続く間は送信を維持する。

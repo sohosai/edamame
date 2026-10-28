@@ -109,8 +109,8 @@ async fn run(
         .bind
         .parse()
         .context("relay.bind を解釈できません")?;
-    let input_url = gstreamer::rtmp_input(&config.relay.bind, &config.channel_id);
-    let server = format!("rtmp://{}/live", config.relay.bind);
+    let input_url = config.relay_url();
+    let server = config.relay_server();
     let key = config.channel_id.clone();
 
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -119,9 +119,8 @@ async fn run(
 
     let (output_stop_tx, output_stop_rx) = watch::channel(false);
     // 送信先は上から順に試し、失敗したら次の送信先へ切り替える
-    let edamame_specs: Vec<OutputSpec> = config
-        .publisher
-        .urls()
+    let publisher_urls = config.publisher.urls(&config.channel_id)?;
+    let edamame_specs: Vec<OutputSpec> = publisher_urls
         .iter()
         .map(|publisher_url| gstreamer::edamame_spec(&input_url, publisher_url))
         .collect();
