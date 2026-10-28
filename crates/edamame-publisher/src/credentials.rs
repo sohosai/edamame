@@ -1,18 +1,12 @@
 //! live2025-server へ配信 URL と HLS 暗号鍵を登録する
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde_json::json;
 
 /// 登録用 HTTP リクエスト 1 回あたりの制限時間
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// 再試行までの待ち時間。
-/// 再試行のたびに倍にし、上限まで延ばす
-const RETRY_MIN: Duration = Duration::from_secs(1);
-const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// 登録に使う HTTP クライアントを作る
 pub fn client() -> Result<Client, String> {
@@ -54,15 +48,20 @@ pub fn credentials_body(
 }
 
 /// 登録の結果
-enum RegisterError {
-    /// 時間をおいて再試行する
+pub(crate) enum RegisterError {
+    /// 次のセグメントセットで再試行する
     Retryable(String),
     /// 設定を直さないと登録できない
     Fatal(String),
 }
 
 /// 1 回だけ登録する
-fn register_once(client: &Client, url: &str, token: &str, body: &str) -> Result<(), RegisterError> {
+pub(crate) fn register_once(
+    client: &Client,
+    url: &str,
+    token: &str,
+    body: &str,
+) -> Result<(), RegisterError> {
     let response = match client
         .post(url)
         .header("Authorization", format!("Bearer {token}"))
@@ -86,46 +85,6 @@ fn register_once(client: &Client, url: &str, token: &str, body: &str) -> Result<
         Err(RegisterError::Fatal(message))
     } else {
         Err(RegisterError::Retryable(message))
-    }
-}
-
-/// 登録が成功するまで再試行する。
-/// 停止要求を受けた場合や再試行できないエラーの場合は、登録を打ち切る
-pub fn register_until_success(
-    client: &Client,
-    url: &str,
-    token: &str,
-    body: &str,
-    channel_id: &str,
-    stop: &AtomicBool,
-) -> Result<(), String> {
-    let mut delay = RETRY_MIN;
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return Err("stream credentials are not registered".to_owned());
-        }
-        match register_once(client, url, token, body) {
-            Ok(()) => return Ok(()),
-            Err(RegisterError::Retryable(message)) => {
-                println!(
-                    "channel={channel_id} retrying stream credentials registration: {message}"
-                );
-                sleep_interruptible(delay, stop);
-                delay = (delay * 2).min(RETRY_MAX);
-            }
-            Err(RegisterError::Fatal(message)) => return Err(message),
-        }
-    }
-}
-
-/// 停止要求を確認しながら待つ
-fn sleep_interruptible(duration: Duration, stop: &AtomicBool) {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
