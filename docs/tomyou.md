@@ -207,7 +207,7 @@ ImageFlux の再接続でプレイリスト URL が変わった場合は、次�
 | fallback 登録の通信または 5xx | 1 秒から 30 秒の間隔で再試行する。配信は継続する |
 | fallback 登録の 400 または 401 | 再試行せず、設定エラーとして GUI とログに表示する。配信は継続する |
 | ImageFlux の再接続でプレイリスト URL が変わる | 再登録しない。次回の配信開始まで古い URL のまま |
-| edamame-publisher が停止、または RTMP URL へ到達できない | ImageFlux は継続する。Edamame 側の GStreamer だけを再起動する。GUI のログに接続失敗を表示する |
+| edamame-publisher が停止、または RTMP URL へ到達できない | ImageFlux は継続する。Edamame 側の GStreamer だけを再起動する。RTMP の接続確認が完了するまで「送信中」にせず、失敗時は GUI とログに接続失敗を表示する |
 | RTMP 入力が切れる | 出力を止め、OBS の再接続を待つ |
 | GStreamer が起動できない | 原因を画面に表示し、バックオフして再試行する |
 
@@ -220,8 +220,8 @@ ImageFlux と Edamame の出力は別プロセスなので、片方の停止が�
 
 設定は OS 標準のユーザーディレクトリへ保存する。
 
-- Windows: `%APPDATA%\tomyou\config.toml`
-- macOS: `~/Library/Application Support/tomyou/config.toml`
+- Windows: `%APPDATA%\sohosai\tomyou\config.toml`
+- macOS: `~/Library/Application Support/com.sohosai.tomyou/config.toml`
 - Linux: `~/.config/tomyou/config.toml`
 
 起動時に `--config <FILE>` を指定すると、そのファイルを読み込み、保存先にも使う。
@@ -244,6 +244,22 @@ ImageFlux は Edamame の controller より後ろに置くため、既定の 100
 
 秘密情報を含むため、設定ファイルを配布したりリポジトリへ commit したりしない。
 ログと画面のコピー機能には秘密情報を出さない。
+
+## ログとバージョン
+
+起動すると、OS 標準のデータディレクトリ配下の `logs` に実行ごとのログファイルを作る。
+ファイル名は `tomyou-YYYYMMDD-HHMMSS-<pid>.log` である。
+
+- Windows: `%LOCALAPPDATA%\sohosai\tomyou\logs\`
+- macOS: `~/Library/Application Support/com.sohosai.tomyou/logs/`
+- Linux: `~/.local/share/tomyou/logs/`
+
+ログには、起動時のバージョン、OS、設定ファイルのパス、チャンネル、publisher ホスト、RTMP リレーの待ち受け、OBS の接続先、GStreamer の標準エラー出力、ImageFlux と fallback 登録の状態などを残す。
+publisher の URL に含まれる認証情報とクエリは伏せ字にする。
+OBS のパスワード、ImageFlux の API トークン、`STREAM_INGEST_TOKEN` はログへ出さない。
+
+GUI の「設定」にはアプリのバージョンとログファイルのパスを表示し、「開く」からログファイルを開ける。
+タイトルバーと画面左上にも `tomyou v<version>` を表示する。
 
 ## publisher の接続先
 
@@ -307,7 +323,7 @@ GStreamer は外部ランタイムとし、アプリには同梱しない。
 
 ## 検証
 
-単体テストは設定、URL、ImageFlux の JSON、GStreamer のパイプラインを確認する。
+単体テストは設定、URL、ImageFlux の JSON、GStreamer のパイプライン、RTMP の接続成功・失敗行の解析、ログの伏せ字、バージョン表示を確認する。
 実サービスを使う確認は次の順で行う。
 
 1. `gst-inspect-1.0 whipclientsink` が成功することを確認する。
@@ -316,7 +332,7 @@ GStreamer は外部ランタイムとし、アプリには同梱しない。
 4. 配信中に ImageFlux のマスター、メディアプレイリスト、セグメントを取得する。
 5. `ffprobe` で映像と音声を確認し、実 client で再生時刻の進行を確認する。
 6. RTMP 入力から `whipclientsink` へ流しても同じ結果になることを確認する。
-7. Edamame 向けは `rtmpsink` で publisher へ送れることを確認する。
+7. Edamame 向けは `rtmpsink` で publisher へ送れることを確認する。接続確認が完了するまで「送信中」にならず、到達できないホストでは「接続失敗」になることも確認する。
 8. 片方の GStreamer を止めても、もう片方が継続することを確認する。
 9. テストで作成した ImageFlux チャンネルを削除する。
 

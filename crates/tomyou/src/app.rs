@@ -123,6 +123,9 @@ pub struct TomyouApp {
     publisher_connected: bool,
     imageflux_output: bool,
     edamame_output: bool,
+    edamame_connecting: bool,
+    edamame_error: Option<String>,
+    log_path: Option<PathBuf>,
     show_settings: bool,
     show_license: bool,
     gstreamer_path_draft: String,
@@ -140,6 +143,7 @@ impl TomyouApp {
         config_path: PathBuf,
         runtime: tokio::runtime::Runtime,
         startup_error: Option<String>,
+        log_path: Option<PathBuf>,
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
         let (events_tx, events_rx) = std::sync::mpsc::channel();
@@ -170,6 +174,9 @@ impl TomyouApp {
             publisher_connected: false,
             imageflux_output: false,
             edamame_output: false,
+            edamame_connecting: false,
+            edamame_error: None,
+            log_path,
             show_settings: false,
             show_license: false,
             gstreamer_path_draft,
@@ -182,6 +189,9 @@ impl TomyouApp {
 
     fn log(&mut self, message: impl Into<String>) {
         let message = message.into();
+        // 画面のログはファイルにも残す。コンソールは info 以上だけなので、
+        // 詳細ログはファイル側の debug フィルタで読む
+        tracing::debug!(target: "tomyou::ui", "{message}");
         if self.logs.len() >= 2000 {
             self.logs.pop_front();
         }
@@ -207,6 +217,8 @@ impl TomyouApp {
         self.publisher_connected = false;
         self.imageflux_output = false;
         self.edamame_output = false;
+        self.edamame_connecting = false;
+        self.edamame_error = None;
         self.edamame_destination = None;
         self.obs_snapshot = None;
         self.status = Status::Starting;
@@ -236,6 +248,7 @@ impl TomyouApp {
     }
 
     fn handle_event(&mut self, event: SessionEvent) {
+        tracing::debug!(target: "tomyou::ui", event = ?event, "session event");
         match event {
             SessionEvent::Starting => {
                 self.status = Status::Starting;
@@ -303,20 +316,43 @@ impl TomyouApp {
                     self.log(format!("fallback 登録に失敗: {error}"));
                 }
             }
+            SessionEvent::OutputConnecting(name) => {
+                if self.session.is_some() && name == "Edamame" {
+                    self.edamame_output = false;
+                    self.edamame_connecting = true;
+                    self.edamame_error = None;
+                }
+                self.log(format!("{name} への接続を確認しています"));
+            }
             SessionEvent::OutputStarted(name) => {
                 // セッション終了の通知より後に届くことがあるため、配信中だけ反映する
                 if self.session.is_some() {
                     if name == "Edamame" {
                         self.edamame_output = true;
+                        self.edamame_connecting = false;
+                        self.edamame_error = None;
                     } else {
                         self.imageflux_output = true;
                     }
                 }
                 self.log(format!("{name} への送信を開始しました"));
             }
+            SessionEvent::OutputError(name, message) => {
+                if self.session.is_some() {
+                    if name == "Edamame" {
+                        self.edamame_output = false;
+                        self.edamame_connecting = false;
+                        self.edamame_error = Some(message.clone());
+                    } else {
+                        self.imageflux_output = false;
+                    }
+                }
+                self.log(format!("{name} の送信エラー: {message}"));
+            }
             SessionEvent::OutputExited(name, message) => {
                 if name == "Edamame" {
                     self.edamame_output = false;
+                    self.edamame_connecting = false;
                 } else {
                     self.imageflux_output = false;
                 }
@@ -341,6 +377,8 @@ impl TomyouApp {
                 self.publisher_connected = false;
                 self.imageflux_output = false;
                 self.edamame_output = false;
+                self.edamame_connecting = false;
+                self.edamame_error = None;
                 self.edamame_destination = None;
                 self.fallback_registered = false;
                 self.fallback_error = None;
@@ -414,6 +452,22 @@ impl TomyouApp {
         }
     }
 
+    fn open_log_file(&mut self) {
+        let Some(path) = self.log_path.clone() else {
+            return;
+        };
+        match open::that(&path) {
+            Ok(()) => {
+                self.error = None;
+                self.log(format!("ログファイルを開きました: {}", path.display()));
+            }
+            Err(error) => {
+                self.error = Some(format!("ログファイルを開けません: {error:#}"));
+                self.log(format!("ログファイルを開けません: {error:#}"));
+            }
+        }
+    }
+
     fn load_config_from_draft(&mut self) {
         let path = self.config_path_from_draft();
         if path.as_os_str().is_empty() {
@@ -451,7 +505,7 @@ impl eframe::App for TomyouApp {
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("tomyou");
+                ui.heading(format!("tomyou v{}", crate::VERSION));
                 ui.separator();
                 ui.label(format!("チャンネル: {}", self.config.channel_id));
                 ui.separator();
@@ -683,14 +737,23 @@ impl eframe::App for TomyouApp {
             ui.columns(2, |columns| {
                 columns[0].group(|ui| {
                     ui.label(egui::RichText::new("Edamame（主系）").strong());
-                    let (text, tone) = if self.edamame_output {
-                        ("送信中", Tone::Good)
-                    } else if self.session.is_some() {
-                        ("接続待ち / 再接続中", Tone::Warn)
-                    } else {
+                    let (text, tone) = if self.session.is_none() {
                         ("停止", Tone::Idle)
+                    } else if self.edamame_output {
+                        ("送信中", Tone::Good)
+                    } else if self.edamame_error.is_some() {
+                        ("接続失敗", Tone::Bad)
+                    } else if self.edamame_connecting {
+                        ("接続確認中", Tone::Warn)
+                    } else {
+                        ("再接続中", Tone::Warn)
                     };
                     tone_label(ui, tone, text);
+                    if self.session.is_some()
+                        && let Some(error) = &self.edamame_error
+                    {
+                        tone_label(ui, Tone::Bad, error.clone());
+                    }
                     let urls = self
                         .config
                         .publisher
@@ -791,10 +854,33 @@ impl TomyouApp {
         let mut load_requested = false;
         let mut save_requested = false;
         let mut open_requested = false;
+        let mut open_log_requested = false;
         egui::Window::new("設定")
             .open(&mut open)
             .default_width(720.0)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("このアプリ").strong());
+                egui::Grid::new("settings-about")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("バージョン");
+                        ui.label(format!("v{}", crate::VERSION));
+                        ui.end_row();
+                        ui.label("ログファイル");
+                        if let Some(path) = &self.log_path {
+                            ui.horizontal(|ui| {
+                                ui.monospace(path.display().to_string());
+                                if ui.button("開く").clicked() {
+                                    open_log_requested = true;
+                                }
+                            });
+                        } else {
+                            ui.label("初期化できませんでした");
+                        }
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
                 ui.label(egui::RichText::new("設定ファイル").strong());
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut self.config_path_draft);
@@ -946,6 +1032,9 @@ impl TomyouApp {
         if open_requested {
             self.open_config_file();
         }
+        if open_log_requested {
+            self.open_log_file();
+        }
         if load_requested {
             self.load_config_from_draft();
         }
@@ -966,7 +1055,7 @@ impl TomyouApp {
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.label("tomyou");
+                ui.label(format!("tomyou v{}", crate::VERSION));
                 ui.label("Apache License 2.0");
                 ui.separator();
                 ui.label("同梱・使用するソフトウェア");

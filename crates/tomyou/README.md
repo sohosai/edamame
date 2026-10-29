@@ -59,7 +59,7 @@ cargo run -p tomyou
 cargo run -p tomyou -- --config /path/to/config.toml
 ```
 
-設定は `%APPDATA%\tomyou\config.toml`、`~/Library/Application Support/tomyou/config.toml`、
+設定は `%APPDATA%\sohosai\tomyou\config.toml`、`~/Library/Application Support/com.sohosai.tomyou/config.toml`、
 `~/.config/tomyou/config.toml` のいずれかへ保存される。
 `--config` を指定した場合は、そのパスを読み込み、保存先にも使う。
 GUI の「設定」でも設定ファイルのパスを指定して読み込み・保存できる。
@@ -160,8 +160,19 @@ GStreamer のインストールをアプリが自動実行することはない�
 6. 画面の「RTMP URL」で、`tomyou` が待ち受ける URL を確認できる。パスワードはない。
 7. 終了時は「配信を停止」を押す。OBS の配信先は、変更していなければ元へ戻る。
 
+Edamame の送信状態は、RTMP の接続を確認してから「送信中」になる。
+接続できないホストの場合は「接続失敗」となり、次の publisher ホストへ切り替える。
 OBS が既に配信中の場合は開始しない。
 OBS WebSocket だけが切れても、RTMP 入力が続く間は送信を維持する。
+
+## ログとバージョン
+
+起動すると、OS 標準のデータディレクトリ配下の `logs` に実行ごとのログファイルを作る。
+ファイル名は `tomyou-YYYYMMDD-HHMMSS-<pid>.log` である。
+ログには起動時のバージョン、OS、設定パス、チャンネル、publisher ホスト、OBS 接続先、GStreamer の標準エラー出力などを残す。
+OBS のパスワード、ImageFlux の API トークン、`STREAM_INGEST_TOKEN` は出さない。
+GUI の「設定」にバージョンとログファイルのパスを表示し、「開く」から開ける。
+タイトルバーと画面左上にも `tomyou v<version>` を表示する。
 
 ## 制約
 
