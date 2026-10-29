@@ -174,6 +174,11 @@ OBS のパスワード、ImageFlux の API トークン、`STREAM_INGEST_TOKEN` 
 GUI の「設定」にバージョンとログファイルのパスを表示し、「開く」から開ける。
 タイトルバーと画面左上にも `tomyou v<version>` を表示する。
 
+`rtpgccbwe` の `Got packet feedback without local-ts:` というFIXME診断は、
+画面の履歴とログファイルを同じ行で埋めないよう、30秒ごとの件数にまとめる。
+標準エラー出力の終了時にも、まだ報告していない件数を記録する。
+それ以外の警告・エラーとRTMP接続確認の処理は継続する。
+
 ## 制約
 
 - fallback 登録は配信開始後に一度だけ行う。ImageFlux の再接続でプレイリスト URL が変わった場合は、次回の配信開始まで再登録しない。

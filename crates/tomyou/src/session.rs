@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
     sync::watch,
 };
@@ -639,23 +639,13 @@ async fn run_once(
     if let Some(stderr) = child.stderr.take() {
         let ui = ui.clone();
         let name = name.to_owned();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // 画面には必要な行だけ出すが、ファイルには完全なログを残す
-                tracing::debug!(target: "tomyou::gstreamer", "{name}: {line}");
-                if check_rtmp {
-                    if is_rtmp_connection_success(&line) {
-                        let _ = connection_tx.send(RtmpConnectionState::Connected);
-                    } else if let Some(message) = rtmp_connection_error(&line) {
-                        let _ = connection_tx.send(RtmpConnectionState::Failed(message));
-                    }
-                }
-                if is_useful_gst_line(&line) && !line.contains("rtmpsink is deprecated") {
-                    let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
-                }
-            }
-        });
+        tokio::spawn(forward_gst_stderr(
+            stderr,
+            ui,
+            name,
+            check_rtmp,
+            connection_tx,
+        ));
     }
 
     if !check_rtmp {
@@ -736,6 +726,67 @@ async fn run_once(
     }
 }
 
+/// 同じ高頻度診断が画面とファイルを埋めないよう、stderr の受信側で集約する。
+async fn forward_gst_stderr(
+    stderr: impl AsyncRead + Unpin,
+    ui: Sender<SessionEvent>,
+    name: String,
+    check_rtmp: bool,
+    connection_tx: watch::Sender<RtmpConnectionState>,
+) {
+    let mut lines = BufReader::new(stderr).lines();
+    let mut repeated = 0_u64;
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            result = lines.next_line() => match result {
+                Ok(Some(line)) => {
+                    if is_local_ts_fixme(&line) {
+                        repeated = repeated.saturating_add(1);
+                        continue;
+                    }
+                    tracing::debug!(target: "tomyou::gstreamer", "{name}: {line}");
+                    if check_rtmp {
+                        if is_rtmp_connection_success(&line) {
+                            let _ = connection_tx.send(RtmpConnectionState::Connected);
+                        } else if let Some(message) = rtmp_connection_error(&line) {
+                            let _ = connection_tx.send(RtmpConnectionState::Failed(message));
+                        }
+                    }
+                    if is_useful_gst_line(&line) && !line.contains("rtmpsink is deprecated") {
+                        let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    warn!("{name}: GStreamer stderr read failed: {error}");
+                    break;
+                }
+            },
+            _ = interval.tick() => report_local_ts_fixmes(&ui, &name, &mut repeated),
+        }
+    }
+    report_local_ts_fixmes(&ui, &name, &mut repeated);
+}
+
+fn report_local_ts_fixmes(ui: &Sender<SessionEvent>, name: &str, repeated: &mut u64) {
+    if *repeated == 0 {
+        return;
+    }
+    let message = format!("{name}: rtpgccbwe local-ts 欠落の FIXME 診断を集約: {repeated} 件");
+    tracing::debug!(target: "tomyou::gstreamer", "{message}");
+    let _ = ui.send(SessionEvent::Log(message));
+    *repeated = 0;
+}
+
+fn is_local_ts_fixme(line: &str) -> bool {
+    line.split_whitespace().any(|word| word == "FIXME")
+        && line.contains("rtpgccbwe")
+        && line.contains("Got packet feedback without local-ts:")
+}
+
 /// 子プロセスの終了状態をログ用の文字列にする
 fn exit_message(status: Result<std::process::ExitStatus, std::io::Error>) -> String {
     match status {
@@ -769,6 +820,9 @@ fn rtmp_connection_error(line: &str) -> Option<String> {
 
 /// 画面に出す価値のある GStreamer のエラー行か
 fn is_useful_gst_line(line: &str) -> bool {
+    if is_local_ts_fixme(line) {
+        return false;
+    }
     let lower = line.to_ascii_lowercase();
     [
         "error",
@@ -804,6 +858,88 @@ async fn wait_backoff(stop_rx: &mut watch::Receiver<bool>, seconds: u64) -> bool
 mod tests {
     use super::*;
     use gstreamer::OutputKind;
+
+    const LOCAL_TS_FIXME: &str = "0:53:34.475538600 25212 24032 FIXME rtpgccbwe imp.rs:143:Packet::from_structure: Got packet feedback without local-ts: ValueGetError { error: UnexpectedNone }";
+
+    #[test]
+    fn keeps_errors_but_coalesces_the_known_local_ts_fixme() {
+        assert!(!is_useful_gst_line(LOCAL_TS_FIXME));
+        assert!(is_useful_gst_line(
+            &LOCAL_TS_FIXME.replace("FIXME", "ERROR")
+        ));
+        assert!(is_useful_gst_line("ERROR rtmpsink Broken pipe"));
+        assert!(is_useful_gst_line(
+            "WARNING whipclientsink DTLS handshake failed"
+        ));
+        assert!(is_useful_gst_line("FIXME rtpgccbwe other ValueGetError"));
+    }
+
+    #[tokio::test]
+    async fn forwards_errors_and_connection_state_after_a_diagnostic_burst() {
+        let input = format!(
+            "{}DEBUG rtmpsink Opened connection to rtmp://127.0.0.1/live/1A\nWARNING rtpgccbwe feedback delayed\nERROR rtmpsink Broken pipe\n",
+            format!("{LOCAL_TS_FIXME}\n").repeat(2000)
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (connection_tx, connection_rx) = watch::channel(RtmpConnectionState::Connecting);
+        forward_gst_stderr(
+            input.as_bytes(),
+            tx,
+            "ImageFlux".to_owned(),
+            true,
+            connection_tx,
+        )
+        .await;
+        assert!(matches!(
+            *connection_rx.borrow(),
+            RtmpConnectionState::Connected
+        ));
+        let messages: Vec<_> = rx
+            .try_iter()
+            .map(|event| match event {
+                SessionEvent::Log(message) => message,
+                other => panic!("予期しないイベント: {other:?}"),
+            })
+            .collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(messages.iter().any(|line| line.contains("2000 件")));
+        assert!(
+            messages
+                .iter()
+                .any(|line| line.contains("feedback delayed"))
+        );
+        assert!(messages.iter().any(|line| line.contains("Broken pipe")));
+        assert!(!messages.iter().any(|line| line.contains("ValueGetError")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reports_diagnostics_while_stderr_is_idle() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (connection_tx, _connection_rx) = watch::channel(RtmpConnectionState::Connecting);
+        let task = tokio::spawn(forward_gst_stderr(
+            reader,
+            tx,
+            "ImageFlux".to_owned(),
+            false,
+            connection_tx,
+        ));
+        writer
+            .write_all(format!("{LOCAL_TS_FIXME}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(rx.try_recv(), Ok(SessionEvent::Log(line)) if line.ends_with("1 件")));
+        assert!(rx.try_recv().is_err());
+        drop(writer);
+        task.await.unwrap();
+        assert!(rx.try_recv().is_err());
+    }
 
     fn spec(target: &str) -> OutputSpec {
         OutputSpec {
