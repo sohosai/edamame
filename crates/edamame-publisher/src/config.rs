@@ -724,7 +724,7 @@ bandwidth = 1000000
         .expect("設定を書ける");
         let cli = Cli {
             config: path.clone(),
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controller_url: Some("http://127.0.0.1:9000".to_owned()),
             auth_token: None,
             work_dir: None,
             key_file: None,
