@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-controller"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "bytes",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-domain"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "url",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-publisher"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "axum",
@@ -1162,7 +1162,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-telemetry"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-tls"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "edamame-worker"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "bytes",
@@ -4424,7 +4424,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tomyou"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
