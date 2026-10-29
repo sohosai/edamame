@@ -8,6 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 directories = "6"
 eframe.workspace = true
@@ -22,6 +23,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "signal", "io-util"] }
 toml.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 winit.workspace = true

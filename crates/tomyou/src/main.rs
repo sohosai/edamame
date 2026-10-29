@@ -6,9 +6,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use eframe::egui;
-use tracing_subscriber::EnvFilter;
 
-use tomyou::{app::TomyouApp, config::Config};
+use tomyou::{app::TomyouApp, config::Config, logging};
 
 /// tomyou の起動オプション
 #[derive(Debug, Parser)]
@@ -24,12 +23,16 @@ struct Args {
 }
 
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    let logging = logging::init();
+    tracing::info!(
+        version = tomyou::VERSION,
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        "tomyou starting"
+    );
+    if let Some(path) = logging.log_path() {
+        tracing::info!("log file: {}", path.display());
+    }
 
     let args = Args::parse();
     let explicit_config = args.config.is_some();
@@ -40,6 +43,7 @@ fn main() -> eframe::Result<()> {
         Ok(config) => (config, None),
         Err(error) => {
             let message = format!("{error:#}");
+            tracing::warn!("failed to load config: {message}");
             let context = if explicit_config {
                 "指定した設定ファイルを読み込めませんでした"
             } else {
@@ -68,9 +72,11 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
+    let log_path = logging.log_path().map(std::path::Path::to_path_buf);
+    let title = tomyou::window_title();
 
-    eframe::run_native(
-        "tomyou",
+    let result = eframe::run_native(
+        &title,
         options,
         Box::new(move |cc| {
             Ok(Box::new(TomyouApp::new(
@@ -79,9 +85,13 @@ fn main() -> eframe::Result<()> {
                 config_path,
                 runtime,
                 startup_error,
+                log_path,
             )))
         }),
-    )
+    );
+    // NonBlocking writer のバッファをアプリ終了時に flush する
+    drop(logging);
+    result
 }
 
 #[cfg(test)]

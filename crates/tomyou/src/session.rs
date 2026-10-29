@@ -18,8 +18,9 @@ use tracing::{error, info, warn};
 use crate::{
     config::{Config, StreamCredentialsConfig},
     credentials,
-    gstreamer::{self, OutputSpec},
+    gstreamer::{self, OutputKind, OutputSpec},
     imageflux::{ImageFluxClient, whip_url},
+    logging,
     obs::{ObsClient, PreviousStream, StreamSnapshot},
     relay::{self, RelayEvent},
     state::State,
@@ -46,13 +47,26 @@ pub enum SessionEvent {
     ImageFluxError(String),
     FallbackRegistered,
     FallbackRegistrationFailed(String),
+    OutputConnecting(String),
     OutputStarted(String),
+    OutputError(String, String),
     OutputExited(String, String),
     /// Edamame で今送っている送信先
     EdamameDestination(String),
     Error(String),
     Log(String),
     Stopped,
+}
+
+/// RTMP 接続の確認が完了するまでの上限
+const RTMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// RTMP 接続の状態
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RtmpConnectionState {
+    Connecting,
+    Connected,
+    Failed(String),
 }
 
 /// セッションの停止操作
@@ -86,6 +100,23 @@ async fn run(
     ui: Sender<SessionEvent>,
 ) -> anyhow::Result<()> {
     let _ = ui.send(SessionEvent::Starting);
+    let publisher_urls = config
+        .publisher
+        .urls(&config.channel_id)
+        .unwrap_or_default();
+    info!(
+        channel = %config.channel_id,
+        relay_bind = %config.relay.bind,
+        publisher_hosts = ?config.publisher.hosts(),
+        publisher_urls = ?publisher_urls
+            .iter()
+            .map(|url| logging::redact_url(url))
+            .collect::<Vec<_>>(),
+        obs = %format!("{}:{}", config.obs.host, config.obs.port),
+        imageflux = config.imageflux_enabled(),
+        fallback = config.stream_credentials.enabled(),
+        "starting session"
+    );
     if !config.edamame_enabled() {
         anyhow::bail!("publisher の送信先が未設定です。Edamame へ送信できません");
     }
@@ -124,12 +155,6 @@ async fn run(
         .iter()
         .map(|publisher_url| gstreamer::edamame_spec(&input_url, publisher_url))
         .collect();
-    spawn_output(
-        edamame_specs,
-        gst_launch.clone(),
-        output_stop_rx.clone(),
-        ui.clone(),
-    );
 
     let obs = ObsClient::connect(&config.obs).await?;
     let _ = ui.send(SessionEvent::ObsConnected);
@@ -141,6 +166,16 @@ async fn run(
         return Err(error);
     }
     let _ = ui.send(SessionEvent::ObsStreaming);
+
+    // OBS の配信開始後に Edamame 出力を起動する。
+    // 入力がまだ来ていない段階で RTMP の接続確認を始めると、
+    // 正常な publisher でもタイムアウトしてしまう。
+    spawn_output(
+        edamame_specs,
+        gst_launch.clone(),
+        output_stop_rx.clone(),
+        ui.clone(),
+    );
 
     let state_path = State::default_path().ok();
     let mut state = match state_path.as_ref() {
@@ -563,6 +598,7 @@ async fn run_once(
     ui: &Sender<SessionEvent>,
     name: &str,
 ) -> bool {
+    let check_rtmp = spec.kind == OutputKind::Edamame && spec.target.is_some();
     let mut command = Command::new(gst_launch);
     command
         .args(&spec.args)
@@ -570,44 +606,165 @@ async fn run_once(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    if check_rtmp {
+        // rtmpsink が接続を開いた時だけ出す DEBUG 行を、接続確認に使う
+        let debug = std::env::var("GST_DEBUG").unwrap_or_default();
+        let debug = if debug.is_empty() {
+            "rtmpsink:5".to_owned()
+        } else {
+            format!("{debug},rtmpsink:5")
+        };
+        command
+            .env("GST_DEBUG", debug)
+            .env("GST_DEBUG_NO_COLOR", "1");
+    }
     // 中継のたびにコンソールウィンドウが開かないようにする
     gstreamer::hide_console_window(command.as_std_mut());
+    if check_rtmp {
+        let _ = ui.send(SessionEvent::OutputConnecting(name.to_owned()));
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = ui.send(SessionEvent::OutputExited(
-                name.to_owned(),
-                format!("起動できません: {error}"),
-            ));
+            let message = format!("起動できません: {error}");
+            if check_rtmp {
+                let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+            } else {
+                let _ = ui.send(SessionEvent::OutputExited(name.to_owned(), message));
+            }
             return false;
         }
     };
-    let _ = ui.send(SessionEvent::OutputStarted(name.to_owned()));
+    let (connection_tx, mut connection_rx) = watch::channel(RtmpConnectionState::Connecting);
     if let Some(stderr) = child.stderr.take() {
         let ui = ui.clone();
         let name = name.to_owned();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if is_useful_gst_line(&line) {
+                // 画面には必要な行だけ出すが、ファイルには完全なログを残す
+                tracing::debug!(target: "tomyou::gstreamer", "{name}: {line}");
+                if check_rtmp {
+                    if is_rtmp_connection_success(&line) {
+                        let _ = connection_tx.send(RtmpConnectionState::Connected);
+                    } else if let Some(message) = rtmp_connection_error(&line) {
+                        let _ = connection_tx.send(RtmpConnectionState::Failed(message));
+                    }
+                }
+                if is_useful_gst_line(&line) && !line.contains("rtmpsink is deprecated") {
                     let _ = ui.send(SessionEvent::Log(format!("{name}: {line}")));
                 }
             }
         });
     }
-    let status = tokio::select! {
-        result = child.wait() => result,
-        _ = stop_rx.changed() => {
-            let _ = child.kill().await;
-            return true;
+
+    if !check_rtmp {
+        let _ = ui.send(SessionEvent::OutputStarted(name.to_owned()));
+    } else {
+        let deadline = tokio::time::Instant::now() + RTMP_CONNECT_TIMEOUT;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    let message = "RTMP 接続がタイムアウトしました".to_owned();
+                    let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+                    let _ = child.kill().await;
+                    return false;
+                }
+                changed = connection_rx.changed() => {
+                    if changed.is_err() {
+                        let message = "GStreamer の出力が終了しました".to_owned();
+                        let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+                        let _ = child.kill().await;
+                        return false;
+                    }
+                    let state = connection_rx.borrow().clone();
+                    match state {
+                        RtmpConnectionState::Connecting => {}
+                        RtmpConnectionState::Connected => {
+                            let _ = ui.send(SessionEvent::OutputStarted(name.to_owned()));
+                            break;
+                        }
+                        RtmpConnectionState::Failed(message) => {
+                            let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+                            let _ = child.kill().await;
+                            return false;
+                        }
+                    }
+                }
+                status = child.wait() => {
+                    let _ = ui.send(SessionEvent::OutputError(name.to_owned(), exit_message(status)));
+                    return false;
+                }
+                _ = stop_rx.changed() => {
+                    let _ = child.kill().await;
+                    return true;
+                }
+            }
         }
-    };
-    let message = match status {
+    }
+
+    let mut watch_connection = check_rtmp;
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let message = exit_message(status);
+                if check_rtmp {
+                    let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+                } else {
+                    let _ = ui.send(SessionEvent::OutputExited(name.to_owned(), message));
+                }
+                return false;
+            }
+            changed = connection_rx.changed(), if watch_connection => {
+                if changed.is_err() {
+                    // stderr が閉じた後に changed() を polling し続けない
+                    watch_connection = false;
+                    continue;
+                }
+                let state = connection_rx.borrow().clone();
+                if let RtmpConnectionState::Failed(message) = state {
+                    let _ = ui.send(SessionEvent::OutputError(name.to_owned(), message));
+                    let _ = child.kill().await;
+                    return false;
+                }
+            }
+            _ = stop_rx.changed() => {
+                let _ = child.kill().await;
+                return true;
+            }
+        }
+    }
+}
+
+/// 子プロセスの終了状態をログ用の文字列にする
+fn exit_message(status: Result<std::process::ExitStatus, std::io::Error>) -> String {
+    match status {
         Ok(status) => format!("終了: {status}"),
         Err(error) => format!("待機に失敗: {error}"),
-    };
-    let _ = ui.send(SessionEvent::OutputExited(name.to_owned(), message));
-    false
+    }
+}
+
+/// RTMP の接続が確立したことを示す GStreamer の行か
+fn is_rtmp_connection_success(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("opened connection to") && lower.contains("rtmp")
+}
+
+/// RTMP の接続失敗を示す GStreamer の行か
+fn rtmp_connection_error(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    [
+        "could not connect to rtmp stream",
+        "could not open resource for writing",
+        "connection refused",
+        "no route to host",
+        "name or service not known",
+        "handshake failed",
+        "connection timed out",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    .then(|| line.trim().to_owned())
 }
 
 /// 画面に出す価値のある GStreamer のエラー行か
@@ -691,5 +848,133 @@ mod tests {
                 "rtmp://second.example.test/live/1A".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn detects_rtmp_connection_lines() {
+        assert!(is_rtmp_connection_success(
+            r#"0:00:00 DEBUG rtmpsink gstrtmpsink.c:256: Opened connection to rtmp://127.0.0.1:1935/live/1A"#
+        ));
+        assert!(!is_rtmp_connection_success(
+            "Changed URI to rtmp://127.0.0.1:1935/live/1A"
+        ));
+        assert!(rtmp_connection_error(
+            r#"WARN rtmpsink gstrtmpsink.c:300: Could not connect to RTMP stream "rtmp://127.0.0.1:1935/live/1A" for writing"#
+        )
+        .is_some());
+        assert!(rtmp_connection_error(
+            "ERROR: from element /GstPipeline:pipeline0/GstRTMPSink:rtmpsink0: Could not open resource for writing."
+        )
+        .is_some());
+        assert!(rtmp_connection_error("Opened connection to rtmp://127.0.0.1").is_none());
+    }
+
+    #[cfg(unix)]
+    fn fake_gst_script(name: &str, stderr_line: &str, sleep: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("現在時刻を取得できる")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("tomyou-fake-gst-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        let path = dir.join(format!("{name}.sh"));
+        let tail = if sleep { "exec sleep 30\n" } else { "exit 1\n" };
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{}' >&2\n{tail}", stderr_line),
+        )
+        .expect("スクリプトを書ける");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("実行権限を付けられる");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn starts_output_only_after_the_rtmp_connection_opens() {
+        let script = fake_gst_script(
+            "success",
+            "0:00:00 DEBUG rtmpsink gstrtmpsink.c:256: Opened connection to rtmp://127.0.0.1:1935/live/1A",
+            true,
+        );
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spec = spec("rtmp://127.0.0.1:1935/live/1A");
+        let task = tokio::spawn(async move {
+            let mut stop_rx = stop_rx;
+            run_once(&spec, &script, &mut stop_rx, &tx, "Edamame").await
+        });
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::OutputStarted(_)))
+        {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "OutputStarted が届きません: {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let connecting = events
+            .iter()
+            .position(|event| matches!(event, SessionEvent::OutputConnecting(_)));
+        let started = events
+            .iter()
+            .position(|event| matches!(event, SessionEvent::OutputStarted(_)));
+        assert!(
+            matches!((connecting, started), (Some(connecting), Some(started)) if connecting < started),
+            "接続確認より先に送信開始が届きました: {events:?}"
+        );
+
+        let _ = stop_tx.send(true);
+        assert!(task.await.expect("task を待てません"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reports_a_failed_rtmp_connection_without_starting_output() {
+        let script = fake_gst_script(
+            "failure",
+            "0:00:00 WARN rtmpsink gstrtmpsink.c:300:gst_rtmp_sink_render:<rtmpsink0> error: Could not connect to RTMP stream \"rtmp://127.0.0.1:1935/live/1A\" for writing",
+            false,
+        );
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spec = spec("rtmp://127.0.0.1:1935/live/1A");
+        let task = tokio::spawn(async move {
+            let mut stop_rx = stop_rx;
+            run_once(&spec, &script, &mut stop_rx, &tx, "Edamame").await
+        });
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::OutputError(_, _)))
+        {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "OutputError が届きません: {events:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::OutputStarted(_))),
+            "接続失敗なのに送信開始が届きました: {events:?}"
+        );
+        assert!(!task.await.expect("task を待てません"));
     }
 }
