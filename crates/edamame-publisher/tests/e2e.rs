@@ -763,6 +763,17 @@ bandwidth = 12000000
         "ffmpeg が起動しません: {}",
         publisher.log()
     );
+    // この設定の停滞判定は7秒。初回の入力待ちは、それを超えても維持する。
+    thread::sleep(Duration::from_secs(8));
+    assert!(
+        publisher.is_running(),
+        "入力待機中にpublisherが終了しました"
+    );
+    assert!(
+        !publisher.log().contains("starting ffmpeg run=2"),
+        "入力待ちを停滞と誤判定しました: {}",
+        publisher.log()
+    );
     let mut sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);
     let stored = wait_for(
         || controller.sequences("1B", "main").len() >= 2,
@@ -780,10 +791,27 @@ bandwidth = 12000000
 
     // 古い接続を捨て、新しい送信で配信が再開することを確かめる
     drop(sender);
-    let before = controller.sequences("1B", "main").len();
+    // 復旧後の入力待ちも、直前の実行の進捗を引き継いで再起動し続けない。
+    thread::sleep(Duration::from_secs(8));
+    assert!(
+        !publisher.log().contains("starting ffmpeg run=3"),
+        "復旧後の入力待ちを停滞と誤判定しました: {}",
+        publisher.log()
+    );
+    let before = controller
+        .sequences("1B", "main")
+        .into_iter()
+        .max()
+        .unwrap();
     let _new_sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);
     let resumed = wait_for(
-        || controller.sequences("1B", "main").len() > before,
+        || {
+            controller
+                .sequences("1B", "main")
+                .into_iter()
+                .max()
+                .is_some_and(|sequence| sequence > before)
+        },
         Duration::from_secs(30),
     );
     assert!(
