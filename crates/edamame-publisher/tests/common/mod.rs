@@ -4,7 +4,7 @@
 //! ffmpeg と publisher は別プロセスとして起動する。
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -326,6 +326,16 @@ impl Publisher {
         auth_token: Option<&str>,
         work_dir: &Path,
     ) -> Self {
+        Self::start_with_args(config, controller_url, auth_token, work_dir, &[])
+    }
+
+    pub fn start_with_args(
+        config: &Path,
+        controller_url: &str,
+        auth_token: Option<&str>,
+        work_dir: &Path,
+        extra_args: &[&str],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_edamame-publisher"));
         command
             .arg("--config")
@@ -337,6 +347,7 @@ impl Publisher {
         if let Some(token) = auth_token {
             command.arg("--auth-token").arg(token);
         }
+        command.args(extra_args.iter().copied());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn().expect("publisher を起動できません");
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -459,4 +470,72 @@ pub fn assert_mpegts(data: &[u8]) {
         data[188], 0x47,
         "188 バイト目が MPEG-TS の同期バイトではありません"
     );
+}
+
+/// live2025-server の stream-credentials 登録を受け取るテスト用サーバー
+pub struct CredentialsServer {
+    pub url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl CredentialsServer {
+    pub fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("登録用サーバーを起動できません");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("アドレスを読めません")
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("接続を複製できません"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_length = 0;
+                let mut expect_continue = false;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(value) = lower.strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("expect:") && lower.contains("100-continue") {
+                        expect_continue = true;
+                    }
+                }
+                if expect_continue {
+                    let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                }
+                let mut body = vec![0u8; content_length];
+                if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                recorded
+                    .lock()
+                    .expect("登録内容を記録できません")
+                    .push(String::from_utf8_lossy(&body).into_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        Self { url, requests }
+    }
+
+    /// 受け取った登録リクエストの body を返す
+    pub fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("登録内容を読めません").clone()
+    }
 }

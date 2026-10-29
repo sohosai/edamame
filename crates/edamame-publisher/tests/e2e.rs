@@ -11,8 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use common::{
-    Controller, Publisher, Sender, TestDir, Worker, assert_mpegts, decrypt_segment, free_port,
-    http_get, wait_for,
+    Controller, CredentialsServer, Publisher, Sender, TestDir, Worker, assert_mpegts,
+    decrypt_segment, free_port, http_get, wait_for,
 };
 
 /// 設定ファイルを書く
@@ -799,4 +799,137 @@ bandwidth = 12000000
 
     let status = publisher.stop();
     assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
+/// stream credentials の登録テスト用に 1 channel の設定を書く
+fn write_credentials_config(dir: &Path, rtmp_port: u16) -> PathBuf {
+    write_config(
+        dir,
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1A"
+input_url = "rtmp://127.0.0.1:{rtmp_port}/live/1A"
+
+[[input.rendition]]
+quality = "main"
+resolution = "640x360"
+bandwidth = 1400000
+video_bitrate = 500000
+"#
+        ),
+    )
+}
+
+/// stream credentials の登録先を指定して publisher を起動する
+fn start_publisher_with_credentials(
+    config: &Path,
+    controller_url: &str,
+    work_dir: &Path,
+    credentials: &CredentialsServer,
+) -> Publisher {
+    Publisher::start_with_args(
+        config,
+        controller_url,
+        Some("test-token"),
+        work_dir,
+        &[
+            "--stream-credentials-url",
+            credentials.url.as_str(),
+            "--stream-ingest-token",
+            "test-token",
+        ],
+    )
+}
+
+#[test]
+fn does_not_register_stream_credentials_without_input() {
+    let dir = TestDir::new("credentials-no-input");
+    let rtmp_port = free_port();
+    let controller = Controller::start("test-token");
+    let credentials = CredentialsServer::start();
+    let config = write_credentials_config(dir.path(), rtmp_port);
+    let mut publisher =
+        start_publisher_with_credentials(&config, &controller.base_url, dir.path(), &credentials);
+
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        credentials.requests().is_empty(),
+        "入力前に stream credentials が登録されました: {:?}",
+        credentials.requests()
+    );
+
+    let status = publisher.stop();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "publisher の終了コード: {status}\n{}",
+        publisher.log()
+    );
+}
+
+#[test]
+fn registers_stream_credentials_for_each_segment_set() {
+    let dir = TestDir::new("credentials-per-set");
+    let rtmp_port = free_port();
+    let controller = Controller::start("test-token");
+    let credentials = CredentialsServer::start();
+    let config = write_credentials_config(dir.path(), rtmp_port);
+    let mut publisher =
+        start_publisher_with_credentials(&config, &controller.base_url, dir.path(), &credentials);
+
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        credentials.requests().is_empty(),
+        "入力前に stream credentials が登録されました: {:?}",
+        credentials.requests()
+    );
+
+    let _sender = Sender::start_rtmp(rtmp_port, "1A", "640x360", 30, 30, "aac", 60);
+    let registered = wait_for(
+        || credentials.requests().len() >= 2,
+        Duration::from_secs(30),
+    );
+    assert!(
+        registered,
+        "セグメントセットごとの登録が 2 回以上発生しません: {:?}\n{}",
+        credentials.requests(),
+        publisher.log()
+    );
+
+    for request in credentials.requests() {
+        assert!(
+            request.contains("\"channel_id\":\"1A\""),
+            "channel_id がありません: {request}"
+        );
+        assert!(
+            request.contains("\"candidates\""),
+            "candidates がありません: {request}"
+        );
+    }
+
+    let status = publisher.stop();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "publisher の終了コード: {status}\n{}",
+        publisher.log()
+    );
 }

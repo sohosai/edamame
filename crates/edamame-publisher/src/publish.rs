@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{fmt::Write as _, io};
@@ -216,19 +216,8 @@ pub fn spawn_channel(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let context = Arc::new(context);
-        let registered = Arc::new(AtomicBool::new(
-            context.settings.stream_credentials_url.is_none(),
-        ));
-
-        let registration = {
-            let context = Arc::clone(&context);
-            let stop = Arc::clone(&stop);
-            let failed = Arc::clone(&failed);
-            let registered = Arc::clone(&registered);
-            thread::spawn(move || {
-                register_stream_credentials(&context, &stop, &failed, &registered)
-            })
-        };
+        let credentials =
+            CredentialsUpdater::new(Arc::clone(&context), Arc::clone(&stop), Arc::clone(&failed));
 
         // PUT の設定誤りなどでチャンネルが止まっても、待ち受けを再開して次の入力を待つ。
         // 止まったままにすると、送信側が設定を直して接続し直しても復帰できない。
@@ -248,19 +237,16 @@ pub fn spawn_channel(
                 let context = Arc::clone(&context);
                 let stop = Arc::clone(&stop);
                 let channel_stop = Arc::clone(&channel_stop);
-                let published = Arc::clone(&published);
-                let pending = Arc::clone(&pending);
-                let run_counter = Arc::clone(&run_counter);
+                let state = EncoderState {
+                    stop: Arc::clone(&stop),
+                    channel_stop: Arc::clone(&channel_stop),
+                    published: Arc::clone(&published),
+                    pending: Arc::clone(&pending),
+                    run_counter: Arc::clone(&run_counter),
+                    credentials: Arc::clone(&credentials),
+                };
                 thread::spawn(move || {
-                    if let Err(message) = run_encoder(
-                        &context,
-                        &sender,
-                        &stop,
-                        &channel_stop,
-                        &published,
-                        &pending,
-                        &run_counter,
-                    ) {
+                    if let Err(message) = run_encoder(&context, &sender, state) {
                         println!("channel={} stopped: {message}", context.channel_id());
                     }
                 })
@@ -313,9 +299,10 @@ pub fn spawn_channel(
             }
         }
 
-        let _ = registration.join();
-        // 登録できないまま終わった場合も、運用者が気づけるように失敗として扱う
-        if !registered.load(Ordering::Relaxed) {
+        credentials.stop();
+        // 入力を受け付けたのに一度も登録できなかった場合だけ失敗として扱う。
+        // 入力がないまま停止した場合は、登録しなくても正常終了にする
+        if credentials.input_seen() && !credentials.is_registered() {
             println!(
                 "channel={} stream credentials were not registered",
                 context.channel_id()
@@ -345,23 +332,89 @@ fn last_run_number(work_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// 鍵と配信 URL を live2025-server へ登録する
-fn register_stream_credentials(
+/// channel ごとに live2025-server への登録を更新する
+struct CredentialsUpdater {
+    tx: SyncSender<()>,
+    input_seen: AtomicBool,
+    registered: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl CredentialsUpdater {
+    fn new(
+        context: Arc<ChannelContext>,
+        stop: Arc<AtomicBool>,
+        failed: Arc<AtomicBool>,
+    ) -> Arc<Self> {
+        let registered = Arc::new(AtomicBool::new(
+            context.settings.stream_credentials_url.is_none(),
+        ));
+        let finished = Arc::new(AtomicBool::new(false));
+        // 登録処理が詰まっても通知を溜め込まないよう、枠は 1 つだけ持つ。
+        // 登録中に届いたセットは、登録後の次の 1 回でまとめて反映する
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handle = if context.settings.stream_credentials_url.is_some() {
+            let context = Arc::clone(&context);
+            let stop = Arc::clone(&stop);
+            let failed = Arc::clone(&failed);
+            let registered = Arc::clone(&registered);
+            let finished = Arc::clone(&finished);
+            Some(thread::spawn(move || {
+                run_credentials_worker(&context, &rx, &stop, &failed, &registered, &finished);
+            }))
+        } else {
+            None
+        };
+        Arc::new(Self {
+            tx,
+            input_seen: AtomicBool::new(false),
+            registered,
+            finished,
+            handle: Mutex::new(handle),
+        })
+    }
+
+    /// 有効なセグメントセットができたことを登録ワーカーへ知らせる
+    fn notify(&self) {
+        self.input_seen.store(true, Ordering::Relaxed);
+        // ワーカーが登録中で枠が埋まっている場合は、その登録後の次の 1 回で足りる
+        let _ = self.tx.try_send(());
+    }
+
+    fn input_seen(&self) -> bool {
+        self.input_seen.load(Ordering::Relaxed)
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered.load(Ordering::Relaxed)
+    }
+
+    fn stop(&self) {
+        self.finished.store(true, Ordering::Relaxed);
+        let handle = self
+            .handle
+            .lock()
+            .expect("stream credentials worker mutex is poisoned")
+            .take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// セグメントセットが届くたびに live_credentials を更新する
+fn run_credentials_worker(
     context: &ChannelContext,
+    receiver: &Receiver<()>,
     stop: &AtomicBool,
     failed: &AtomicBool,
     registered: &AtomicBool,
+    finished: &AtomicBool,
 ) {
-    let (Some(base_url), Some(token)) = (
-        context.settings.stream_credentials_url.as_deref(),
-        context.settings.stream_ingest_token.as_deref(),
-    ) else {
+    let Some((url, token, body)) = stream_credentials_payload(context) else {
         return;
     };
-    let candidates = context.settings.candidate_live_urls(context.input());
-    if candidates.is_empty() {
-        return;
-    }
     let client = match credentials::client() {
         Ok(client) => client,
         Err(message) => {
@@ -373,35 +426,56 @@ fn register_stream_credentials(
             return;
         }
     };
-    let url = credentials::credentials_url(base_url);
-    let body =
-        credentials::credentials_body(context.channel_id(), &hex_encode(&context.key), &candidates);
-    match credentials::register_until_success(
-        &client,
-        &url,
-        token,
-        &body,
-        context.channel_id(),
-        stop,
-    ) {
-        Ok(()) => {
-            registered.store(true, Ordering::Relaxed);
-            println!(
-                "channel={} registered stream credentials",
-                context.channel_id()
-            );
+    let mut last_attempt_failed = false;
+    while !stop.load(Ordering::Relaxed) && !finished.load(Ordering::Relaxed) {
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        Err(message) => {
-            if stop.load(Ordering::Relaxed) {
-                return;
+        match credentials::register_once(&client, &url, &token, &body) {
+            Ok(()) => {
+                if !registered.swap(true, Ordering::Relaxed) || last_attempt_failed {
+                    println!(
+                        "channel={} registered stream credentials",
+                        context.channel_id()
+                    );
+                }
+                last_attempt_failed = false;
             }
-            println!(
-                "channel={} failed to register stream credentials: {message}",
-                context.channel_id()
-            );
-            failed.store(true, Ordering::Relaxed);
+            Err(credentials::RegisterError::Retryable(message)) => {
+                println!(
+                    "channel={} failed to register stream credentials: {message}; \
+                     retrying on the next segment set",
+                    context.channel_id()
+                );
+                last_attempt_failed = true;
+            }
+            Err(credentials::RegisterError::Fatal(message)) => {
+                println!(
+                    "channel={} failed to register stream credentials: {message}",
+                    context.channel_id()
+                );
+                failed.store(true, Ordering::Relaxed);
+                break;
+            }
         }
     }
+}
+
+/// 登録に使う URL、token、body を組み立てる
+fn stream_credentials_payload(context: &ChannelContext) -> Option<(String, String, String)> {
+    let base_url = context.settings.stream_credentials_url.as_deref()?;
+    let token = context.settings.stream_ingest_token.as_deref()?;
+    let candidates = context.settings.candidate_live_urls(context.input());
+    if candidates.is_empty() {
+        return None;
+    }
+    Some((
+        credentials::credentials_url(base_url),
+        token.to_owned(),
+        credentials::credentials_body(context.channel_id(), &hex_encode(&context.key), &candidates),
+    ))
 }
 
 /// 起動時に controller のプレイリストから次のセグメント番号を求める。
@@ -532,16 +606,30 @@ fn parse_playlist_sequences(text: &str) -> Vec<u64> {
     sequences
 }
 
+/// encoder スレッドが使う channel 共通の状態
+struct EncoderState {
+    stop: Arc<AtomicBool>,
+    channel_stop: Arc<AtomicBool>,
+    published: Arc<AtomicU64>,
+    pending: Arc<AtomicU64>,
+    run_counter: Arc<AtomicU64>,
+    credentials: Arc<CredentialsUpdater>,
+}
+
 /// 1 つの channel の ffmpeg を起動し、完成したセグメントを送信側へ渡す
 fn run_encoder(
     context: &ChannelContext,
     sender: &Sender<PendingSet>,
-    stop: &AtomicBool,
-    channel_stop: &AtomicBool,
-    published: &AtomicU64,
-    pending: &AtomicU64,
-    run_counter: &AtomicU64,
+    state: EncoderState,
 ) -> Result<(), String> {
+    let EncoderState {
+        stop,
+        channel_stop,
+        published,
+        pending,
+        run_counter,
+        credentials,
+    } = state;
     let mut restart_delay = RESTART_MIN;
 
     'restart_input: while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
@@ -580,7 +668,7 @@ fn run_encoder(
                 );
                 break;
             }
-            match collect_segments(context, &mut run, sender, pending) {
+            match collect_segments(context, &mut run, sender, &pending, &credentials) {
                 Ok(()) => {}
                 Err(SegmentError::Rejected(message)) => {
                     reject_input(
@@ -588,9 +676,9 @@ fn run_encoder(
                         &mut process,
                         &mut run,
                         &message,
-                        pending,
-                        stop,
-                        channel_stop,
+                        &pending,
+                        &stop,
+                        &channel_stop,
                     )?;
                     continue 'restart_input;
                 }
@@ -600,7 +688,7 @@ fn run_encoder(
         }
 
         // 終了間際に完成したセグメントを集め、揃わなかったものは捨てる
-        match collect_segments(context, &mut run, sender, pending) {
+        match collect_segments(context, &mut run, sender, &pending, &credentials) {
             Ok(()) => {}
             Err(SegmentError::Rejected(message)) => {
                 reject_input(
@@ -608,9 +696,9 @@ fn run_encoder(
                     &mut process,
                     &mut run,
                     &message,
-                    pending,
-                    stop,
-                    channel_stop,
+                    &pending,
+                    &stop,
+                    &channel_stop,
                 )?;
                 continue 'restart_input;
             }
@@ -624,7 +712,7 @@ fn run_encoder(
             restart_delay = RESTART_MIN;
         }
         // 再起動の前に少し待ち、その間も停止要求を確認する
-        sleep_interruptible(restart_delay, stop, channel_stop);
+        sleep_interruptible(restart_delay, &stop, &channel_stop);
     }
     Ok(())
 }
@@ -697,6 +785,7 @@ fn collect_segments(
     run: &mut RunState,
     sender: &Sender<PendingSet>,
     pending: &AtomicU64,
+    credentials: &CredentialsUpdater,
 ) -> Result<(), SegmentError> {
     check_copy_segment_durations(context, run).map_err(SegmentError::Fatal)?;
     read_files(context, run).map_err(SegmentError::Fatal)?;
@@ -743,6 +832,9 @@ fn collect_segments(
         }
         run.sent.insert(index);
         run.produced += 1;
+        // セグメントセットができたので、live2025-server の登録を更新する。
+        // 入力がない間はここに来ないため、登録も行われない
+        credentials.notify();
     }
     Ok(())
 }
