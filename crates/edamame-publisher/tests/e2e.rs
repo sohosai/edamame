@@ -721,6 +721,82 @@ preset = "ultrafast"
     assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
 }
 
+/// TCP 接続を残したまま RTMP の送信だけが止まっても、publisher が検知して ffmpeg を起動し直す
+#[test]
+fn restarts_ffmpeg_when_the_rtmp_input_stalls_without_disconnecting() {
+    let dir = TestDir::new("input-stall");
+    let rtmp_port = free_port();
+    let controller = Controller::start("test-token");
+    let _worker = Worker::start(&controller.base_url, "test-token");
+    let config = write_config(
+        dir.path(),
+        &format!(
+            r#"
+segment_duration_ms = 1000
+backlog_limit = 6
+
+[encoder]
+codec = "libx264"
+preset = "ultrafast"
+
+[[input]]
+channel_id = "1B"
+input_url = "rtmp://127.0.0.1:{rtmp_port}/live/1B"
+
+[[input.rendition]]
+quality = "main"
+mode = "copy"
+resolution = "640x360"
+bandwidth = 12000000
+"#
+        ),
+    );
+
+    let mut publisher = Publisher::start(
+        &config,
+        &controller.base_url,
+        Some("test-token"),
+        dir.path(),
+    );
+    assert!(
+        publisher.wait_for_log("starting ffmpeg run=1", Duration::from_secs(10)),
+        "ffmpeg が起動しません: {}",
+        publisher.log()
+    );
+    let mut sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);
+    let stored = wait_for(
+        || controller.sequences("1B", "main").len() >= 2,
+        Duration::from_secs(30),
+    );
+    assert!(stored, "セグメントが保存されません: {}", publisher.log());
+
+    // SIGSTOP で送信プロセスだけを止める。TCP 接続は残るため、
+    // ffmpeg は入力が来ないまま待ち続ける。
+    sender.pause();
+    let stalled = publisher.wait_for_log("input stalled", Duration::from_secs(25));
+    assert!(stalled, "入力の停止を検知しません: {}", publisher.log());
+    let restarted = publisher.wait_for_log("starting ffmpeg run=2", Duration::from_secs(20));
+    assert!(restarted, "ffmpeg が再起動しません: {}", publisher.log());
+
+    // 古い接続を捨て、新しい送信で配信が再開することを確かめる
+    drop(sender);
+    let before = controller.sequences("1B", "main").len();
+    let _new_sender = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 60);
+    let resumed = wait_for(
+        || controller.sequences("1B", "main").len() > before,
+        Duration::from_secs(30),
+    );
+    assert!(
+        resumed,
+        "入力の再開後に配信が続きません: {}",
+        publisher.log()
+    );
+    assert!(publisher.is_running(), "publisher が終了しました");
+
+    let status = publisher.stop();
+    assert_eq!(status.code(), Some(0), "publisher の終了コード: {status}");
+}
+
 /// RTMP で受け取った映像も、暗号化されたセグメントとして保存されて復号できる
 #[test]
 fn publishes_segments_from_an_rtmp_input() {

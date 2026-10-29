@@ -255,6 +255,15 @@ impl Sender {
         }
         panic!("{protocol} を送信できません。publisher が待ち受けているか確認してください");
     }
+
+    /// TCP 接続を残したまま送信だけを止める
+    pub fn pause(&mut self) {
+        let status = Command::new("kill")
+            .args(["-STOP", &self.child.id().to_string()])
+            .status()
+            .expect("sender を停止できません");
+        assert!(status.success(), "sender を停止できません: {status}");
+    }
 }
 
 /// 映像を送る ffmpeg の引数を組み立てる

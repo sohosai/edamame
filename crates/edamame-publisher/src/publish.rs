@@ -30,6 +30,9 @@ const RESTART_MAX: Duration = Duration::from_secs(10);
 const INPUT_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// 拒否時に、送信待ちのセットが処理されるのを待つ上限
 const PENDING_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// 入力が止まったと判断するまでの待ち時間の下限と上限
+const INPUT_STALL_MIN: Duration = Duration::from_secs(5);
+const INPUT_STALL_MAX: Duration = Duration::from_secs(120);
 /// コピーする rendition のセグメント長を比べるときの許容幅
 const COPY_DURATION_TOLERANCE_MS: u64 = 100;
 /// プレイリスト取得時の制限時間と試行回数
@@ -69,6 +72,21 @@ impl ChannelContext {
     fn max_age(&self) -> Duration {
         Duration::from_millis(self.settings.segment_duration_ms * self.settings.backlog_limit)
     }
+}
+
+/// 最後のセグメントセットから、入力が止まったと判断するまでの時間
+///
+/// TCP 接続が残ったまま映像だけが届かなくなると、ffmpeg は入力を待ち続ける。
+/// セグメントを作れていた実行で新しいセットがこの時間作られなければ、
+/// 入力が止まったとみなして ffmpeg を起動し直す。
+fn input_stall_timeout(settings: &PublisherSettings) -> Duration {
+    Duration::from_millis(
+        settings
+            .segment_duration_ms
+            .saturating_mul(settings.backlog_limit.saturating_add(1)),
+    )
+    .max(INPUT_STALL_MIN)
+    .min(INPUT_STALL_MAX)
 }
 
 /// controller へ送る 1 セット分のセグメント
@@ -631,6 +649,7 @@ fn run_encoder(
         credentials,
     } = state;
     let mut restart_delay = RESTART_MIN;
+    let stall_timeout = input_stall_timeout(&context.settings);
 
     'restart_input: while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
         let run_number = run_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -655,6 +674,7 @@ fn run_encoder(
         );
         let mut process = Ffmpeg::spawn(&args, context.channel_id())?;
         let mut run = RunState::new(run_dir.clone());
+        let mut last_progress = Instant::now();
 
         loop {
             if stop.load(Ordering::Relaxed) || channel_stop.load(Ordering::Relaxed) {
@@ -668,8 +688,24 @@ fn run_encoder(
                 );
                 break;
             }
+            let produced = run.produced;
             match collect_segments(context, &mut run, sender, &pending, &credentials) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if run.produced != produced {
+                        last_progress = Instant::now();
+                    } else if run.produced > 0 && last_progress.elapsed() >= stall_timeout {
+                        restart_stalled_input(
+                            context,
+                            &mut process,
+                            &mut run,
+                            &pending,
+                            &stop,
+                            &channel_stop,
+                            last_progress.elapsed(),
+                        )?;
+                        continue 'restart_input;
+                    }
+                }
                 Err(SegmentError::Rejected(message)) => {
                     reject_input(
                         context,
@@ -734,6 +770,28 @@ fn reject_input(
     println!(
         "channel={} rejected the input: {message}; restarting the input",
         context.channel_id()
+    );
+    process.stop();
+    run.discard_incomplete(context)?;
+    wait_for_pending_sets(pending, stop, channel_stop);
+    sleep_interruptible(INPUT_RESTART_DELAY, stop, channel_stop);
+    Ok(())
+}
+
+/// 入力が止まった ffmpeg を止め、次の入力を受け付けられる状態にする
+fn restart_stalled_input(
+    context: &ChannelContext,
+    process: &mut Ffmpeg,
+    run: &mut RunState,
+    pending: &AtomicU64,
+    stop: &AtomicBool,
+    channel_stop: &AtomicBool,
+    stalled_for: Duration,
+) -> Result<(), String> {
+    println!(
+        "channel={} input stalled for {} ms without a new segment; restarting ffmpeg",
+        context.channel_id(),
+        stalled_for.as_millis()
     );
     process.stop();
     run.discard_incomplete(context)?;
@@ -1304,6 +1362,25 @@ mod tests {
                 renditions: vec![rendition("1080p")],
             }],
         }
+    }
+
+    #[test]
+    fn computes_input_stall_timeout_from_segment_duration_and_backlog() {
+        let mut settings = settings();
+        // 6 秒 × (6 + 1) = 42 秒
+        assert_eq!(input_stall_timeout(&settings), Duration::from_secs(42));
+
+        settings.segment_duration_ms = 1000;
+        assert_eq!(input_stall_timeout(&settings), Duration::from_secs(7));
+
+        // 短いセグメントでも、下限の 5 秒より早くは切らない
+        settings.segment_duration_ms = 500;
+        assert_eq!(input_stall_timeout(&settings), Duration::from_secs(5));
+
+        // 長いセグメントや大きい backlog でも、上限の 120 秒で打ち切る
+        settings.segment_duration_ms = 60_000;
+        settings.backlog_limit = 10;
+        assert_eq!(input_stall_timeout(&settings), Duration::from_secs(120));
     }
 
     #[test]
