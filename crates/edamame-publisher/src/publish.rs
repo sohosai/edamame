@@ -116,6 +116,8 @@ enum PublishError {
 enum SegmentError {
     /// 入力が設定に合わないので、セットを捨てて入力を待ち直す
     Rejected(String),
+    /// copy の入力の解像度が設定と違うので、この quality を encode に切り替えて待ち直す
+    CopyResolutionMismatch { quality: String, message: String },
     /// ローカルの障害なので、channel を起動し直す
     Fatal(String),
 }
@@ -650,11 +652,14 @@ fn run_encoder(
     } = state;
     let mut restart_delay = RESTART_MIN;
     let stall_timeout = input_stall_timeout(&context.settings);
+    // 入力の解像度が合わず、copy から encode に切り替えた quality
+    let mut fallback = BTreeSet::new();
 
     'restart_input: while !stop.load(Ordering::Relaxed) && !channel_stop.load(Ordering::Relaxed) {
         let run_number = run_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let run_dir = context.work_dir.join(format!("run-{run_number}"));
-        for rendition in context.renditions() {
+        let renditions = effective_renditions(context.renditions(), &fallback);
+        for rendition in &renditions {
             fs::create_dir_all(run_dir.join(&rendition.quality))
                 .map_err(|error| format!("failed to create the work directory: {error}"))?;
         }
@@ -664,7 +669,7 @@ fn run_encoder(
         let args = ffmpeg::build_command(
             &context.settings,
             context.input_url(),
-            context.renditions(),
+            &renditions,
             &run_dir,
             offset_ms,
         );
@@ -673,7 +678,7 @@ fn run_encoder(
             context.channel_id()
         );
         let mut process = Ffmpeg::spawn(&args, context.channel_id())?;
-        let mut run = RunState::new(run_dir.clone());
+        let mut run = RunState::new(run_dir.clone(), renditions);
         let mut last_progress = Instant::now();
 
         loop {
@@ -703,6 +708,8 @@ fn run_encoder(
                             &channel_stop,
                             last_progress.elapsed(),
                         )?;
+                        // 次の入力は別の解像度で届くかもしれないので、copy から試し直す
+                        fallback.clear();
                         continue 'restart_input;
                     }
                 }
@@ -716,6 +723,19 @@ fn run_encoder(
                         &stop,
                         &channel_stop,
                     )?;
+                    continue 'restart_input;
+                }
+                Err(SegmentError::CopyResolutionMismatch { quality, message }) => {
+                    reject_input(
+                        context,
+                        &mut process,
+                        &mut run,
+                        &format!("{message}; falling back to encode"),
+                        &pending,
+                        &stop,
+                        &channel_stop,
+                    )?;
+                    fallback.insert(quality);
                     continue 'restart_input;
                 }
                 Err(SegmentError::Fatal(message)) => return Err(message),
@@ -738,9 +758,24 @@ fn run_encoder(
                 )?;
                 continue 'restart_input;
             }
+            Err(SegmentError::CopyResolutionMismatch { quality, message }) => {
+                reject_input(
+                    context,
+                    &mut process,
+                    &mut run,
+                    &format!("{message}; falling back to encode"),
+                    &pending,
+                    &stop,
+                    &channel_stop,
+                )?;
+                fallback.insert(quality);
+                continue 'restart_input;
+            }
             Err(SegmentError::Fatal(message)) => return Err(message),
         }
         run.discard_incomplete(context)?;
+        // 入力が終わったので、次の入力は copy から試し直す
+        fallback.clear();
 
         if run.produced == 0 {
             restart_delay = (restart_delay * 2).min(RESTART_MAX);
@@ -751,6 +786,23 @@ fn run_encoder(
         sleep_interruptible(restart_delay, &stop, &channel_stop);
     }
     Ok(())
+}
+
+/// fallback に含まれる copy の quality を encode に置き換えた rendition を返す
+fn effective_renditions(
+    renditions: &[RenditionSettings],
+    fallback: &BTreeSet<String>,
+) -> Vec<RenditionSettings> {
+    renditions
+        .iter()
+        .map(|rendition| {
+            if rendition.mode == RenditionMode::Copy && fallback.contains(&rendition.quality) {
+                rendition.as_encode_fallback()
+            } else {
+                rendition.clone()
+            }
+        })
+        .collect()
 }
 
 /// 不正な入力を拒否し、channel を維持したまま ffmpeg を起動し直せる状態にする
@@ -815,6 +867,8 @@ fn wait_for_pending_sets(pending: &AtomicU64, stop: &AtomicBool, channel_stop: &
 /// ffmpeg を 1 回起動して作られたセグメントの状態
 struct RunState {
     run_dir: PathBuf,
+    /// この実行で使う rendition。copy から encode に切り替えた quality を含む
+    renditions: Vec<RenditionSettings>,
     /// セグメント番号 -> quality -> ファイル
     files: BTreeMap<u64, BTreeMap<String, PathBuf>>,
     /// 送信側へ渡したセグメント番号
@@ -826,9 +880,10 @@ struct RunState {
 }
 
 impl RunState {
-    fn new(run_dir: PathBuf) -> Self {
+    fn new(run_dir: PathBuf, renditions: Vec<RenditionSettings>) -> Self {
         Self {
             run_dir,
+            renditions,
             files: BTreeMap::new(),
             sent: BTreeSet::new(),
             checked: BTreeSet::new(),
@@ -846,11 +901,11 @@ fn collect_segments(
     credentials: &CredentialsUpdater,
 ) -> Result<(), SegmentError> {
     check_copy_segment_durations(context, run).map_err(SegmentError::Fatal)?;
-    read_files(context, run).map_err(SegmentError::Fatal)?;
+    read_files(run).map_err(SegmentError::Fatal)?;
 
-    while let Some(index) = next_complete_index(context, run) {
-        let files = context
-            .renditions()
+    while let Some(index) = next_complete_index(run) {
+        let files = run
+            .renditions
             .iter()
             .filter_map(|rendition| {
                 run.files
@@ -864,12 +919,12 @@ fn collect_segments(
             .collect::<Vec<_>>();
 
         // 拒否したセットは送らずに削除し、残りの未完成セットは呼び出し側で捨てる
-        if let Err(message) = validate_set(context, &files, run.produced == 0) {
+        if let Err(error) = validate_set(context, &run.renditions, &files, run.produced == 0) {
             let _ = run.files.remove(&index);
             for file in &files {
                 let _ = fs::remove_file(&file.path);
             }
-            return Err(SegmentError::Rejected(message));
+            return Err(error);
         }
 
         let identifier = new_identifier().map_err(SegmentError::Fatal)?;
@@ -907,7 +962,7 @@ fn check_copy_segment_durations(
     context: &ChannelContext,
     run: &mut RunState,
 ) -> Result<(), String> {
-    for rendition in context.renditions() {
+    for rendition in &run.renditions {
         if rendition.mode != RenditionMode::Copy {
             continue;
         }
@@ -943,8 +998,8 @@ fn check_copy_segment_durations(
 }
 
 /// 作業ディレクトリにあるセグメントファイルを探す
-fn read_files(context: &ChannelContext, run: &mut RunState) -> Result<(), String> {
-    for rendition in context.renditions() {
+fn read_files(run: &mut RunState) -> Result<(), String> {
+    for rendition in &run.renditions {
         let dir = run.run_dir.join(&rendition.quality);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -975,10 +1030,10 @@ fn read_files(context: &ChannelContext, run: &mut RunState) -> Result<(), String
 }
 
 /// 全 rendition が揃った最小のセグメント番号を返す
-fn next_complete_index(context: &ChannelContext, run: &RunState) -> Option<u64> {
+fn next_complete_index(run: &RunState) -> Option<u64> {
     run.files.iter().find_map(|(index, qualities)| {
-        let complete = context
-            .renditions()
+        let complete = run
+            .renditions
             .iter()
             .all(|rendition| qualities.contains_key(&rendition.quality));
         complete.then_some(*index)
@@ -993,27 +1048,28 @@ fn parse_segment_index(name: &str) -> Option<u64> {
 /// 完成したセットが入力の前提を満たすか確かめる
 ///
 /// 音声はそのままコピーするため AAC に限る。copy の映像は H.264 で、
-/// 設定した解像度と一致しなければならない。
+/// 設定した解像度と一致しなければならない。解像度だけが違う場合は、
+/// 呼び出し側が encode に切り替えられるよう区別して返す。
 fn validate_set(
     context: &ChannelContext,
+    renditions: &[RenditionSettings],
     files: &[SegmentFile],
     first_set: bool,
-) -> Result<(), String> {
+) -> Result<(), SegmentError> {
     for file in files {
-        let rendition = context
-            .renditions()
+        let rendition = renditions
             .iter()
             .find(|rendition| rendition.quality == file.quality)
-            .ok_or_else(|| format!("unknown quality: {}", file.quality))?;
-        let streams = ffmpeg::probe_streams(&file.path)?;
+            .ok_or_else(|| SegmentError::Rejected(format!("unknown quality: {}", file.quality)))?;
+        let streams = ffmpeg::probe_streams(&file.path).map_err(SegmentError::Rejected)?;
 
         // 音声はそのままコピーするので、aac 以外は再生できない
         for stream in streams.iter().filter(|stream| stream.codec_type == "audio") {
             if stream.codec_name != "aac" {
-                return Err(format!(
+                return Err(SegmentError::Rejected(format!(
                     "audio codec must be aac but is {}: quality {}",
                     stream.codec_name, file.quality
-                ));
+                )));
             }
         }
 
@@ -1021,22 +1077,30 @@ fn validate_set(
             let video = streams
                 .iter()
                 .find(|stream| stream.codec_type == "video")
-                .ok_or_else(|| format!("video stream is missing: quality {}", file.quality))?;
+                .ok_or_else(|| {
+                    SegmentError::Rejected(format!(
+                        "video stream is missing: quality {}",
+                        file.quality
+                    ))
+                })?;
             if video.codec_name != "h264" {
-                return Err(format!(
+                return Err(SegmentError::Rejected(format!(
                     "copied video codec must be h264 but is {}: quality {}",
                     video.codec_name, file.quality
-                ));
+                )));
             }
             let resolution = rendition.resolution;
             if video.width != Some(resolution.width) || video.height != Some(resolution.height) {
-                return Err(format!(
-                    "copied video resolution must be {} but is {}x{}: quality {}",
-                    resolution.text(),
-                    video.width.unwrap_or(0),
-                    video.height.unwrap_or(0),
-                    file.quality
-                ));
+                return Err(SegmentError::CopyResolutionMismatch {
+                    quality: file.quality.clone(),
+                    message: format!(
+                        "copied video resolution must be {} but is {}x{}: quality {}",
+                        resolution.text(),
+                        video.width.unwrap_or(0),
+                        video.height.unwrap_or(0),
+                        file.quality
+                    ),
+                });
             }
             if first_set
                 && let Some(field_order) = &video.field_order
@@ -1503,22 +1567,10 @@ mod tests {
 
     #[test]
     fn identifies_complete_segments() {
-        let context = ChannelContext {
-            input_index: 0,
-            settings: Arc::new(PublisherSettings {
-                inputs: vec![InputSettings {
-                    channel_id: "1A".to_owned(),
-                    input_url: "srt://0.0.0.0:9101?mode=listener".to_owned(),
-                    live_url: None,
-                    key_uri: None,
-                    renditions: vec![rendition("1080p"), rendition("720p")],
-                }],
-                ..settings()
-            }),
-            key: [0u8; 16],
-            work_dir: PathBuf::from("/tmp"),
-        };
-        let mut run = RunState::new(PathBuf::from("/tmp/run-1"));
+        let mut run = RunState::new(
+            PathBuf::from("/tmp/run-1"),
+            vec![rendition("1080p"), rendition("720p")],
+        );
         run.files
             .entry(0)
             .or_default()
@@ -1531,6 +1583,23 @@ mod tests {
             .entry(1)
             .or_default()
             .insert("720p".to_owned(), PathBuf::from("1.ts"));
-        assert_eq!(next_complete_index(&context, &run), Some(1));
+        assert_eq!(next_complete_index(&run), Some(1));
+    }
+
+    #[test]
+    fn replaces_only_fallback_copy_renditions_with_encode() {
+        let renditions = vec![rendition("1080p"), rendition("720p")];
+        let fallback = BTreeSet::from(["1080p".to_owned()]);
+        let effective = effective_renditions(&renditions, &fallback);
+        assert_eq!(effective[0].mode, RenditionMode::Encode);
+        assert_eq!(effective[0].video_bitrate, Some(12_000_000));
+        assert_eq!(effective[1].mode, RenditionMode::Copy);
+
+        let effective = effective_renditions(&renditions, &BTreeSet::new());
+        assert!(
+            effective
+                .iter()
+                .all(|rendition| rendition.mode == RenditionMode::Copy)
+        );
     }
 }

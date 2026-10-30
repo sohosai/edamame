@@ -199,8 +199,22 @@ pub struct RenditionSettings {
     pub resolution: Resolution,
     /// controller へ宣言するビットレート
     pub bandwidth: u64,
-    /// エンコーダの目標ビットレート。mode が copy のときは指定しない
+    /// エンコーダの目標ビットレート。
+    /// mode が copy のときは任意で、入力の解像度が合わずに encode へ切り替えたときに使う
     pub video_bitrate: Option<u64>,
+}
+
+impl RenditionSettings {
+    /// copy の入力が設定と合わないときに代わりに使う encode の設定を返す。
+    /// video_bitrate がなければ bandwidth を目標ビットレートにする
+    #[must_use]
+    pub fn as_encode_fallback(&self) -> Self {
+        Self {
+            mode: RenditionMode::Encode,
+            video_bitrate: Some(self.video_bitrate.unwrap_or(self.bandwidth)),
+            ..self.clone()
+        }
+    }
 }
 
 /// rendition の作り方
@@ -410,9 +424,9 @@ impl PublisherSettings {
                 }
                 match rendition.mode {
                     RenditionMode::Copy => {
-                        if rendition.video_bitrate.is_some() {
+                        if rendition.video_bitrate == Some(0) {
                             return Err(format!(
-                                "video_bitrate must not be set when mode is copy: channel {} quality {}",
+                                "video_bitrate must be positive when set: channel {} quality {}",
                                 input.channel_id, rendition.quality
                             ));
                         }
@@ -607,10 +621,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_video_bitrate_for_copy() {
+    fn accepts_positive_video_bitrate_for_copy() {
         let mut target = settings();
         target.inputs[0].renditions[0].video_bitrate = Some(1_000_000);
+        target.validate().unwrap();
+        target.inputs[0].renditions[0].video_bitrate = Some(0);
         assert!(target.validate().is_err());
+    }
+
+    #[test]
+    fn builds_encode_fallback_for_copy() {
+        let mut rendition = settings().inputs[0].renditions[0].clone();
+        let fallback = rendition.as_encode_fallback();
+        assert_eq!(fallback.mode, RenditionMode::Encode);
+        assert_eq!(fallback.video_bitrate, Some(12_000_000));
+        assert_eq!(fallback.resolution, rendition.resolution);
+
+        rendition.video_bitrate = Some(8_000_000);
+        assert_eq!(
+            rendition.as_encode_fallback().video_bitrate,
+            Some(8_000_000)
+        );
     }
 
     #[test]
