@@ -1,5 +1,6 @@
 //! peer の生存確認と leader の選出
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -340,7 +341,8 @@ impl ClusterState {
     }
 }
 
-/// 直接疎通から 3 秒未満の peer と自分の中で、metric、URL の順に最大の機体を選ぶ。
+/// 直接疎通から 3 秒未満の peer と自分の中で、metric が最小の機体を選ぶ。
+/// metric が同じ場合は URL が最大の機体を選ぶ。
 fn select_leader<'a>(
     own_url: &'a str,
     metric: u32,
@@ -350,8 +352,8 @@ fn select_leader<'a>(
     peers
         .into_iter()
         .filter(|(_, _, last)| last.is_some_and(|last| now.duration_since(last) < MEMBER_TIMEOUT))
-        .map(|(url, metric, _)| (metric, url))
-        .chain(std::iter::once((metric, own_url)))
+        .map(|(url, metric, _)| (Reverse(metric), url))
+        .chain(std::iter::once((Reverse(metric), own_url)))
         .max()
         .expect("self is always alive")
         .1
@@ -374,7 +376,7 @@ mod tests {
             external_min_percent: 1,
             cors_origin: vec![],
             public_url: "http://a.test".to_owned(),
-            metric: 10,
+            metric: 50,
             auth_token: "token".to_owned(),
             seed: vec![],
             tls_cert: None,
@@ -460,17 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn selects_largest_live_metric_at_timeout_boundary() {
+    fn selects_smallest_live_metric_at_timeout_boundary() {
         let now = Instant::now();
         // 3 秒未満の応答だけを生存とし、未接触の peer は選ばない。
         for (age, expected) in [(2999, "http://b"), (3000, "http://a"), (3001, "http://a")] {
             assert_eq!(
                 select_leader(
                     "http://a",
-                    1,
+                    9,
                     [
                         ("http://b", 2, Some(now - Duration::from_millis(age))),
-                        ("http://c", 9, None)
+                        ("http://c", 1, None)
                     ],
                     now
                 ),
@@ -483,7 +485,7 @@ mod tests {
     fn selects_self_and_breaks_ties_by_public_url() {
         let now = Instant::now();
         assert_eq!(
-            select_leader("http://a", 3, [("http://b", 2, Some(now))], now),
+            select_leader("http://a", 1, [("http://b", 2, Some(now))], now),
             "http://a"
         );
         assert_eq!(

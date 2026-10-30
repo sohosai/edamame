@@ -9,7 +9,7 @@
 ```bash
 cargo run --locked -p edamame-controller -- \
   --bind 127.0.0.1:9000 --public-url http://127.0.0.1:9000 \
-  --metric 20 --seed http://127.0.0.1:9002 \
+  --metric 10 --seed http://127.0.0.1:9002 \
   --storage-capacity 512MiB --playlist-segments 6 \
   --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
   --auth-token example-token --cors-origin '*'
@@ -18,7 +18,7 @@ cargo run --locked -p edamame-controller -- \
 ```bash
 cargo run --locked -p edamame-controller -- \
   --bind 127.0.0.1:9002 --public-url http://127.0.0.1:9002 \
-  --metric 10 --seed http://127.0.0.1:9000 \
+  --metric 20 --seed http://127.0.0.1:9000 \
   --storage-capacity 512MiB --playlist-segments 6 \
   --sync-interval-ms 1000 --sync-timeout-ms 10000 --publish-wait-ms 2000 \
   --auth-token example-token --cors-origin '*'
@@ -29,7 +29,7 @@ curl --fail --show-error http://127.0.0.1:9000/internal/cluster/health
 curl --fail --show-error http://127.0.0.1:9002/internal/cluster/health
 ```
 
-選出が完了すると metric `20` の機体が leader、`10` の機体が follower になる。
+選出が完了すると metric `10` の機体が leader、`20` の機体が follower になる。
 この構成は状態を複製しないため、冗長化しても無停止の配信やデータの保持を保証しない。
 
 本番運用での DNS と接続先の設定、および障害時の注意点は次のとおりである。
@@ -76,8 +76,8 @@ heartbeat の送受信で既知の member を交換し、発見した URL にも
 
 ## leader の判定
 
-自分と生存している member の中で、`(metric, public_url)` が最大のものを leader にする。
-metric は u32 で、大きい値を優先する。
+自分と生存している member の中で、metric が最小のものを leader にする。
+metric は u32 で、小さい値を優先する。publisher の `[[controller]]` の metric と同じ向きである。
 省略時は `100`、明示的に指定できる範囲は `0` 以上 `4294967295` 以下とする。
 metric が同じ場合は、正規化後の public URL の文字列を比較して大きい方を選ぶ。
 各 controller は同じ URL を自分と同じインスタンスとして扱うため、public URL を共有しない。
@@ -87,7 +87,7 @@ cluster の起動直後は follower とし、最初の heartbeat の送信が 1 
 接触先が空なら追加の待ち時間は設けず、最初の選出で自分を leader にする。
 seed がすべて停止していても、初回の送信が完了すれば自分を leader にできる。
 
-上位機が停止すると、その member の最終成功から 3 秒以上経過した後の判定で、生存している最大の metric の機体が leader になる。
+上位機が停止すると、その member の最終成功から 3 秒以上経過した後の判定で、生存している最小の metric の機体が leader になる。
 上位機が復帰すると再び上位機を leader にする。
 障害検知と通信の時間があるため、切り替えの所要時間は正確に 3 秒とは限らない。
 
@@ -148,4 +148,4 @@ quorum と fencing は使わない。
 二重 leader の間に受け付けた PUT は、降格時に破棄される可能性がある。
 切り替え直前に旧 leader へ送った PUT も、新 leader に複製されない。
 成功した PUT を交代後も保持する保証や、全リクエストで共通の採番を続ける保証はない。
-通信が回復すれば最大の metric の機体へ戻るが、分断中の状態は統合しない。
+通信が回復すれば最小の metric の機体へ戻るが、分断中の状態は統合しない。

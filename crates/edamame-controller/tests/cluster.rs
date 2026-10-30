@@ -45,7 +45,7 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
     wait_for_role(&client, &low_url, "leader", &low_url).await;
     assert_eq!(publish(&client, &low_url, "before-0", "old-0").await, 0);
     assert_eq!(publish(&client, &low_url, "before-1", "old-1").await, 1);
-    let mut high = spawn_cluster_process(high_addr, 200, std::slice::from_ref(&low_url), "").await;
+    let mut high = spawn_cluster_process(high_addr, 50, std::slice::from_ref(&low_url), "").await;
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     let health: Value = client
@@ -224,7 +224,7 @@ async fn forwards_requests_and_discards_state_on_failover_and_failback() {
     wait_for_playlist(&following, &playlist_url).await;
 
     // 上位機の復帰で戻し、直前の採番と worker のキャッシュが失われる。
-    let mut high = spawn_cluster_process(high_addr, 200, std::slice::from_ref(&low_url), "").await;
+    let mut high = spawn_cluster_process(high_addr, 50, std::slice::from_ref(&low_url), "").await;
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     let absent = following
@@ -257,9 +257,9 @@ async fn discovers_members_transitively_and_supports_url_prefixes() {
     let a_url = format!("http://{a}/a");
     let b_url = format!("http://{b}/b");
     let c_url = format!("http://{c}/c");
-    let _a = spawn_cluster_process(a, 10, std::slice::from_ref(&b_url), "/a").await;
+    let _a = spawn_cluster_process(a, 30, std::slice::from_ref(&b_url), "/a").await;
     let mut middle = spawn_cluster_process(b, 20, std::slice::from_ref(&a_url), "/b").await;
-    let _c = spawn_cluster_process(c, 30, std::slice::from_ref(&b_url), "/c").await;
+    let _c = spawn_cluster_process(c, 10, std::slice::from_ref(&b_url), "/c").await;
     wait_for_role(&client, &a_url, "follower", &c_url).await;
     wait_for_role(&client, &b_url, "follower", &c_url).await;
     wait_for_role(&client, &c_url, "leader", &c_url).await;
@@ -289,12 +289,12 @@ async fn slow_upload_does_not_block_heartbeats_or_write_after_demotion() {
     let high_addr = available_addr();
     let low_url = format!("http://{low_addr}");
     let high_url = format!("http://{high_addr}");
-    let _low = spawn_cluster_process(low_addr, 10, std::slice::from_ref(&high_url), "").await;
+    let _low = spawn_cluster_process(low_addr, 20, std::slice::from_ref(&high_url), "").await;
     wait_for_role(&client, &low_url, "leader", &low_url).await;
     let mut upload = tokio::net::TcpStream::connect(low_addr).await.unwrap();
     upload.write_all(format!("PUT /segments/live/720p/slow?duration_ms=6000&bandwidth=3000000 HTTP/1.1\r\nHost: {low_addr}\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 4\r\nConnection: close\r\n\r\na").as_bytes()).await.unwrap();
     // body を送り切る前でも、上位機を認識して降格できる必要がある。
-    let mut high = spawn_cluster_process(high_addr, 20, std::slice::from_ref(&low_url), "").await;
+    let mut high = spawn_cluster_process(high_addr, 10, std::slice::from_ref(&low_url), "").await;
     wait_for_role(&client, &low_url, "follower", &high_url).await;
     wait_for_role(&client, &high_url, "leader", &high_url).await;
     upload.write_all(b"bcd").await.unwrap();
