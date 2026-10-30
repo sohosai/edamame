@@ -37,6 +37,7 @@ curl --fail --show-error http://127.0.0.1:9002/internal/cluster/health
 - 共有名（例：`controller.example.test:9000`）を DNS ラウンドロビンで複数の A レコードに対応させ、全機で待ち受けポートと API のパスをそろえる
 - 各機の `--public-url` と `--seed` には共有名ではなく機体固有の名前を使う
 - worker と publisher の `--controller-url`、client のプレイリスト URL は共有名に向ける（GET と sync の `307` に追従でき、転送先の固有 URL にも到達できることが必要になる）
+- 共有名を用意しない場合は、worker の `--controller-url` と publisher の `[[controller]]` に各機の固有 URL を複数指定する
 - 停止した機体の A レコードは削除する。
   TTL を短くしても既存の DNS キャッシュと TCP 接続が残るため、接続失敗を再試行する
 - worker のリクエストは最大 30 秒待つ場合があり、復旧は leader の選出完了より遅れることがある。

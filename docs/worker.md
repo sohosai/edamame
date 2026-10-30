@@ -12,6 +12,8 @@ worker は controller からセグメントファイルを取得し、メモリ�
 - controller と同じ認証トークンを用意し、worker ごとに異なる `--worker-id` を指定すること
 
 `--controller-url` には `http` または `https` の絶対 URL を指定できる。
+カンマ区切りと繰り返しで複数指定でき、先頭の URL から使い、登録や同期に失敗したら次の URL へ切り替える。
+follower は leader へ転送するため、cluster 内のどの controller を指定しても同じ leader に届く。
 controller が TLS を終端する場合は `https` を使い、worker がその証明書を検証できる root CA を用意する。
 leader へのリダイレクトでも `https` に追従できる。
 worker 自身の TLS 設定は client 向けの通信に適用され、controller への接続には影響しない。
@@ -50,7 +52,7 @@ controller より先に起動しても、登録に成功するまで再試行す
 | `--worker-id` | `EDAMAME_WORKER_ID` | 必須 | なし | 登録する識別子。`[A-Za-z0-9_-]` の 1〜64 文字 |
 | `--bind` | `EDAMAME_BIND` | 必須 | なし | HTTP または TLS の待ち受け IP アドレスとポート |
 | `--public-url` | `EDAMAME_PUBLIC_URL` | 必須 | なし | client 向けの `http` / `https` 絶対 URL。TLS / ACME 指定時は `https` が必須 |
-| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | なし | worker から接続する `http` / `https` の絶対 URL |
+| `--controller-url` | `EDAMAME_CONTROLLER_URL` | 必須 | なし | worker から接続する `http` / `https` の絶対 URL。カンマ区切りと繰り返しで複数指定でき、失敗時に次の URL へ切り替える |
 | `--cache-limit` | `EDAMAME_CACHE_LIMIT` | 必須 | なし | `(channel_id, quality)` ごとの保持件数。1 以上の整数で、実行環境の `usize` に収まる値 |
 | `--weight` | `EDAMAME_WEIGHT` | 任意 | `1` | 配信先に選ぶ回数の相対的な重み。1〜4294967295 の整数 |
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | CLI では任意、controller への登録には必須 | なし | controller と同じ Bearer トークン。空白と制御文字を除く表示可能 ASCII。登録の PUT にだけ付ける |
@@ -72,7 +74,7 @@ controller より先に起動しても、登録に成功するまで再試行す
 worker は起動後に登録し、その後は同期を繰り返す。
 
 1. `PUT /workers/{worker_id}` で公開 URL と weight を登録する。
-   失敗した場合はログを出し、1 秒待って再試行する。
+   失敗した場合はログを出し、次の controller へ切り替えて 1 秒後に再試行する。
    トークンの省略や不一致による `401` でも終了せず、再試行を続ける。
 2. 登録に成功すると手元のキャッシュをすべて捨て、レスポンスの `sync_interval_ms` を同期の待ち時間として設定する。
 3. `POST /workers/{worker_id}/sync` にキャッシュ済みと取得中の一覧を送り、`fetch_segments` で不足分の取得指示を受ける。
@@ -89,10 +91,12 @@ controller 側の公開条件は [controller の公開範囲の決定](./control
 - 取得バッチは同時に 1 つだけ実行し、バッチ内のセグメントを順番に GET する。
   取得中も同期は続けるが、新しい取得指示に着手するのは実行中のバッチが終わった後である
 - 登録、同期、セグメント取得の HTTP リクエストには、それぞれ 30 秒のタイムアウトを設定する。
-  遅い取得があると後続のセグメントも待つため、同期できていてもキャッシュが最新とは限らない
+  遅い取得があると後続のセグメントも待つため、同期できていてもキャッシュが最新とは限らない。
+  接続の確立は 2 秒で打ち切り、停止した controller を早く見切る
 - セグメントの取得や読み取りに失敗した場合はログを出し、そのバッチの次のセグメントへ進む。
   失敗した分は、後続の同期で再び取得を指示された場合に取り直す
-- 同期の通信失敗や `404` 以外のエラーではキャッシュを保持し、待ち時間の後に同期を再試行する
+- 同期の通信失敗や `404` 以外のエラーではキャッシュを保持し、次の controller へ切り替えて待ち時間の後に同期を再試行する。
+  切り替え先でも登録は leader が保持しているため、再登録しない
 - 同期で `404` を受け取ると、取得中のタスクを止めて再登録する。
   キャッシュ全体を捨てるのは再登録に成功した時点であり、登録に失敗している間は既存キャッシュの配信を続ける
 - controller の再起動や leader 交代による採番リセットでも、この再登録と取り直しで追従する（交代時の状態消失と接続失敗の制約は [controller の冗長化](./cluster.md) を参照する）

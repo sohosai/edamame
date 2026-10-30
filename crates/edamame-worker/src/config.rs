@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use edamame_domain::{CorsOrigins, EdamameError, validate_auth_token, validate_identifier};
+use edamame_domain::{
+    CorsOrigins, EdamameError, normalize_public_url, validate_auth_token, validate_identifier,
+};
 
 pub use edamame_tls::TlsMode;
 
@@ -24,9 +26,16 @@ pub struct WorkerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL")]
     pub public_url: String,
 
-    /// controller の接続先。http または https の絶対 URL を指定する
-    #[arg(long, env = "EDAMAME_CONTROLLER_URL")]
-    pub controller_url: String,
+    /// controller の接続先。http または https の絶対 URL を指定する。
+    /// カンマ区切りと繰り返しを許可し、接続に失敗したら次の URL へ切り替える
+    #[arg(
+        long,
+        env = "EDAMAME_CONTROLLER_URL",
+        value_delimiter = ',',
+        required = true,
+        value_parser = normalize_public_url
+    )]
+    pub controller_url: Vec<String>,
 
     /// (channel_id, quality) ごとのキャッシュ上限
     #[arg(long, env = "EDAMAME_CACHE_LIMIT")]
@@ -97,6 +106,11 @@ impl WorkerConfig {
                 "weight must be positive".to_owned(),
             ));
         }
+        if self.controller_url.is_empty() {
+            return Err(EdamameError::BadRequest(
+                "controller URL is required".to_owned(),
+            ));
+        }
         self.tls_mode()?;
         Ok(())
     }
@@ -118,6 +132,18 @@ impl WorkerConfig {
     pub fn cors_origins(&self) -> Result<CorsOrigins, EdamameError> {
         CorsOrigins::parse(&self.cors_origin)
     }
+
+    /// 重複を除いた controller の URL を、指定した順に返す
+    #[must_use]
+    pub fn controller_urls(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        for url in &self.controller_url {
+            if !urls.contains(url) {
+                urls.push(url.clone());
+            }
+        }
+        urls
+    }
 }
 
 #[cfg(test)]
@@ -133,7 +159,7 @@ mod tests {
             worker_id: "worker-a".to_owned(),
             bind: "127.0.0.1:9001".parse().unwrap(),
             public_url: "http://127.0.0.1:9001".to_owned(),
-            controller_url: "http://127.0.0.1:9000".to_owned(),
+            controller_url: vec!["http://127.0.0.1:9000".to_owned()],
             cache_limit: 12,
             tls_cert: None,
             tls_key: None,
@@ -164,6 +190,56 @@ mod tests {
         let mut config = config();
         config.weight = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_controller_url() {
+        let mut config = config();
+        config.controller_url = Vec::new();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn deduplicates_controller_urls_in_order() {
+        let mut config = config();
+        config.controller_url = vec![
+            "https://b.test".to_owned(),
+            "https://a.test".to_owned(),
+            "https://b.test".to_owned(),
+        ];
+        assert_eq!(
+            config.controller_urls(),
+            vec!["https://b.test".to_owned(), "https://a.test".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_multiple_controller_urls() {
+        // カンマ区切りと繰り返しを受け付け、末尾の `/` を取り除く
+        let config = WorkerConfig::try_parse_from([
+            "edamame-worker",
+            "--worker-id",
+            "worker-a",
+            "--bind",
+            "127.0.0.1:9001",
+            "--public-url",
+            "http://127.0.0.1:9001",
+            "--cache-limit",
+            "12",
+            "--controller-url",
+            "https://a.test/,https://b.test",
+            "--controller-url",
+            "https://c.test",
+        ])
+        .unwrap();
+        assert_eq!(
+            config.controller_url,
+            vec![
+                "https://a.test".to_owned(),
+                "https://b.test".to_owned(),
+                "https://c.test".to_owned(),
+            ]
+        );
     }
 
     #[test]

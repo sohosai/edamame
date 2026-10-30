@@ -26,7 +26,7 @@ async fn health_is_available_at_root_and_path_prefix() {
     let addr = listener.local_addr().unwrap();
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         "http://127.0.0.1:9001/base".to_owned(),
         1,
         Cache::new(12).unwrap(),
@@ -55,7 +55,7 @@ async fn serves_segments_under_public_url_path_prefix() {
     let addr = listener.local_addr().unwrap();
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         "http://127.0.0.1:9001/base".to_owned(),
         1,
         cache,
@@ -88,7 +88,7 @@ async fn missing_segment_returns_404() {
     let addr = listener.local_addr().unwrap();
     let state = WorkerState::new(
         "worker-a".to_owned(),
-        "http://127.0.0.1:9000".to_owned(),
+        vec!["http://127.0.0.1:9000".to_owned()],
         format!("http://{addr}"),
         1,
         cache,
@@ -115,7 +115,7 @@ async fn serves_segments_under_path_prefix_with_route_characters() {
         let addr = listener.local_addr().unwrap();
         let state = WorkerState::new(
             "worker-a".to_owned(),
-            "http://127.0.0.1:9000".to_owned(),
+            vec!["http://127.0.0.1:9000".to_owned()],
             format!("http://{addr}{path}"),
             1,
             cache,
