@@ -127,9 +127,9 @@ video_bitrate = 3000000
 | `input.key_uri` | 任意。鍵を取得する HTTP または HTTPS の絶対 URL。通常の HLS プレイヤーで再生する場合は必要 |
 | `input.rendition.quality` | 必須。quality の識別子。同じ channel 内で重複不可。`master` は使用不可 |
 | `input.rendition.mode` | 任意。省略時は `encode`。`copy` は映像を再エンコードしない。音声はどちらもコピーする |
-| `input.rendition.resolution` | 必須。`WIDTHxHEIGHT`。幅と高さはそれぞれ 2 以上の偶数。encode はこの解像度へ変換し、copy は入力との一致を検証する |
+| `input.rendition.resolution` | 必須。`WIDTHxHEIGHT`。幅と高さはそれぞれ 2 以上の偶数。encode はこの解像度へ変換する。copy は入力と一致しなければ、この解像度へ encode に切り替える |
 | `input.rendition.bandwidth` | 必須。正の整数。controller へ宣言する bit/s。音声と多重化を含めて見積もる |
-| `input.rendition.video_bitrate` | encode の場合は正の整数が必須。copy の場合は指定不可 |
+| `input.rendition.video_bitrate` | encode の場合は正の整数が必須。copy の場合は任意の正の整数で、入力の解像度が合わずに encode へ切り替えたときの目標ビットレートに使う。省略すると `bandwidth` を使う |
 
 RTMP の `input_url` は、ホストだけを書くとチャンネルごとの既定ポートと `/live/<channel_id>` を補う。
 
@@ -255,7 +255,13 @@ publisher が新しいセグメントを送らなくなって猶予を超える�
 copy では映像の H.264 と解像度も検証する。
 条件を満たさないセットは controller へ送らずに捨て、ffmpeg を起動し直して次の入力を待つ。
 channel と publisher は止めない。
-送信側は接続を切られるため、解像度や音声を直して再接続する。
+送信側は接続を切られるため、音声などを直して再接続する。
+
+copy の映像の解像度だけが `resolution` と違う場合は、その quality を encode に切り替えて ffmpeg を起動し直す。
+切り替え後は入力を `resolution` へ変換し、`video_bitrate`（省略時は `bandwidth`）を目標ビットレートにする。
+送信側は接続を 1 回切られるため、再接続すると設定の解像度で配信が続く。
+controller へ宣言する `resolution` と `bandwidth` は設定値のままである。
+入力が終わるか止まって ffmpeg を起動し直すと、次の入力は再び copy で試す。
 copy の入力がインターレースの場合は、ffmpeg の実行ごとの最初のセットで警告を出す。
 
 確定したセグメント長が設定値から 100 ms を超えてずれる場合も警告を出す。
@@ -307,7 +313,7 @@ ffprobe plain.ts
 | 鍵登録時の 400、401 | ログを出して登録を打ち切る。セグメントの配信は続ける |
 | 入力がないまま停止 | 登録を行わず、終了コード `0` で終了する |
 | 未送信セットが `segment_duration_ms × backlog_limit` ミリ秒を超える | セットを捨てる |
-| AAC 以外の音声、copy の前提を満たさない入力 | そのセットを捨て、送信中のセットの処理を最大 5 秒待ってから 1 秒後に ffmpeg を起動し直す。channel は止めない。他の channel は続ける |
+| AAC 以外の音声、copy の前提を満たさない入力 | 解像度だけが違う copy の入力は encode に切り替える。そのセットを捨て、送信中のセットの処理を最大 5 秒待ってから 1 秒後に ffmpeg を起動し直す。channel は止めない。他の channel は続ける |
 | SIGINT、SIGTERM | ffmpeg を停止して終了する |
 
 入力の拒否では channel は止めない。

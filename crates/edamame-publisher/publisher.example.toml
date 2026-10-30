@@ -53,6 +53,9 @@ quality = "1080p"
 mode = "copy"
 resolution = "1920x1080"
 bandwidth = 12000000
+# 入力の解像度が resolution と違うときは encode に切り替え、このビットレートで作り直す。
+# 省略すると bandwidth を使う
+video_bitrate = 10000000
 
 [[input.rendition]]
 quality = "720p"
@@ -76,6 +79,7 @@ quality = "1080p"
 mode = "copy"
 resolution = "1920x1080"
 bandwidth = 12000000
+video_bitrate = 10000000
 
 [[input.rendition]]
 quality = "720p"
@@ -99,6 +103,7 @@ quality = "1080p"
 mode = "copy"
 resolution = "1920x1080"
 bandwidth = 12000000
+video_bitrate = 10000000
 
 [[input.rendition]]
 quality = "720p"

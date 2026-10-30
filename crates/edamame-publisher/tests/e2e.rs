@@ -378,10 +378,10 @@ preset = "ultrafast"
 }
 
 #[test]
-fn recovers_after_rejecting_an_input_that_does_not_match_the_rendition() {
-    // 設定と違う解像度の入力で ffmpeg を起動し直したあと、
-    // publisher を止めずに正しい解像度で配信を再開できることを確かめる
-    let dir = TestDir::new("recover-resolution");
+fn falls_back_to_encode_when_the_copied_input_resolution_differs() {
+    // 設定と違う解像度の入力では copy から encode に切り替えて設定の解像度で配信し、
+    // その入力が終わったあとは再び copy で正しい解像度の入力を配信できることを確かめる
+    let dir = TestDir::new("fallback-resolution");
     let srt_port = free_port();
     let controller = Controller::start("test-token");
     let _worker = Worker::start(&controller.base_url, "test-token");
@@ -413,45 +413,74 @@ preset = "ultrafast"
         publisher.log()
     );
 
-    // レンディションと違う解像度を送り、入力が拒否されるのを待つ
+    // レンディションと違う解像度を送り、encode に切り替わるのを待つ
     let wrong = Sender::start(srt_port, "320x180", 30, 30, "aac", 20);
-    let rejected = publisher.wait_for_log(
-        "channel=1A rejected the input: copied video resolution must be 640x360",
+    let fell_back = publisher.wait_for_log(
+        "channel=1A rejected the input: copied video resolution must be 640x360 but is 320x180: \
+         quality main; falling back to encode",
         Duration::from_secs(30),
     );
     assert!(
-        rejected,
-        "解像度が合わない入力で 1A が拒否されません: {}",
-        publisher.log()
-    );
-    assert!(
-        !publisher.log().contains("channel=1A stopped"),
-        "解像度が合わない入力で 1A が止まりました: {}",
+        fell_back,
+        "解像度が合わない入力で 1A が encode に切り替わりません: {}",
         publisher.log()
     );
     drop(wrong);
     assert!(
-        controller.sequences("1A", "main").is_empty(),
-        "拒否した解像度のセグメントが保存されています"
-    );
-
-    // ffmpeg が起動し直したら、正しい解像度を送る
-    let restarted =
-        publisher.wait_for_log("channel=1A starting ffmpeg run=2", Duration::from_secs(10));
-    assert!(
-        restarted,
+        publisher.wait_for_log("channel=1A starting ffmpeg run=2", Duration::from_secs(10)),
         "1A の待ち受けが再開しません: {}",
         publisher.log()
     );
-    let _right = Sender::start(srt_port, "640x360", 30, 30, "aac", 120);
 
+    // 切り替え後は同じ解像度の入力を設定の解像度へ encode して配信する
+    let wrong = Sender::start(srt_port, "320x180", 30, 30, "aac", 120);
     let published = wait_for(
         || !controller.sequences("1A", "main").is_empty(),
         Duration::from_secs(40),
     );
     assert!(
         published,
+        "encode に切り替えた入力で配信が始まりません: {}",
+        publisher.log()
+    );
+    let sequence = controller.sequences("1A", "main")[0];
+    let stored = controller
+        .segment("1A", "main", sequence)
+        .expect("セグメントを読めません");
+    let plain = decrypt_segment(&publisher.key(), &"0".repeat(32), &stored);
+    let streams = probe_streams(dir.path(), &plain);
+    assert!(
+        streams.contains("h264") && streams.contains("640,360"),
+        "encode に切り替えたセグメントが設定の解像度になっていません: {streams}"
+    );
+
+    // 入力が終わったら copy に戻し、正しい解像度の入力をそのまま配信する
+    drop(wrong);
+    assert!(
+        publisher.wait_for_log("channel=1A starting ffmpeg run=3", Duration::from_secs(60)),
+        "入力が終わったあとに 1A の待ち受けが再開しません: {}",
+        publisher.log()
+    );
+    let before = controller.sequences("1A", "main").len();
+    let _right = Sender::start(srt_port, "640x360", 30, 30, "aac", 120);
+    let published = wait_for(
+        || controller.sequences("1A", "main").len() > before,
+        Duration::from_secs(40),
+    );
+    assert!(
+        published,
         "正しい解像度の入力で配信が再開しません: {}",
+        publisher.log()
+    );
+    assert_eq!(
+        publisher.log().matches("falling back to encode").count(),
+        1,
+        "正しい解像度の入力でも encode に切り替わりました: {}",
+        publisher.log()
+    );
+    assert!(
+        !publisher.log().contains("channel=1A stopped"),
+        "1A が止まりました: {}",
         publisher.log()
     );
     assert!(publisher.is_running(), "publisher が終了しました");
@@ -461,9 +490,9 @@ preset = "ultrafast"
 }
 
 #[test]
-fn publishes_after_rejecting_an_rtmp_input_that_does_not_match_the_rendition() {
-    // RTMP で解像度が合わない入力を拒否したあとも、正しい入力で publish できることを確かめる
-    let dir = TestDir::new("recover-rtmp-resolution");
+fn falls_back_to_encode_when_the_copied_rtmp_input_resolution_differs() {
+    // RTMP でも、解像度が合わない入力を encode に切り替えて配信できることを確かめる
+    let dir = TestDir::new("fallback-rtmp-resolution");
     let rtmp_port = free_port();
     let controller = Controller::start("test-token");
     let _worker = Worker::start(&controller.base_url, "test-token");
@@ -487,6 +516,7 @@ quality = "main"
 mode = "copy"
 resolution = "640x360"
 bandwidth = 12000000
+video_bitrate = 2000000
 "#
         ),
     );
@@ -504,42 +534,66 @@ bandwidth = 12000000
     );
 
     let wrong = Sender::start_rtmp(rtmp_port, "1B", "320x180", 30, 30, "aac", 20);
-    let rejected = publisher.wait_for_log(
-        "channel=1B rejected the input: copied video resolution must be 640x360",
+    let fell_back = publisher.wait_for_log(
+        "channel=1B rejected the input: copied video resolution must be 640x360 but is 320x180: \
+         quality main; falling back to encode",
         Duration::from_secs(30),
     );
     assert!(
-        rejected,
-        "RTMP の解像度が合わない入力で 1B が拒否されません: {}",
-        publisher.log()
-    );
-    assert!(
-        !publisher.log().contains("channel=1B stopped"),
-        "RTMP の解像度が合わない入力で 1B が止まりました: {}",
+        fell_back,
+        "RTMP の解像度が合わない入力で 1B が encode に切り替わりません: {}",
         publisher.log()
     );
     drop(wrong);
     assert!(
-        controller.sequences("1B", "main").is_empty(),
-        "拒否した解像度のセグメントが保存されています"
-    );
-
-    let restarted =
-        publisher.wait_for_log("channel=1B starting ffmpeg run=2", Duration::from_secs(10));
-    assert!(
-        restarted,
+        publisher.wait_for_log("channel=1B starting ffmpeg run=2", Duration::from_secs(10)),
         "1B の RTMP の待ち受けが再開しません: {}",
         publisher.log()
     );
-    let _right = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 120);
 
+    let wrong = Sender::start_rtmp(rtmp_port, "1B", "320x180", 30, 30, "aac", 120);
     let published = wait_for(
         || !controller.sequences("1B", "main").is_empty(),
         Duration::from_secs(40),
     );
     assert!(
         published,
+        "encode に切り替えた RTMP 入力で配信が始まりません: {}",
+        publisher.log()
+    );
+    let sequence = controller.sequences("1B", "main")[0];
+    let stored = controller
+        .segment("1B", "main", sequence)
+        .expect("セグメントを読めません");
+    let plain = decrypt_segment(&publisher.key(), &"0".repeat(32), &stored);
+    let streams = probe_streams(dir.path(), &plain);
+    assert!(
+        streams.contains("h264") && streams.contains("640,360"),
+        "encode に切り替えたセグメントが設定の解像度になっていません: {streams}"
+    );
+
+    // 入力が終わったら copy に戻し、正しい解像度の入力をそのまま配信する
+    drop(wrong);
+    assert!(
+        publisher.wait_for_log("channel=1B starting ffmpeg run=3", Duration::from_secs(60)),
+        "入力が終わったあとに 1B の RTMP の待ち受けが再開しません: {}",
+        publisher.log()
+    );
+    let before = controller.sequences("1B", "main").len();
+    let _right = Sender::start_rtmp(rtmp_port, "1B", "640x360", 30, 30, "aac", 120);
+    let published = wait_for(
+        || controller.sequences("1B", "main").len() > before,
+        Duration::from_secs(40),
+    );
+    assert!(
+        published,
         "正しい解像度の RTMP 入力で配信が再開しません: {}",
+        publisher.log()
+    );
+    assert_eq!(
+        publisher.log().matches("falling back to encode").count(),
+        1,
+        "正しい解像度の RTMP 入力でも encode に切り替わりました: {}",
         publisher.log()
     );
     assert!(publisher.is_running(), "publisher が終了しました");
