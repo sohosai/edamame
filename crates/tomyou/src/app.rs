@@ -103,6 +103,16 @@ fn status_badge(ui: &mut egui::Ui, text: &str, tone: Tone) {
         });
 }
 
+/// 設定ウィンドウで押された操作
+#[derive(Debug, Default)]
+struct SettingsActions {
+    close: bool,
+    load: bool,
+    save: bool,
+    open_config: bool,
+    open_log: bool,
+}
+
 /// tomyou のメイン画面
 pub struct TomyouApp {
     config: Config,
@@ -849,201 +859,219 @@ impl TomyouApp {
         if !self.show_settings {
             return;
         }
-        let mut open = self.show_settings;
-        let mut close_requested = false;
-        let mut load_requested = false;
-        let mut save_requested = false;
-        let mut open_requested = false;
-        let mut open_log_requested = false;
-        egui::Window::new("設定")
-            .open(&mut open)
-            .default_width(720.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("このアプリ").strong());
-                egui::Grid::new("settings-about")
-                    .num_columns(2)
-                    .spacing([16.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("バージョン");
-                        ui.label(format!("v{}", crate::VERSION));
-                        ui.end_row();
-                        ui.label("ログファイル");
-                        if let Some(path) = &self.log_path {
-                            ui.horizontal(|ui| {
-                                ui.monospace(path.display().to_string());
-                                if ui.button("開く").clicked() {
-                                    open_log_requested = true;
-                                }
-                            });
-                        } else {
-                            ui.label("初期化できませんでした");
-                        }
-                        ui.end_row();
+        let mut actions = SettingsActions::default();
+        let mut open = true;
+        // 設定は別のネイティブウィンドウとして開き、本体の外へ動かせるようにする
+        let viewport_id = egui::ViewportId::from_hash_of("tomyou-settings");
+        let builder = egui::ViewportBuilder::default()
+            .with_title("設定 - tomyou")
+            .with_inner_size([760.0, 720.0])
+            .with_min_inner_size([520.0, 320.0]);
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            match class {
+                egui::ViewportClass::Embedded => {
+                    // 別ウィンドウに対応しないバックエンドでは本体の中に出す
+                    egui::Window::new("設定")
+                        .open(&mut open)
+                        .default_width(720.0)
+                        .default_height(600.0)
+                        .show(ctx, |ui| {
+                            self.settings_scroll_ui(ui, &mut actions);
+                        });
+                }
+                _ => {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        self.settings_scroll_ui(ui, &mut actions);
                     });
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("設定ファイル").strong());
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.config_path_draft);
-                    if ui.button("読み込む").clicked() {
-                        load_requested = true;
-                    }
-                    if ui.button("OS のアプリで開く").clicked() {
-                        open_requested = true;
-                    }
-                });
-                ui.label(
-                    "保存もこのパスへ書き込みます。空欄の場合は現在の設定ファイルを使います。",
-                );
-                ui.label("ファイルが無い場合は、現在の設定を保存してから開きます。");
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("接続").strong());
-                egui::Grid::new("settings-connection")
-                    .num_columns(2)
-                    .spacing([16.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("チャンネル");
-                        egui::ComboBox::from_id_salt("channel")
-                            .selected_text(&self.config.channel_id)
-                            .show_ui(ui, |ui| {
-                                for channel in CHANNELS {
-                                    ui.selectable_value(
-                                        &mut self.config.channel_id,
-                                        channel.to_owned(),
-                                        channel,
-                                    );
-                                }
-                            });
-                        ui.end_row();
-                        ui.label("OBS ホスト");
-                        ui.text_edit_singleline(&mut self.config.obs.host);
-                        ui.end_row();
-                        ui.label("OBS ポート");
-                        ui.add(egui::DragValue::new(&mut self.config.obs.port).range(1..=65535));
-                        ui.end_row();
-                        ui.label("OBS パスワード");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.obs.password)
-                                .password(true),
-                        );
-                        ui.end_row();
-                    });
-                ui.add_space(4.0);
-                ui.label("publisher ホスト（上から順に試し、失敗したら次へ切り替える）");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.publisher_hosts_draft)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("publisher.example.test"),
-                );
-                ui.label(
-                    "1 行に 1 つ。ポートを省略するとチャンネルごとの既定値を使います。チャンネルは /live/<channel> として自動で付きます。",
-                );
-                ui.label("既定ポート: uni 1935、1A 1936、kaikan 1937。");
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("fallback 登録").strong());
-                egui::Grid::new("settings-stream-credentials")
-                    .num_columns(2)
-                    .spacing([16.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("ベース URL");
-                        ui.text_edit_singleline(&mut self.config.stream_credentials.base_url);
-                        ui.end_row();
-                        ui.label("STREAM_INGEST_TOKEN");
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.config.stream_credentials.ingest_token,
-                            )
-                            .password(true),
-                        );
-                        ui.end_row();
-                        ui.label("metric");
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.stream_credentials.metric)
-                                .range(0..=i32::MAX as u32),
-                        );
-                        ui.end_row();
-                    });
-                ui.label(
-                    "空欄なら登録しません。鍵 URI はベース URL とチャンネル名から自動で決まります。",
-                );
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("ImageFlux").strong());
-                egui::Grid::new("settings-imageflux")
-                    .num_columns(2)
-                    .spacing([16.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("API トークン");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.config.imageflux.token)
-                                .password(true),
-                        );
-                        ui.end_row();
-                        ui.label("Webhook URL");
-                        ui.text_edit_singleline(&mut self.config.imageflux.event_webhook_url);
-                        ui.end_row();
-                    });
-                ui.add_space(4.0);
-                ui.label("HLS 出力（whip-script の設定を取り込んだ値。ここでは参照のみ）");
-                egui::Grid::new("settings-hls")
-                    .num_columns(5)
-                    .spacing([12.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("解像度");
-                        ui.label("FPS");
-                        ui.label("映像 bps");
-                        ui.label("音声 bps");
-                        ui.label("セグメント秒");
-                        ui.end_row();
-                        for rendition in &self.config.imageflux.hls {
-                            ui.label(format!(
-                                "{}x{}",
-                                rendition.video.width, rendition.video.height
-                            ));
-                            ui.label(rendition.video.fps.to_string());
-                            ui.label(rendition.video.bps.to_string());
-                            ui.label(rendition.audio.bps.to_string());
-                            ui.label(rendition.duration_seconds.to_string());
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("GStreamer").strong());
-                ui.horizontal(|ui| {
-                    ui.label("実行ファイル");
-                    ui.text_edit_singleline(&mut self.gstreamer_path_draft);
-                });
-                ui.label("空欄なら PATH、TOMYOU_GST_LAUNCH、標準的な場所から自動検出します。");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("保存").clicked() {
-                        save_requested = true;
-                    }
-                    if ui.button("再読込").clicked() {
-                        load_requested = true;
-                    }
-                    if ui.button("閉じる").clicked() {
-                        close_requested = true;
-                    }
-                });
-                ui.add_space(4.0);
-                ui.label("配信中は接続先の変更を反映しません。停止してから保存してください。");
-            });
-        self.show_settings = open && !close_requested;
-        if open_requested {
+                }
+            }
+            if ctx.input(|input| input.viewport().close_requested()) {
+                open = false;
+            }
+        });
+        self.show_settings = open && !actions.close;
+        if actions.open_config {
             self.open_config_file();
         }
-        if open_log_requested {
+        if actions.open_log {
             self.open_log_file();
         }
-        if load_requested {
+        if actions.load {
             self.load_config_from_draft();
         }
-        if save_requested {
+        if actions.save {
             self.save_config();
             if self.error.is_none() {
                 self.show_settings = false;
             }
         }
+    }
+
+    fn settings_scroll_ui(&mut self, ui: &mut egui::Ui, actions: &mut SettingsActions) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.settings_content(ui, actions);
+            });
+    }
+
+    fn settings_content(&mut self, ui: &mut egui::Ui, actions: &mut SettingsActions) {
+        ui.label(egui::RichText::new("このアプリ").strong());
+        egui::Grid::new("settings-about")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("バージョン");
+                ui.label(format!("v{}", crate::VERSION));
+                ui.end_row();
+                ui.label("ログファイル");
+                if let Some(path) = &self.log_path {
+                    ui.horizontal(|ui| {
+                        ui.monospace(path.display().to_string());
+                        if ui.button("開く").clicked() {
+                            actions.open_log = true;
+                        }
+                    });
+                } else {
+                    ui.label("初期化できませんでした");
+                }
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("設定ファイル").strong());
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.config_path_draft);
+            if ui.button("読み込む").clicked() {
+                actions.load = true;
+            }
+            if ui.button("OS のアプリで開く").clicked() {
+                actions.open_config = true;
+            }
+        });
+        ui.label("保存もこのパスへ書き込みます。空欄の場合は現在の設定ファイルを使います。");
+        ui.label("ファイルが無い場合は、現在の設定を保存してから開きます。");
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("接続").strong());
+        egui::Grid::new("settings-connection")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("チャンネル");
+                egui::ComboBox::from_id_salt("channel")
+                    .selected_text(&self.config.channel_id)
+                    .show_ui(ui, |ui| {
+                        for channel in CHANNELS {
+                            ui.selectable_value(
+                                &mut self.config.channel_id,
+                                channel.to_owned(),
+                                channel,
+                            );
+                        }
+                    });
+                ui.end_row();
+                ui.label("OBS ホスト");
+                ui.text_edit_singleline(&mut self.config.obs.host);
+                ui.end_row();
+                ui.label("OBS ポート");
+                ui.add(egui::DragValue::new(&mut self.config.obs.port).range(1..=65535));
+                ui.end_row();
+                ui.label("OBS パスワード");
+                ui.add(egui::TextEdit::singleline(&mut self.config.obs.password).password(true));
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        ui.label("publisher ホスト（上から順に試し、失敗したら次へ切り替える）");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.publisher_hosts_draft)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .hint_text("publisher.example.test"),
+        );
+        ui.label(
+            "1 行に 1 つ。ポートを省略するとチャンネルごとの既定値を使います。チャンネルは /live/<channel> として自動で付きます。",
+        );
+        ui.label("既定ポート: uni 1935、1A 1936、kaikan 1937。");
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("fallback 登録").strong());
+        egui::Grid::new("settings-stream-credentials")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("ベース URL");
+                ui.text_edit_singleline(&mut self.config.stream_credentials.base_url);
+                ui.end_row();
+                ui.label("STREAM_INGEST_TOKEN");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.config.stream_credentials.ingest_token)
+                        .password(true),
+                );
+                ui.end_row();
+                ui.label("metric");
+                ui.add(
+                    egui::DragValue::new(&mut self.config.stream_credentials.metric)
+                        .range(0..=i32::MAX as u32),
+                );
+                ui.end_row();
+            });
+        ui.label("空欄なら登録しません。鍵 URI はベース URL とチャンネル名から自動で決まります。");
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("ImageFlux").strong());
+        egui::Grid::new("settings-imageflux")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("API トークン");
+                ui.add(egui::TextEdit::singleline(&mut self.config.imageflux.token).password(true));
+                ui.end_row();
+                ui.label("Webhook URL");
+                ui.text_edit_singleline(&mut self.config.imageflux.event_webhook_url);
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        ui.label("HLS 出力（whip-script の設定を取り込んだ値。ここでは参照のみ）");
+        egui::Grid::new("settings-hls")
+            .num_columns(5)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("解像度");
+                ui.label("FPS");
+                ui.label("映像 bps");
+                ui.label("音声 bps");
+                ui.label("セグメント秒");
+                ui.end_row();
+                for rendition in &self.config.imageflux.hls {
+                    ui.label(format!(
+                        "{}x{}",
+                        rendition.video.width, rendition.video.height
+                    ));
+                    ui.label(rendition.video.fps.to_string());
+                    ui.label(rendition.video.bps.to_string());
+                    ui.label(rendition.audio.bps.to_string());
+                    ui.label(rendition.duration_seconds.to_string());
+                    ui.end_row();
+                }
+            });
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("GStreamer").strong());
+        ui.horizontal(|ui| {
+            ui.label("実行ファイル");
+            ui.text_edit_singleline(&mut self.gstreamer_path_draft);
+        });
+        ui.label("空欄なら PATH、TOMYOU_GST_LAUNCH、標準的な場所から自動検出します。");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("保存").clicked() {
+                actions.save = true;
+            }
+            if ui.button("再読込").clicked() {
+                actions.load = true;
+            }
+            if ui.button("閉じる").clicked() {
+                actions.close = true;
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("配信中は接続先の変更を反映しません。停止してから保存してください。");
     }
 
     fn license_window(&mut self, ctx: &egui::Context) {
