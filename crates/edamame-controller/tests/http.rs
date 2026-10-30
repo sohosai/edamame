@@ -7,11 +7,11 @@ use std::time::Duration;
 use edamame_domain::CorsOrigins;
 use serde_json::{Value, json};
 use support::{
-    DEFAULT_STORAGE_CAPACITY_BYTES, TempDir, spawn_controller, spawn_controller_with_auth,
-    spawn_controller_with_cors, spawn_controller_with_external_percent,
+    DEFAULT_STORAGE_CAPACITY_BYTES, TempDir, available_addr, spawn_controller,
+    spawn_controller_with_auth, spawn_controller_with_cors, spawn_controller_with_external_percent,
     spawn_controller_with_publish_wait, spawn_worker, spawn_worker_with_auth,
-    spawn_worker_with_cors, spawn_worker_with_weight, wait_for_playlist,
-    wait_for_playlist_contains, wait_for_segment,
+    spawn_worker_with_controller_urls, spawn_worker_with_cors, spawn_worker_with_weight,
+    wait_for_playlist, wait_for_playlist_contains, wait_for_segment,
 };
 
 /// 通常の API テストで、必須の認証 token を付け忘れないための client。
@@ -2532,6 +2532,38 @@ async fn end_to_end_publish_sync_playlist_serve() {
         segment.bytes().await.unwrap().as_ref(),
         b"segment-720p-seg-5"
     );
+}
+
+/// 先頭の controller に接続できなくても、次の controller に登録して配信する
+#[tokio::test]
+async fn worker_falls_back_to_next_controller_url() {
+    let _tmp = TempDir::new("controller-fallback");
+    let controller =
+        spawn_controller(any_addr(), DEFAULT_STORAGE_CAPACITY_BYTES, 6, 50, 1000).await;
+    // 待ち受けていないアドレスを先頭に置き、接続失敗で切り替わることを確かめる
+    let unreachable_url = format!("http://{}", available_addr());
+    let worker = spawn_worker_with_controller_urls(
+        "worker-a",
+        &[&unreachable_url, &controller.base_url],
+        12,
+        true,
+    )
+    .await;
+    let client = authenticated_client();
+    publish_series(&client, &controller.base_url, "720p", 0..6).await;
+    let media = wait_for_playlist_contains(
+        &client,
+        &format!("{}/channels/live/720p.m3u8", controller.base_url),
+        &format!("{}/segments/live/720p/5.ts", worker.base_url),
+    )
+    .await;
+    assert!(media.contains(&format!("{}/segments/live/720p/5.ts", worker.base_url)));
+    let segment = client
+        .get(format!("{}/segments/live/720p/5.ts", worker.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(segment.status().as_u16(), 200);
 }
 
 /// 連続してセグメントを PUT しても、公開待ちの間にプレイリストが 503 にならない

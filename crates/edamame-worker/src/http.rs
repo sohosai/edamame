@@ -23,7 +23,8 @@ use crate::metrics::WorkerMetrics;
 /// worker の共有状態
 pub struct WorkerState {
     pub worker_id: String,
-    pub controller_url: String,
+    /// 接続先の候補。sync のループが失敗するたびに次の URL へ切り替える
+    pub controller_urls: Vec<String>,
     pub public_url: String,
     pub weight: u32,
     pub path_prefix: String,
@@ -37,13 +38,20 @@ impl WorkerState {
     /// HTTP client と共有状態を作る
     pub fn new(
         worker_id: String,
-        controller_url: String,
+        controller_urls: Vec<String>,
         public_url: String,
         weight: u32,
         cache: Cache,
     ) -> Result<Arc<Self>, EdamameError> {
+        if controller_urls.is_empty() {
+            return Err(EdamameError::BadRequest(
+                "controller URL is required".to_owned(),
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            // 停止した controller を早く見切り、次の候補へ切り替える
+            .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|error| {
                 EdamameError::Internal(format!("build http client failed: {error}"))
@@ -53,7 +61,7 @@ impl WorkerState {
         let path_prefix = parsed.path().trim_end_matches('/').to_owned();
         Ok(Arc::new(Self {
             worker_id,
-            controller_url,
+            controller_urls,
             public_url,
             weight,
             path_prefix,

@@ -293,7 +293,7 @@ pub async fn spawn_worker(
 ) -> WorkerHandle {
     spawn_worker_with_options(
         worker_id,
-        controller_url,
+        vec![controller_url.to_owned()],
         cache_limit,
         start_sync,
         WorkerOptions::default(),
@@ -311,7 +311,7 @@ pub async fn spawn_worker_with_cors(
 ) -> WorkerHandle {
     spawn_worker_with_options(
         worker_id,
-        controller_url,
+        vec![controller_url.to_owned()],
         cache_limit,
         start_sync,
         WorkerOptions {
@@ -332,13 +332,33 @@ pub async fn spawn_worker_with_auth(
 ) -> WorkerHandle {
     spawn_worker_with_options(
         worker_id,
-        controller_url,
+        vec![controller_url.to_owned()],
         cache_limit,
         start_sync,
         WorkerOptions {
             auth_token: Some(auth_token.to_owned()),
             ..WorkerOptions::default()
         },
+    )
+    .await
+}
+
+/// 複数の controller の URL を指定して worker の HTTP サーバーを起動する
+pub async fn spawn_worker_with_controller_urls(
+    worker_id: &str,
+    controller_urls: &[&str],
+    cache_limit: u64,
+    start_sync: bool,
+) -> WorkerHandle {
+    spawn_worker_with_options(
+        worker_id,
+        controller_urls
+            .iter()
+            .map(|url| (*url).to_owned())
+            .collect(),
+        cache_limit,
+        start_sync,
+        WorkerOptions::default(),
     )
     .await
 }
@@ -353,7 +373,7 @@ pub async fn spawn_worker_with_weight(
 ) -> WorkerHandle {
     spawn_worker_with_options(
         worker_id,
-        controller_url,
+        vec![controller_url.to_owned()],
         cache_limit,
         start_sync,
         WorkerOptions {
@@ -383,7 +403,7 @@ impl Default for WorkerOptions {
 
 async fn spawn_worker_with_options(
     worker_id: &str,
-    controller_url: &str,
+    controller_urls: Vec<String>,
     cache_limit: u64,
     start_sync: bool,
     options: WorkerOptions,
@@ -399,7 +419,7 @@ async fn spawn_worker_with_options(
     let public_url = format!("http://{addr}");
     let state = WorkerState::new(
         worker_id.to_owned(),
-        controller_url.to_owned(),
+        controller_urls,
         public_url.clone(),
         weight,
         cache,

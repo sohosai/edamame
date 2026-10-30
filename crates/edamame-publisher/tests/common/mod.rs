@@ -178,7 +178,7 @@ impl Worker {
                 let cache = Cache::new(12).expect("キャッシュを作れません");
                 let state = WorkerState::new(
                     "worker-test".to_owned(),
-                    controller_url,
+                    vec![controller_url],
                     public_url,
                     1,
                     cache,

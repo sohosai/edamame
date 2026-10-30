@@ -26,6 +26,9 @@ pub async fn run_sync_loop_until(
     auth_token: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    // 選択中の controller。登録や sync に失敗したら次の候補へ切り替える。
+    // follower は leader へ転送するため、どの controller に接続しても同じ leader に届く
+    let mut controller_index = 0_usize;
     let mut registered = false;
     let mut interval_ms = 1000_u64;
     let mut fetch_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -35,11 +38,12 @@ pub async fn run_sync_loop_until(
         if *shutdown.borrow() {
             break;
         }
+        let controller_url = state.controller_urls[controller_index].clone();
         if !registered {
             // 前の登録で始めた取得タスクがキャッシュ破棄後に古い内容を保存しないよう、先に止める
             stop_fetch(&mut fetch_task).await;
             fetching.clear();
-            match register(&state, auth_token.as_deref()).await {
+            match register(&state, &controller_url, auth_token.as_deref()).await {
                 Ok(received_interval_ms) => {
                     registered = true;
                     interval_ms = received_interval_ms;
@@ -48,7 +52,8 @@ pub async fn run_sync_loop_until(
                 }
                 Err(error) => {
                     state.metrics.record_error("register");
-                    eprintln!("registration failed: {error}");
+                    eprintln!("registration failed for {controller_url}: {error}");
+                    controller_index = next_controller(&state, controller_index);
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     continue;
                 }
@@ -64,13 +69,15 @@ pub async fn run_sync_loop_until(
             let _ = handle.await;
             fetching.clear();
         }
-        match sync_once(&state, &fetching).await {
+        match sync_once(&state, &controller_url, &fetching).await {
             Ok(SyncOutcome::Known(fetch_segments)) => {
                 if !fetch_segments.is_empty() && fetch_task.is_none() {
                     fetching.clone_from(&fetch_segments);
                     let fetch_state = state.clone();
+                    let fetch_controller_url = controller_url.clone();
                     fetch_task = Some(tokio::spawn(async move {
-                        fetch_missing_segments(fetch_state, fetch_segments).await;
+                        fetch_missing_segments(fetch_state, fetch_controller_url, fetch_segments)
+                            .await;
                     }));
                 }
             }
@@ -80,7 +87,10 @@ pub async fn run_sync_loop_until(
             }
             Err(error) => {
                 state.metrics.record_error("sync");
-                eprintln!("sync failed: {error}");
+                eprintln!("sync failed for {controller_url}: {error}");
+                // 登録は leader が保持しているため、切り替え先で sync を続ける。
+                // leader が登録を失っていれば 404 が返り、再登録する
+                controller_index = next_controller(&state, controller_index);
             }
         }
         tokio::select! {
@@ -94,6 +104,11 @@ pub async fn run_sync_loop_until(
     }
     // 取得中のタスクが残ったまま再開すると、古いキャッシュを書き戻すため、停止を待つ
     stop_fetch(&mut fetch_task).await;
+}
+
+/// 失敗した controller の次の候補を返す。末尾の次は先頭に戻る
+fn next_controller(state: &WorkerState, index: usize) -> usize {
+    (index + 1) % state.controller_urls.len()
 }
 
 /// 進行中のセグメント取得を止める
@@ -111,8 +126,12 @@ async fn discard_cache(state: &WorkerState) {
     cache.clear_all();
 }
 
-async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, EdamameError> {
-    let url = format!("{}/workers/{}", state.controller_url, state.worker_id);
+async fn register(
+    state: &WorkerState,
+    controller_url: &str,
+    auth_token: Option<&str>,
+) -> Result<u64, EdamameError> {
+    let url = format!("{controller_url}/workers/{}", state.worker_id);
     let request = state.client.put(&url).json(&RegisterRequest {
         public_url: state.public_url.clone(),
         weight: state.weight,
@@ -146,13 +165,14 @@ async fn register(state: &WorkerState, auth_token: Option<&str>) -> Result<u64, 
 
 async fn sync_once(
     state: &WorkerState,
+    controller_url: &str,
     fetching_segments: &[SegmentKey],
 ) -> Result<SyncOutcome, EdamameError> {
     let cached_segments = {
         let cache = state.cache.lock().await;
         cache.keys()
     };
-    let url = format!("{}/workers/{}/sync", state.controller_url, state.worker_id);
+    let url = format!("{controller_url}/workers/{}/sync", state.worker_id);
     let response = state
         .client
         .post(&url)
@@ -180,11 +200,15 @@ async fn sync_once(
     Ok(SyncOutcome::Known(body.fetch_segments))
 }
 
-async fn fetch_missing_segments(state: Arc<WorkerState>, segments: Vec<SegmentKey>) {
+async fn fetch_missing_segments(
+    state: Arc<WorkerState>,
+    controller_url: String,
+    segments: Vec<SegmentKey>,
+) {
     for item in segments {
         let url = format!(
-            "{}/segments/{}/{}/{}.ts",
-            state.controller_url, item.channel_id, item.quality, item.sequence
+            "{controller_url}/segments/{}/{}/{}.ts",
+            item.channel_id, item.quality, item.sequence
         );
         match state.client.get(&url).send().await {
             Ok(response) if response.status().is_success() => match response.bytes().await {
