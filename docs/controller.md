@@ -65,7 +65,7 @@ CLI と環境変数の両方に指定した場合は CLI を優先する。
 | `--auth-token` | `EDAMAME_AUTH_TOKEN` | 必須 | PUT と heartbeat に使う共通 Bearer token。空白と制御文字を除く表示可能 ASCII。全 peer、worker、publisher に同じ値を指定する |
 | `--cors-origin` | `EDAMAME_CORS_ORIGIN` | 任意 | GET の読み取りを許可する origin。`*`、`none`、またはカンマ区切りの一覧。`*` と `none` は他の値と混在不可。省略時はヘッダーを付けず警告を出す |
 | `--external-min-percent` | `EDAMAME_EXTERNAL_MIN_PERCENT` | 任意 | 登録された外部配信へ流す最低割合。0 以上 100 以下の整数、既定値 `1` |
-| `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下、既定値 `100`。大きい値を優先する |
+| `--metric` | `EDAMAME_METRIC` | 任意 | leader の優先度。0 以上 4294967295 以下、既定値 `100`。小さい値を優先する |
 | `--seed` | `EDAMAME_SEED` | 任意 | 最初に接触する controller の HTTP / HTTPS URL。カンマ区切りと繰り返しを許可し、重複と自分の URL は除く。省略時は自分 1 台で始める |
 | `--tls-cert` | `EDAMAME_TLS_CERT` | `--tls-key` 使用時は必須 | 証明書チェーンの PEM ファイル。`--acme` と排他 |
 | `--tls-key` | `EDAMAME_TLS_KEY` | `--tls-cert` 使用時は必須 | 秘密鍵の PEM ファイル。`--acme` と排他 |

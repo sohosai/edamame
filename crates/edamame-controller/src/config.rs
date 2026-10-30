@@ -80,7 +80,7 @@ pub struct ControllerConfig {
     #[arg(long, env = "EDAMAME_PUBLIC_URL", value_parser = normalize_public_url)]
     pub public_url: String,
 
-    /// leader の優先度。大きい値を優先する
+    /// leader の優先度。小さい値を優先する
     #[arg(long, env = "EDAMAME_METRIC", default_value_t = 100)]
     pub metric: u32,
 
