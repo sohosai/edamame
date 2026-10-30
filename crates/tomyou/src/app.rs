@@ -1112,6 +1112,7 @@ fn setup_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         // Linux
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansJP-Regular.otf",
     ];
