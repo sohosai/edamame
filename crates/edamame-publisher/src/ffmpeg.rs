@@ -129,17 +129,14 @@ fn forced_idr_option(codec: &str) -> Option<&'static str> {
 }
 
 /// rendition の解像度へ変換するフィルタ。
-/// QSV はハードウェアフレームのまま拡大縮小できるフィルタを使う。
-/// Arc B580 で 540p から 1080p に拡大して比べたとき、scale_qsv の Y-PSNR (40.5 dB) は
-/// lanczos (40.0 dB) より高かったため、CPU の lanczos には替えない。
-/// それ以外は既定の bicubic より輪郭の残る lanczos を使う
+/// QSV はハードウェアフレームのまま縮小できるフィルタを使う
 fn scale_filter(codec: &str, rendition: &RenditionSettings) -> String {
     let width = rendition.resolution.width;
     let height = rendition.resolution.height;
     if codec.ends_with("_qsv") {
         format!("scale_qsv=w={width}:h={height},setsar=1")
     } else {
-        format!("scale={width}:{height}:flags=lanczos,setsar=1")
+        format!("scale={width}:{height},setsar=1")
     }
 }
 
@@ -394,7 +391,7 @@ mod tests {
         assert!(text.contains("-c:v h264_nvenc"));
         assert!(text.contains("-preset p5"));
         assert!(text.contains("-forced-idr 1"));
-        assert!(text.contains("scale=1280:720:flags=lanczos,setsar=1"));
+        assert!(text.contains("scale=1280:720,setsar=1"));
         assert!(text.contains("expr:gte(t,n_forced*6)"));
         assert!(text.contains("-output_ts_offset 6"));
         assert!(text.contains("/tmp/run-1/1080p/%d.ts"));

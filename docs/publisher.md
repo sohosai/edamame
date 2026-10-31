@@ -127,7 +127,7 @@ video_bitrate = 3000000
 | `input.key_uri` | 任意。鍵を取得する HTTP または HTTPS の絶対 URL。通常の HLS プレイヤーで再生する場合は必要 |
 | `input.rendition.quality` | 必須。quality の識別子。同じ channel 内で重複不可。`master` は使用不可 |
 | `input.rendition.mode` | 任意。省略時は `encode`。`copy` は映像を再エンコードしない。音声はどちらもコピーする |
-| `input.rendition.resolution` | 必須。`WIDTHxHEIGHT`。幅と高さはそれぞれ 2 以上の偶数。encode はこの解像度へ変換する（QSV は `scale_qsv`、それ以外は Lanczos）。copy は入力と一致しなければ、この解像度へ encode に切り替える |
+| `input.rendition.resolution` | 必須。`WIDTHxHEIGHT`。幅と高さはそれぞれ 2 以上の偶数。encode はこの解像度へ変換する。copy は入力と一致しなければ、この解像度へ encode に切り替える |
 | `input.rendition.bandwidth` | 必須。正の整数。controller へ宣言する bit/s。音声と多重化を含めて見積もる |
 | `input.rendition.video_bitrate` | encode の場合は正の整数が必須。copy の場合は任意の正の整数で、入力の解像度が合わずに encode へ切り替えたときの目標ビットレートに使う。省略すると `bandwidth` を使う |
 
